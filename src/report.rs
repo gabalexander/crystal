@@ -75,8 +75,8 @@ const LONGEST_TOKEN: usize = 32;
 /// The words of the statuses a row's `state` says, which `--state-label`
 /// gives labels by: an agent's, then a program's, then how a session
 /// ended or waits to start.
-pub const STATE_WORDS: [&str; 8] = [
-    "waiting", "working", "done", "idle", "running", "ended", "failed", "starting",
+pub const STATE_WORDS: [&str; 9] = [
+    "waiting", "working", "done", "open", "idle", "running", "ended", "failed", "starting",
 ];
 
 /// Tells the daemon what the agent in the session called `name`, or the

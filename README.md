@@ -394,6 +394,7 @@ waiting on you moves to the top, and that session leads its worktree.
 | `▲` waiting | the agent is asking you something, like a permission |
 | `◐` working | the agent is working on a turn; the mark turns while it does |
 | `✓` done | the agent finished its turn, and you haven't looked yet |
+| `◇` open | its task is still open, but the agent asks nothing of you: it said it waits on something else, like CI |
 | `▸` | running: an agent at its prompt |
 | `❯` | a terminal: muted at a shell's prompt, brighter while a program runs in it |
 | `■` | ended: muted when it exited well, red when it failed or [couldn't start again](#usage); the pane's header says how |
@@ -424,6 +425,15 @@ one has stopped, a turn of the agent's own, its prompt or its spinner, is the wo
 end of it; with none within a minute, the turn is over. Subagents that show no sign of life for 15 minutes,
 none starting or stopping, no tool finishing, no permission asked for, are taken for gone, and the turn is over
 too.
+
+So with the rest of the work Claude Code wakes the agent for, as its Stop hook lists it (`background_tasks` and
+`session_crons`): a command it runs in the background, like a test suite, a Monitor watching CI, a wakeup it
+scheduled (`ScheduleWakeup`, `CronCreate`, `/loop`), or another task Claude Code keeps for it. A turn that ends
+with any of it to come reads as working, its row says on what (`in the background: cargo test`, `watching: CI
+checks`), and it tells you nothing, until a turn of the agent's own starts as that work wakes it; that turn's
+end is held again if some is still to come. If the agent never wakes, the turn is over once the longest the work
+can take has passed, and a minute more: two hours for a command, an hour for a Monitor or a wakeup. A turn whose
+last message asks you something is never held: you're told at once, whatever runs.
 
 A Claude Code or Codex you start yourself, typed into a session's shell, has no hooks of crystal's: crystal
 doesn't start it. `crystal integration install` puts crystal's hooks in their own settings, beside yours:
@@ -954,7 +964,7 @@ lines past its first take the place of its task's line and its reported line, un
 | `agent` | what's in front in it, in a word, or the agent reported with `--display-agent` |
 | `model` | the model its agent runs on |
 | `subagents` | how many subagents its agent has running, `+2` |
-| `state` | its status in a word (`waiting`, `working`, `done`, `idle`, `running`, `ended`, `failed`, `starting`), or the label reported for it with `--state-label` |
+| `state` | its status in a word (`waiting`, `working`, `done`, `open`, `idle`, `running`, `ended`, `failed`, `starting`), or the label reported for it with `--state-label` |
 | `when` | how long ago it changed, or the tab it's in when it's shown from another |
 | `bell` | `♪` while its bell rang out of sight |
 | `task` | its task: what it was asked to do, or how that went |
@@ -2798,8 +2808,9 @@ made, `t1`, `t2`…, and stays open until it's closed, done or failed, with a li
   "<why>"`. crystal tells Claude Code how, on top of its system prompt, Codex in its developer instructions,
   and other agents at the top of their first prompt, opening with a line on where that comes from, so the
   agent doesn't take it for a stranger's instructions. Agents don't always remember to, Haiku least of all, so
-  the first time Claude Code ends a turn with its task still open, its Stop hook reminds it and it carries on:
-  to close the task, or, if it isn't through, to leave it open and end its turn. `-n <session>` closes another
+  the first time Claude Code ends a turn with its task still open, saying nothing that makes clear why, its Stop
+  hook reminds it and it carries on: to close the task if it's done, to ask you its question plainly if it needs
+  you, or to say what work of its own it waits on, which wakes it, and end its turn. `-n <session>` closes another
   session's task. A task isn't done while its worktree is in the middle of a rebase or a merge, stopped on
   conflicts say: `crystal done` refuses then and says so, until the agent finishes or aborts it; `--failed`
   closes it anyway.
@@ -2811,15 +2822,33 @@ made, `t1`, `t2`…, and stays open until it's closed, done or failed, with a li
 | State | Meaning |
 |---|---|
 | `pending` | made with `--no-launch`: nothing works on it yet |
-| `running` | its session is working on it |
-| `waiting` | its agent's turn ended with the task still open: it's asking you something |
+| `running` | its session is working on it, or its agent left it open waiting on something other than you |
+| `waiting` | its agent's turn ended with the task still open, asking you something |
 | `done` | closed done |
 | `failed` | closed failed, or its session ended while it was open, leaving nobody who could close it |
 | `cancelled` | you cancelled it, or killed its session while it was open |
 
-A turn that ends with the task still open, once the agent has been reminded, is a question for you: the session
-waits on you (`▲`, and `u` finds it) until its agent works again, and its task line says so. So does a
-background task you interrupted. A program that exits with its task open fails it, saying how it ended; `crystal
+Whether a turn that ends with the task still open needs you goes by what the agent said last, which Claude
+Code's Stop hook gives, read with no model:
+
+- A question, or a request: a choice, a decision, an approval, a file, access, or a command for you to run. The
+  session waits on you (`▲`, pinned, `u` finds it, and you're told) until its agent works again, and its task
+  line says so. It isn't reminded first: it asked.
+- A plain statement that it waits on something else: "waiting on CI, not on you", "I'll pick up when the tests
+  finish". The task stays open and the session sits idle, marked `◇`: not pinned, not told of, not found by
+  `u` or `U`. With work of its own still running that wakes it, the turn is held as working instead (see
+  [usage](#usage)).
+- Anything else, like a summary that doesn't close the task, is unclear: it's reminded once, and if its next turn
+  ends as unclear, it waits on you. So does a turn whose end its hooks didn't give, from another agent or an
+  older Claude Code.
+
+Of the 27 turns crystal's own log had marked as waiting on the user, none asked anything: 25 waited on their
+tests, CI, a helper or a subagent, and two were one finished report the agent didn't close. The rule reads 24 of
+them as waiting on something else, and 25 had work of their own running that holds them; together they leave
+out 25, and the finished report still tells you. Over the 472 turn ends a person answered next, it took none
+that asked for one that didn't.
+
+A background task you interrupted waits on you too. A program that exits with its task open fails it, saying how it ended; `crystal
 respawn` opens it again, under the same number.
 
 The sidebar shows a task under its session: what it was asked to do while it's open, `▲` when it waits on you,

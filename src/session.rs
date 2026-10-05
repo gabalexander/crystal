@@ -4,6 +4,8 @@
 use crate::agent_rules;
 use crate::agent_screen::{self, Looks, ScreenWatch};
 use crate::agents;
+use crate::asking::{self, Said};
+use crate::background::Background;
 use crate::claude_title;
 use crate::codex::Rollouts;
 use crate::config::Config;
@@ -20,8 +22,8 @@ use crate::output_ring::OutputRing;
 use crate::printable;
 use crate::protocol::{
     Activity, AgentEvent, AgentReport, Answer, Asking, Conversation, Front, InProgress, Metadata,
-    Reporter, ScreenExplained, SessionInfo, State, TaskBrief, TaskInfo, TaskOutcome, TaskRecord,
-    TaskResult, TaskSpec, TaskState, TaskView, Wakeup,
+    Pending, Reporter, ScreenExplained, SessionInfo, State, TaskBrief, TaskInfo, TaskOutcome,
+    TaskRecord, TaskResult, TaskSpec, TaskState, TaskView, Wakeup,
 };
 use crate::recall::{self, Recalled};
 use crate::report;
@@ -151,6 +153,12 @@ pub struct Session {
     typed_agent: Option<String>,
     /// Its agent's subagents, as its hooks say, and the turn held for them.
     subagents: Subagents,
+    /// The work of its agent's own its last turn ended with still to come,
+    /// as its hooks say, and the turn held for it.
+    background: Background,
+    /// What its agent's last turn ended saying of the user, as its hooks
+    /// say: `None` until a turn ends, or when they don't say.
+    said: Option<Said>,
     /// The model its agent runs on, as its command, its hooks and its
     /// transcript say.
     model: model::Watch,
@@ -318,6 +326,10 @@ pub struct Handed {
     subagents: u32,
     #[serde(default)]
     held_for_subagents: Option<subagents::Held>,
+    #[serde(default)]
+    background: Background,
+    #[serde(default)]
+    said: Option<Said>,
     #[serde(default)]
     model: model::Watch,
     #[serde(default)]
@@ -524,6 +536,8 @@ impl Session {
             title: claude_title::Watch::default(),
             typed_agent: None,
             subagents: Subagents::default(),
+            background: Background::default(),
+            said: None,
             model,
             shown: report::Shown::default(),
             stopped_idle: false,
@@ -598,6 +612,8 @@ impl Session {
             title: claude_title::Watch::default(),
             typed_agent: None,
             subagents: Subagents::default(),
+            background: Background::default(),
+            said: None,
             model: model::Watch::default(),
             shown: report::Shown::default(),
             stopped_idle: false,
@@ -696,6 +712,8 @@ impl Session {
             title: claude_title::Watch::default(),
             typed_agent: None,
             subagents: Subagents::default(),
+            background: Background::default(),
+            said: None,
             model: model::Watch::new(&saved.command),
             shown: report::Shown::default(),
             stopped_idle: false,
@@ -933,21 +951,39 @@ impl Session {
     }
 
     /// Whether to remind the agent, as it ends a turn, that its task is
-    /// still open: once, so one that has its reasons, like waiting on the
-    /// user, isn't held up turn after turn. A background task has no turns
-    /// to end; its runs close it.
+    /// still open: once, so one that has its reasons isn't held up turn
+    /// after turn, and only when what it said leaves it unclear. One that
+    /// asks the user something isn't through; nor is one that says it waits
+    /// on something else. A background task has no turns to end; its runs
+    /// close it.
     pub fn remind_of_task(&mut self) -> bool {
         let open = self
             .goal
             .as_ref()
             .is_some_and(|goal| goal.outcome.is_none() && !goal.background);
-        // An agent whose subagents still run works on: it's reminded as a
-        // turn after them ends.
-        if !open || self.reminded || self.subagents.running() > 0 {
+        let clear = matches!(self.said, Some(Said::Asks | Said::Waits));
+        // An agent with work of its own still to come works on: it's
+        // reminded as a turn after it ends.
+        if !open || self.reminded || clear || self.work_to_come() {
             return false;
         }
         self.reminded = true;
         true
+    }
+
+    /// Whether its agent has work of its own still to come, which wakes
+    /// it: subagents running, or what its last turn ended with.
+    fn work_to_come(&self) -> bool {
+        self.subagents.running() > 0 || self.background.has_pending()
+    }
+
+    /// Takes how its agent's turn ended, as its hooks say: what it said
+    /// last, and the work of its own still to come, each when they say.
+    pub fn turn_ended_with(&mut self, said: Option<&str>, pending: Option<Vec<Pending>>) {
+        self.said = said.map(asking::judge);
+        if let Some(pending) = pending {
+            self.background.ended_with(pending);
+        }
     }
 
     /// The tasks that have closed of themselves since this was last asked,
@@ -1114,7 +1150,8 @@ impl Session {
                 _ => self.subagents.running(),
             },
             model: self.shown.model(now).map(String::from).or(read_model),
-            line: self.shown.line(now).map(String::from),
+            // A turn held for work in the background says what it waits on.
+            line: (self.shown.line(now).map(String::from)).or_else(|| self.background.waits_on()),
             row: self.shown.row(now),
             stopped_idle: self.stopped_idle,
             bell: self.bell,
@@ -1155,7 +1192,9 @@ impl Session {
     /// it was.
     fn idle_agent(&self) -> bool {
         // A turn held for its subagents reads as working all the while.
-        let subagents_at_work = self.subagents.running() > 0 || self.subagents.held().is_some();
+        let subagents_at_work = self.subagents.running() > 0
+            || self.subagents.held().is_some()
+            || self.background.held().is_some();
         if self.activity != Some(Activity::Idle) || subagents_at_work {
             return false;
         }
@@ -1516,20 +1555,38 @@ impl Session {
     pub fn on_agent_event(&mut self, event: AgentEvent) {
         let now = SystemTime::now();
         self.subagents.heard(event, now);
+        // Working again, it will say anew what it says and what's to come.
+        // A tool finishing with subagents running may be theirs.
+        let own_tool = event == AgentEvent::ToolFinished && self.subagents.running() == 0;
+        if matches!(event, AgentEvent::Started | AgentEvent::TurnStarted) || own_tool {
+            self.background.resumed();
+            self.said = None;
+        }
         let turn_ended = event == AgentEvent::TurnEnded
             || (event == AgentEvent::StillIdle && self.activity == Some(Activity::Working));
-        // A turn that ends with subagents still running isn't the agent
-        // done: it works on until they've finished.
-        if turn_ended && self.subagents.hold(now) {
-            if self.activity != Some(Activity::Working) {
-                self.set_activity(Some(Activity::Working));
-                *self.changed.lock().unwrap() = SystemTime::now();
+        // A turn that ends with work of its own still to come, subagents
+        // running or a command in the background, isn't the agent done: it
+        // works on until that wakes it, unless it asks the user something.
+        let asks = self.said == Some(Said::Asks);
+        if turn_ended && !asks {
+            let for_subagents = self.subagents.hold(now);
+            let for_background = self.background.hold(now, self.wakes.wakeup);
+            if for_subagents || for_background {
+                if self.activity != Some(Activity::Working) {
+                    self.set_activity(Some(Activity::Working));
+                    *self.changed.lock().unwrap() = SystemTime::now();
+                }
+                return;
             }
-            return;
         }
         let mut activity = next_activity(self.activity, event, self.is_watched());
         if let Some(goal) = self.goal.as_mut().filter(|goal| goal.is_open()) {
-            if turn_ended && tasks_on() {
+            if turn_ended && tasks_on() && self.said == Some(Said::Waits) {
+                // Waiting on something else, it leaves its task open and
+                // needs nobody: it sits idle, the task marked open.
+                goal.waiting = false;
+                activity = Some(Activity::Idle);
+            } else if turn_ended && tasks_on() {
                 if !std::mem::replace(&mut goal.waiting, true) {
                     self.changes.push(Change::TaskWaiting);
                 }
@@ -1579,12 +1636,19 @@ impl Session {
         self.fail_task_if_ended();
     }
 
-    /// Ends the turn its agent ended while subagents ran, once that's over:
-    /// they've all stopped and it hasn't taken their work up, or they've
-    /// gone quiet. An agent that reports for itself says when it's done.
+    /// Ends the turn its agent ended while subagents ran, or with work of
+    /// its own in the background, once that's over: they've all stopped and
+    /// it hasn't taken their work up, or they've gone quiet; its work has
+    /// had the longest it can take and never woken it. An agent that reports
+    /// for itself says when it's done.
     fn check_held_turn(&mut self) {
-        let at_work = self.activity == Some(Activity::Working) && !self.is_claimed();
-        if at_work && self.subagents.let_go(SystemTime::now()) {
+        if self.activity != Some(Activity::Working) || self.is_claimed() {
+            return;
+        }
+        let now = SystemTime::now();
+        let let_go = self.subagents.let_go(now) | self.background.let_go(now);
+        let still = self.subagents.held().is_some() || self.background.held().is_some();
+        if let_go && !still {
             self.on_agent_event(AgentEvent::TurnEnded);
         }
     }
@@ -1742,6 +1806,8 @@ impl Session {
         }
         if agent_left {
             self.subagents.forget();
+            self.background.forget();
+            self.said = None;
             self.model.forget();
             if self.typed_agent.take().is_some() {
                 self.conversation = None;
@@ -2045,6 +2111,8 @@ impl Session {
             typed_agent: self.typed_agent.clone(),
             subagents: self.subagents.running(),
             held_for_subagents: self.subagents.held(),
+            background: self.background.clone(),
+            said: self.said,
             model: self.model.clone(),
             shown: self.shown.clone(),
             stopped_idle: self.stopped_idle,
@@ -2136,6 +2204,8 @@ impl Session {
             title: handed.title,
             typed_agent: handed.typed_agent,
             subagents: Subagents::handed(handed.subagents, handed.held_for_subagents),
+            background: handed.background,
+            said: handed.said,
             model: handed.model,
             shown: handed.shown,
             stopped_idle: handed.stopped_idle,
@@ -2795,6 +2865,13 @@ mod tests {
             ..Metadata::default()
         };
         shown.take(&metadata, SystemTime::now()).unwrap();
+        let mut background = Background::default();
+        let tests = Pending {
+            kind: crate::protocol::PendingKind::Shell,
+            what: Some("cargo test".into()),
+        };
+        background.ended_with(vec![tests]);
+        background.hold(UNIX_EPOCH, None);
         let mut recalled = Recalled::default();
         recalled.launched(&[4, 7]);
         let handed = Handed {
@@ -2833,6 +2910,8 @@ mod tests {
             typed_agent: Some("codex".into()),
             subagents: 2,
             held_for_subagents: Some(subagents::Held::at(UNIX_EPOCH, None)),
+            background: background.clone(),
+            said: Some(Said::Waits),
             model: model::Watch::new(&["claude".into(), "--model".into(), "opus".into()]),
             shown,
             stopped_idle: false,
@@ -2879,6 +2958,9 @@ mod tests {
         assert_eq!(session.subagents, held);
         // With the shell in front, there are none to show.
         assert_eq!(info.subagents, 0);
+        // What its turn ended with to come, and what it said.
+        assert_eq!(session.background, background);
+        assert_eq!(session.said, Some(Said::Waits));
         // What its agent put on its row stays, the model it reported over
         // the one its command gave.
         assert_eq!(info.line.as_deref(), Some("deploying"));
@@ -3116,6 +3198,8 @@ mod tests {
             typed_agent: Some("claude".into()),
             subagents: 2,
             held_for_subagents: None,
+            background: Background::default(),
+            said: None,
             model: model::Watch::default(),
             shown: report::Shown::default(),
             stopped_idle: false,
@@ -3337,6 +3421,136 @@ mod tests {
         assert!(session.remind_of_task(), "reminded once they're done");
     }
 
+    /// Claude Code at work on task 3.
+    fn claude_on_a_task(dir: &std::path::Path) -> Session {
+        let mut session = claude_at_work(dir);
+        session.give_task(TaskInfo {
+            id: Some(3),
+            goal: "port the tests".into(),
+            background: false,
+            backlog: None,
+            waiting: false,
+            created: 1,
+            outcome: None,
+            brief: Default::default(),
+        });
+        session
+    }
+
+    fn in_the_background(what: &str) -> Vec<Pending> {
+        vec![Pending {
+            kind: crate::protocol::PendingKind::Shell,
+            what: Some(what.into()),
+        }]
+    }
+
+    fn task_waits(session: &Session) -> bool {
+        session.goal.as_ref().unwrap().waiting
+    }
+
+    #[test]
+    fn a_turn_ended_with_a_command_in_the_background_is_held_till_it_wakes_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = claude_on_a_task(dir.path());
+        let waiting =
+            "The tests are still running in the background; I'll pick up when they finish.";
+        session.turn_ended_with(Some(waiting), Some(in_the_background("cargo test")));
+        assert!(!session.remind_of_task(), "it works on");
+        session.on_agent_event(AgentEvent::TurnEnded);
+        assert_eq!(session.activity, Some(Working));
+        assert!(!task_waits(&session));
+        assert_eq!(
+            session.info().line.as_deref(),
+            Some("in the background: cargo test")
+        );
+        // Its prompt back on the screen is the same turn's end.
+        session.on_agent_event(AgentEvent::TurnEnded);
+        assert_eq!(session.activity, Some(Working));
+        session.check();
+        assert_eq!(session.activity, Some(Working));
+        assert!(session.take_changes().is_empty(), "nothing to tell");
+
+        // Woken as the tests end, its next turn asks the user something.
+        session.on_agent_event(AgentEvent::TurnStarted);
+        assert_eq!(session.info().line, None);
+        session.turn_ended_with(Some("All green. Should I open the PR?"), Some(Vec::new()));
+        assert!(!session.remind_of_task(), "it asked: it isn't through");
+        session.on_agent_event(AgentEvent::TurnEnded);
+        assert_eq!(session.activity, Some(Waiting));
+        assert!(task_waits(&session));
+        assert!(session.take_changes().contains(&Change::TaskWaiting));
+    }
+
+    #[test]
+    fn a_turn_that_asks_isn_t_held_for_work_still_to_come() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = claude_on_a_task(dir.path());
+        session.on_agent_event(AgentEvent::SubagentStarted);
+        let asking = "The tests run in the background. Do you want the docs updated too?";
+        session.turn_ended_with(Some(asking), Some(in_the_background("cargo test")));
+        session.on_agent_event(AgentEvent::TurnEnded);
+        assert_eq!(session.activity, Some(Waiting));
+        assert!(task_waits(&session));
+    }
+
+    #[test]
+    fn a_task_left_open_waiting_on_something_else_needs_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = claude_on_a_task(dir.path());
+        let waiting = "PR #118 is open. I'm waiting on CI, not on you.";
+        session.turn_ended_with(Some(waiting), Some(Vec::new()));
+        assert!(!session.remind_of_task(), "it said why it's open");
+        session.on_agent_event(AgentEvent::TurnEnded);
+        assert_eq!(session.activity, Some(Idle));
+        assert!(!task_waits(&session));
+        let changes = session.take_changes();
+        assert!(!changes.contains(&Change::TaskWaiting), "{changes:?}");
+        assert!(session.goal.as_ref().unwrap().is_open());
+        assert_eq!(session.notice(|| Duration::ZERO), None, "nobody's told");
+        // A turn of its own puts it back to work.
+        session.on_agent_event(AgentEvent::TurnStarted);
+        assert_eq!(session.activity, Some(Working));
+    }
+
+    #[test]
+    fn an_unclear_turn_end_is_reminded_once_then_waits_on_the_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = claude_on_a_task(dir.path());
+        session.turn_ended_with(Some("The refactor is in."), Some(Vec::new()));
+        assert!(session.remind_of_task());
+        // It carries on, and ends its turn again saying as little.
+        session.on_agent_event(AgentEvent::ToolFinished);
+        session.turn_ended_with(Some("Still the refactor."), Some(Vec::new()));
+        assert!(!session.remind_of_task(), "once");
+        session.on_agent_event(AgentEvent::TurnEnded);
+        assert_eq!(session.activity, Some(Waiting));
+        assert!(task_waits(&session));
+        // Its hooks saying nothing, as before, is unclear too.
+        let mut session = claude_on_a_task(dir.path());
+        session.turn_ended_with(None, None);
+        assert!(session.remind_of_task());
+    }
+
+    #[test]
+    fn a_turn_held_for_work_that_never_wakes_the_agent_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = claude_on_a_task(dir.path());
+        let waiting = "The deploy runs in the background; it notifies me when it's done.";
+        session.turn_ended_with(Some(waiting), Some(in_the_background("deploy")));
+        session.on_agent_event(AgentEvent::TurnEnded);
+        assert_eq!(session.activity, Some(Working));
+        // Held since longer ago than a command in the background can run.
+        let mut background = Background::default();
+        background.ended_with(in_the_background("deploy"));
+        background.hold(SystemTime::now() - Duration::from_secs(3 * 60 * 60), None);
+        session.background = background;
+        session.check();
+        // It said it waits on something else: its task is left open.
+        assert_eq!(session.activity, Some(Idle));
+        assert!(!task_waits(&session));
+        assert_eq!(session.info().line, None);
+    }
+
     #[test]
     fn a_turn_held_for_subagents_gone_quiet_ends() {
         let dir = tempfile::tempdir().unwrap();
@@ -3400,6 +3614,8 @@ mod tests {
             typed_agent: None,
             subagents: 0,
             held_for_subagents: None,
+            background: Background::default(),
+            said: None,
             model: model::Watch::default(),
             shown: report::Shown::default(),
             pty: None,

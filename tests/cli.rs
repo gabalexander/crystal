@@ -12490,6 +12490,80 @@ fn an_agent_that_ends_its_turn_with_its_task_open_is_reminded_once() {
 }
 
 #[test]
+fn an_agent_waiting_on_its_own_work_works_on_and_only_a_question_waits_on_the_user() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let out = crystal
+        .command(&["new", "-d", "-n", "agent", "claude", "fix the tests"])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let hook = format!("{CRYSTAL} hook claude");
+    let session = [("CRYSTAL_SESSION", "agent")];
+    let says = |event: &serde_json::Value| hook_says(&crystal, &session, &hook, &event.to_string());
+    let status = || crystal.row("agent").unwrap()[1].clone();
+    let prompt = serde_json::json!({"hook_event_name": "UserPromptSubmit"});
+    let stop = |said: &str, tasks: serde_json::Value| {
+        serde_json::json!({
+            "hook_event_name": "Stop",
+            "last_assistant_message": said,
+            "background_tasks": tasks,
+            "session_crons": [],
+        })
+    };
+    let waits_on_user = || {
+        let events = crystal.ok(&["events", "-k", "task.waiting"]);
+        !events.trim().is_empty()
+    };
+    assert_eq!(says(&prompt), "");
+
+    // Its turn ends with its tests running in the background: it's still at
+    // work on them, not reminded of its task, which doesn't wait on the
+    // user, and its row says what runs.
+    let tests = serde_json::json!([{"id": "b1", "type": "shell", "status": "running",
+                                    "description": "Run the full test suite",
+                                    "command": "cargo test"}]);
+    let waiting = "The tests run in the background; I'll pick up when they finish.";
+    assert_eq!(says(&stop(waiting, tests)), "", "not reminded");
+    assert_eq!(status(), "working");
+    let row = listed(&crystal, "agent");
+    assert_eq!(row["task"]["waiting"], false);
+    assert_eq!(row["line"], "in the background: Run the full test suite");
+    let idle = serde_json::json!({"hook_event_name": "Notification",
+                                  "notification_type": "idle_prompt"});
+    assert_eq!(says(&idle), "");
+    assert_eq!(status(), "working", "its prompt back says nothing");
+
+    // Woken as they end, it opens the PR and ends saying it waits on CI,
+    // nothing of its own running: its task stays open, the session idle,
+    // needing nobody.
+    assert_eq!(says(&prompt), "");
+    let ci = "PR #7 is open. I'm waiting on CI, not on you.";
+    assert_eq!(says(&stop(ci, serde_json::json!([]))), "", "not reminded");
+    assert_eq!(status(), "idle");
+    let row = listed(&crystal, "agent");
+    assert_eq!(
+        (&row["task"]["waiting"], &row["line"]),
+        (&false.into(), &serde_json::Value::Null)
+    );
+    assert!(crystal.ok(&["tasks"]).starts_with("t1    running    agent"));
+    assert!(!waits_on_user());
+
+    // Then it asks something: it waits on the user, and isn't reminded first.
+    assert_eq!(says(&prompt), "");
+    let question = "CI is green. Should I merge it?";
+    assert_eq!(
+        says(&stop(question, serde_json::json!([]))),
+        "",
+        "not reminded"
+    );
+    assert_eq!(status(), "waiting");
+    assert_eq!(listed(&crystal, "agent")["task"]["waiting"], true);
+    assert!(waits_on_user());
+}
+
+#[test]
 fn an_agent_whose_subagents_still_run_as_its_turn_ends_works_on() {
     let crystal = Crystal::new();
     let bin = fake_claude(crystal.dir.path());

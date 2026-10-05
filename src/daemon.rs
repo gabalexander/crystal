@@ -2205,6 +2205,8 @@ impl Daemon {
                 subagent,
                 model,
                 wakeup,
+                said,
+                pending,
             } => {
                 let agent = agent.unwrap_or_else(|| "claude".to_string());
                 // The agent kept warm is in no list till it's taken over.
@@ -2248,6 +2250,12 @@ impl Daemon {
                 }
                 let moving = self.is_moving(&id);
                 let session = with_id(&mut sessions, &id)?;
+                // Before it's reminded of its task: whether it asks the user
+                // anything, and what of its own is still to come, say whether
+                // its turn is over.
+                if event == AgentEvent::TurnEnded {
+                    session.turn_ended_with(said.as_deref(), pending);
+                }
                 if let Some(prompt) = &prompt {
                     session.recalled().asked(prompt);
                 }

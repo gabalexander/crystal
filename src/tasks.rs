@@ -62,14 +62,18 @@ pub fn instructions(backlog: bool) -> String {
 }
 
 /// What an agent is told when it ends a turn with its task still open, once
-/// a task: agents don't always remember to close theirs, Haiku least of all.
-/// One that isn't through, say because it's waiting on the user, is told to
-/// leave it open.
-pub const REMINDER: &str = "Your crystal task is still open. If you've done it, close it now: \
-                            run `crystal done \"<one line on what you did>\"`, or `crystal \
-                            done --failed \"<why>\"` if you couldn't do it. If you aren't \
-                            through, say you're waiting on the user, leave it open and end \
-                            your turn.";
+/// a task, and saying nothing that makes it clear why: agents don't always
+/// remember to close theirs, Haiku least of all. One that isn't through
+/// asks the user what it needs of them plainly, or says what of its own it
+/// waits on, which wakes it: only a question needs the user (see
+/// [`crate::asking`]).
+pub const REMINDER: &str = "Your crystal task is still open. If you've done it, close it: \
+                            `crystal done \"<one line on what you did>\"`, or `crystal done \
+                            --failed \"<why>\"` if you couldn't. If you need the user, ask \
+                            them your question plainly. If you're waiting on work of your \
+                            own, a command in the background, a Monitor (say on CI) or a \
+                            subagent, say what and end your turn: you'll be woken when it's \
+                            done.";
 
 /// The most a task's acceptance criteria may come to, all together: they
 /// go on the agent's command line with its goal.

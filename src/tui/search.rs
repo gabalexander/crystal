@@ -221,7 +221,7 @@ impl StatusFilter {
             StatusFilter::Waiting => status == Status::Waiting,
             StatusFilter::Working => status == Status::Working,
             StatusFilter::Done => status == Status::Done,
-            StatusFilter::Idle => status == Status::Running,
+            StatusFilter::Idle => matches!(status, Status::Running | Status::Open),
             StatusFilter::Ended => matches!(status, Status::Ended | Status::Failed),
         }
     }

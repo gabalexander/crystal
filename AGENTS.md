@@ -265,7 +265,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     by name, with its keys, filtered as you type, the latest run first; its state and keys, kept apart from
     I/O, and its drawing
   - `status.rs`: a session's status as the TUI shows it, its mark, and what it needs of the user, which the
-    sidebar's pinned rows and `u` go by
+    sidebar's pinned rows and `u` go by; a task left open asking the user nothing (`◇`) needs nothing
   - `theme.rs`: every color, named for what it's for, and `THEMES`, the one table of every theme by its names:
     crystal's own `dark`, `light` and `terminal`, and the well-known schemes (catppuccin, nord, …), each a
     palette of ten colors given their roles, its tints blended toward the background; the theme for a light
@@ -497,7 +497,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   resume`, and crystal's notes given as its developer instructions, after the ones it has already
 - `src/hook.rs`: `crystal hook <agent>`: what those hooks run, any agent's, to tell the daemon, the prompt sent,
   the conversation, the agent and a subagent included (the daemon passes over an agent's that isn't the one in
-  front), and to pass on its reminder to an agent ending a turn with its task open, and to Claude Code, as the
+  front), what a turn ended saying and with still to come, and to pass on its reminder to an agent ending a turn with its task open, and to Claude Code, as the
   user sends a prompt, the name the session was renamed to in crystal or the words asking it to name the
   session, and as it's about to read or edit a file, what its project's memory has about it, asked of the
   daemon within `recall::WAIT`; with `--installed`, the hooks `crystal integration` installed, and with
@@ -528,6 +528,14 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   still run, held open, the agent still at work, until they've stopped and it hasn't taken their work up within
   a minute, a turn of its own ending the hold, or they've shown no sign of life for 15 minutes; handed over;
   pure, with the time given, so it's unit-tested
+- `src/background.rs`: the rest of the work of its own an agent's turn ends with still to come, which wakes it,
+  as Claude Code's Stop hook lists it (`background_tasks`, `session_crons`): commands in the background,
+  Monitors, wakeups, other tasks; the turn held for it, the agent still at work, until a turn of its own
+  starts or the longest that work can take has passed, and what the session's row says it waits on; handed
+  over; pure, with the time given, so it's unit-tested
+- `src/asking.rs`: whether the last message of a turn, as the Stop hook gives it, asks the user something (a
+  question, a request), says it waits on something else, or is unclear; by its words, no model, erring towards
+  asking; pure, so it's unit-tested
 - `src/front.rs`: what's in front in a session's terminal (agent, shell or program), from its foreground process:
   an agent by its program's name, the catalog's or one its rules give, or by the npm package its rules name,
   or by `CRYSTAL_AGENT` in its environment for a wrapper that hides it; and the processes in the foreground
@@ -540,7 +548,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   itself while it holds the session, the pull request and the issue it's about apart from any task, the
   conversation its agent's hooks named, which counts once the agent has worked on a turn in it, an agent typed
   into its shell whose conversation a restart resumes while it's in front, its agent's subagents and the turn
-  held for them, whether its first prompt can name it, whether the user or a script gave its name, whether its
+  held for them, or for its work in the background, what its last turn ended saying of the user (asking, a
+  task left open waiting on something else, or unclear, reminded once), whether its first prompt can name it, whether the user or a script gave its name, whether its
   agent is to name it or has been asked to, the name Claude Code gives its conversation, whether its agent is
   blocked on the user, how long its agent has sat idle (nobody watching or typing, its turn seen, or with
   nothing under its shell), what its agent left running that wakes it (a job cut loose from its terminal, a
@@ -637,7 +646,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   running or opening the project in a worktree, and `report`, the tokens on a project's rows in the sidebar,
   which the daemon keeps, hands over and the TUI asks for while a layout shows them
 - `src/tasks.rs`: tasks, sessions started with something to do: the paragraph an agent is told about
-  `crystal done`, the reminder for one that ends a turn with its task open, a task's acceptance criteria and
+  `crystal done`, the reminder for one that ends a turn with its task open saying nothing clear, a task's acceptance criteria and
   where they go in its first prompt, the goal of a task on a pull request or an issue and what its agent is
   told of them, a session with no task too, reading a project's closed tasks from the file they were kept in before the database,
   numbering tasks (`t12`) and showing a task waiting to start, the most a prompt crystal puts together may be,
