@@ -38,7 +38,7 @@ use anyhow::{Context as _, Result, bail};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, Value, value};
 
 /// Where a project keeps the plugins it ships, from its main worktree.
@@ -661,6 +661,55 @@ fn names_in(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// The installed plugin `id`, when it's on and can run here: its
+/// directory and manifest.
+pub fn ready(id: &Id) -> Result<(PathBuf, Manifest)> {
+    let label = id.label();
+    if id.project.is_none() {
+        ensure_enabled(&Config::load()?, &id.name)?;
+    } else if !is_on(&Config::load()?, id) {
+        bail!(
+            "{label} is off: `crystal plugin enable {} --project` turns it on",
+            id.name
+        );
+    }
+    let plugin = find_id(id).with_context(|| format!("there's no plugin {label}"))?;
+    if let Some(why) = plugin.blocked() {
+        bail!("{label} can't run: {why}");
+    }
+    let manifest = plugin
+        .manifest
+        .map_err(|why| anyhow::anyhow!("{label}'s plugin.toml: {why}"))?;
+    Ok((plugin.dir, manifest))
+}
+
+/// Starts the action `action` of the plugin `plugin`, about `context`, in
+/// the background, what it prints going to the plugin's log: what a key,
+/// a link or a click in the TUI or `crystal attach` hands a plugin runs.
+/// Returns its process, and what it is: `name: title`.
+pub fn start_action(
+    socket: &Path,
+    plugin: &Id,
+    action: &str,
+    context: &Context,
+) -> Result<(Child, String)> {
+    let (dir, manifest) = ready(plugin)?;
+    let label = plugin.label();
+    let action = manifest
+        .action(action)
+        .with_context(|| format!("{label} has no action {action}"))?;
+    let line = format!("{}: {}", action.id, action.command.join(" "));
+    log(socket, plugin, &line);
+    let file = open_log(socket, plugin)?;
+    let child = command(plugin, &dir, &action.command, socket, context)
+        .stdin(Stdio::null())
+        .stdout(file.try_clone()?)
+        .stderr(file)
+        .spawn()
+        .with_context(|| format!("couldn't run {}", action.command.join(" ")))?;
+    Ok((child, format!("{label}: {}", action.title)))
 }
 
 /// The plugin `id`, the user's own or a project's, if it's there.

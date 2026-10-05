@@ -114,6 +114,14 @@ impl Pane {
         copy.on_key(&mut self.screen, key)
     }
 
+    /// Text pasted while copy mode has the keyboard: into the search being
+    /// typed, if there is one.
+    pub fn copy_paste(&mut self, text: &str) {
+        if let Some(copy) = &mut self.copy {
+            copy.on_paste(&mut self.screen, text);
+        }
+    }
+
     /// The mouse went down on the cell at `(row, col)`, the first click,
     /// the second or the third of `clicks` in a row there: where a
     /// selection starts, of characters if it drags, or the word there, or
@@ -238,7 +246,7 @@ impl Pane {
 
 /// What the clicks in a row select: characters from the first, the word
 /// from a double-click, the line from a triple-click.
-fn selection_kind(clicks: u8) -> SelectionKind {
+pub fn selection_kind(clicks: u8) -> SelectionKind {
     match clicks {
         2 => SelectionKind::Words,
         3 => SelectionKind::Lines,
@@ -265,25 +273,32 @@ const CLICKS_WITHIN: Duration = Duration::from_millis(400);
 
 /// Counts the clicks on a pane's screen that come one quickly after
 /// another on the same cell, or one beside it: a double-click selects a
-/// word, and a triple-click a line.
-#[derive(Debug, Default)]
-pub struct Clicks {
-    last: Option<Click>,
+/// word, and a triple-click a line. The screen is a pane's at a [`Slot`],
+/// or `crystal attach`'s, which is the only one there.
+#[derive(Debug)]
+pub struct Clicks<S = Slot> {
+    last: Option<Click<S>>,
+}
+
+impl<S> Default for Clicks<S> {
+    fn default() -> Clicks<S> {
+        Clicks { last: None }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Click {
-    slot: Slot,
+struct Click<S> {
+    slot: S,
     cell: (u16, u16),
     at: Instant,
     count: u8,
 }
 
-impl Clicks {
+impl<S: Copy + PartialEq> Clicks<S> {
     /// A click on `cell` of the screen of the pane at `slot`, at `at`: the
     /// first in a row, the second or the third, and a fourth is a first
     /// again.
-    pub fn click(&mut self, slot: Slot, cell: (u16, u16), at: Instant) -> u8 {
+    pub fn click(&mut self, slot: S, cell: (u16, u16), at: Instant) -> u8 {
         let near = |(row, col): (u16, u16)| row.abs_diff(cell.0) <= 1 && col.abs_diff(cell.1) <= 1;
         let count = match self.last {
             Some(last)

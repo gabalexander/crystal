@@ -1,11 +1,14 @@
 //! Turning keys into the bytes a terminal would send for them, so that a
 //! session gets what it would get if it ran in a terminal of its own: the
 //! keys crossterm reports to the TUI, and the keys named to
-//! `crystal send-keys`.
+//! `crystal send-keys`. And back: what your terminal sends `crystal
+//! attach`, read into keys, for the few it takes for itself and for copy
+//! mode.
 
 use crate::vt;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::fmt::Write as _;
+use std::ops::Range;
 
 /// The bytes a terminal sends for `key`, or `None` for a key it sends
 /// nothing for. `application_cursor` is the mode a program can ask for, in
@@ -377,6 +380,268 @@ fn function_key(n: u8) -> Option<Vec<u8>> {
     Some(sequence.as_bytes().to_vec())
 }
 
+/// What a terminal sent, read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Typed {
+    Key(KeyEvent),
+    /// What was pasted, marked as a paste because the program asked.
+    Paste(String),
+    /// Not a key: a mouse report, the terminal saying it gained the focus,
+    /// or a sequence crystal doesn't read.
+    Other,
+}
+
+/// Reads what a terminal sent into what was typed, each with the bytes it
+/// took: keys the old way or in the Kitty keyboard protocol, as
+/// [`encode_for`] writes them, pastes, and the rest. A sequence cut off at
+/// the end of `bytes` is taken as far as it goes.
+pub fn decode(bytes: &[u8]) -> Vec<(Typed, Range<usize>)> {
+    let mut decoded = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let (typed, len) = decode_one(&bytes[at..]);
+        decoded.push((typed, at..at + len));
+        at += len;
+    }
+    decoded
+}
+
+/// What `bytes`, which aren't empty, start with, and how many bytes it is.
+fn decode_one(bytes: &[u8]) -> (Typed, usize) {
+    let pressed = |code| Typed::Key(KeyEvent::new(code, KeyModifiers::NONE));
+    let ctrl = |c| Typed::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    let typed = match bytes[0] {
+        0x1b => return escape(bytes),
+        b'\r' => pressed(KeyCode::Enter),
+        b'\t' => pressed(KeyCode::Tab),
+        0x7f | 0x08 => pressed(KeyCode::Backspace),
+        0x00 => ctrl(' '),
+        byte @ 0x01..=0x1a => ctrl(char::from(byte - 1 + b'a')),
+        // Ctrl+\, Ctrl+], Ctrl+^ and Ctrl+_, as crossterm names them.
+        byte @ 0x1c..=0x1f => ctrl(char::from(byte - 0x1c + b'4')),
+        _ => return character(bytes),
+    };
+    (typed, 1)
+}
+
+/// The character `bytes` start with, in UTF-8, as its key.
+fn character(bytes: &[u8]) -> (Typed, usize) {
+    let len = match bytes[0] {
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => 1,
+    };
+    let len = len.min(bytes.len());
+    let c = std::str::from_utf8(&bytes[..len])
+        .ok()
+        .and_then(|text| text.chars().next());
+    match c {
+        Some(c) => (Typed::Key(char_key(c)), len),
+        None => (Typed::Other, len),
+    }
+}
+
+/// The key that types `c`, Shift held for a capital, as crossterm has it.
+fn char_key(c: char) -> KeyEvent {
+    let modifiers = if c.is_ascii_uppercase() {
+        KeyModifiers::SHIFT
+    } else {
+        KeyModifiers::NONE
+    };
+    KeyEvent::new(KeyCode::Char(c), modifiers)
+}
+
+/// What `bytes`, which start with an escape, are: a CSI or SS3 sequence, a
+/// key with Alt held, or Esc on its own.
+fn escape(bytes: &[u8]) -> (Typed, usize) {
+    let pressed = |code| Typed::Key(KeyEvent::new(code, KeyModifiers::NONE));
+    match bytes.get(1) {
+        None | Some(0x1b) => (pressed(KeyCode::Esc), 1),
+        Some(b'[') => csi(bytes),
+        Some(b'O') if bytes.len() > 2 => {
+            let code = match bytes[2] {
+                b'A' => KeyCode::Up,
+                b'B' => KeyCode::Down,
+                b'C' => KeyCode::Right,
+                b'D' => KeyCode::Left,
+                b'H' => KeyCode::Home,
+                b'F' => KeyCode::End,
+                letter @ b'P'..=b'S' => KeyCode::F(letter - b'P' + 1),
+                _ => return (Typed::Other, 3),
+            };
+            (pressed(code), 3)
+        }
+        Some(_) => match decode_one(&bytes[1..]) {
+            (Typed::Key(mut key), len) => {
+                key.modifiers |= KeyModifiers::ALT;
+                (Typed::Key(key), len + 1)
+            }
+            (_, len) => (Typed::Other, len + 1),
+        },
+    }
+}
+
+/// The end of a bracketed paste.
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// What a CSI sequence at the start of `bytes` is, and how long it is: its
+/// parameters, then any intermediate bytes, then the byte that ends it.
+fn csi(bytes: &[u8]) -> (Typed, usize) {
+    // A mouse report the old way: three bytes after `CSI M`.
+    if bytes.get(2) == Some(&b'M') {
+        return (Typed::Other, bytes.len().min(6));
+    }
+    let params_end = (2..bytes.len())
+        .find(|&at| !(0x30..=0x3f).contains(&bytes[at]))
+        .unwrap_or(bytes.len());
+    let end = (params_end..bytes.len())
+        .find(|&at| !(0x20..=0x2f).contains(&bytes[at]))
+        .unwrap_or(bytes.len());
+    let Some(&last) = bytes.get(end) else {
+        return (Typed::Other, bytes.len());
+    };
+    let len = end + 1;
+    let params = String::from_utf8_lossy(&bytes[2..params_end]);
+    if params == "200" && last == b'~' {
+        let rest = &bytes[len..];
+        let ends = rest.windows(PASTE_END.len()).position(|w| w == PASTE_END);
+        let (pasted, taken) = match ends {
+            Some(at) => (&rest[..at], at + PASTE_END.len()),
+            None => (rest, rest.len()),
+        };
+        let pasted = String::from_utf8_lossy(pasted).into_owned();
+        return (Typed::Paste(pasted), len + taken);
+    }
+    // Private parameters, like an SGR mouse report's `<`, aren't keys.
+    if end != params_end || params.starts_with(['<', '=', '>', '?']) {
+        return (Typed::Other, len);
+    }
+    let key = match last {
+        b'u' => kitty_key(&params),
+        b'A' => csi_key(KeyCode::Up, &params),
+        b'B' => csi_key(KeyCode::Down, &params),
+        b'C' => csi_key(KeyCode::Right, &params),
+        b'D' => csi_key(KeyCode::Left, &params),
+        b'H' => csi_key(KeyCode::Home, &params),
+        b'F' => csi_key(KeyCode::End, &params),
+        b'P'..=b'S' => csi_key(KeyCode::F(last - b'P' + 1), &params),
+        b'Z' => Some(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+        b'~' => tilde_code(&params).and_then(|code| csi_key(code, &params)),
+        _ => None,
+    };
+    (key.map_or(Typed::Other, Typed::Key), len)
+}
+
+/// A key written with a letter or `~` at its end, with the modifiers and
+/// the event in its second parameter: `1;5A` is Ctrl+Up.
+fn csi_key(code: KeyCode, params: &str) -> Option<KeyEvent> {
+    let (modifiers, kind) = held(params.split(';').nth(1))?;
+    Some(KeyEvent::new_with_kind(code, modifiers, kind))
+}
+
+/// The key a number before `~` stands for.
+fn tilde_code(params: &str) -> Option<KeyCode> {
+    let number: u8 = params.split(';').next()?.parse().ok()?;
+    let code = match number {
+        1 | 7 => KeyCode::Home,
+        2 => KeyCode::Insert,
+        3 => KeyCode::Delete,
+        4 | 8 => KeyCode::End,
+        5 => KeyCode::PageUp,
+        6 => KeyCode::PageDown,
+        11..=15 => KeyCode::F(number - 10),
+        17..=21 => KeyCode::F(number - 11),
+        23 | 24 => KeyCode::F(number - 12),
+        _ => return None,
+    };
+    Some(code)
+}
+
+/// The modifiers and the event a field of `modifiers:event` says, as the
+/// Kitty protocol and xterm write them: one more than the modifiers' bits,
+/// Caps Lock and Num Lock not counted, and 1 for a press, 2 a repeat, 3 a
+/// release. A field left out is a press with none held.
+fn held(field: Option<&str>) -> Option<(KeyModifiers, KeyEventKind)> {
+    let mut parts = field.unwrap_or("").split(':');
+    let number = |part: Option<&str>| match part {
+        None | Some("") => Some(1),
+        Some(part) => part.parse::<u16>().ok(),
+    };
+    let bits = number(parts.next())?.checked_sub(1)?;
+    let mut modifiers = KeyModifiers::NONE;
+    for (bit, modifier) in [
+        (1, KeyModifiers::SHIFT),
+        (2, KeyModifiers::ALT),
+        (4, KeyModifiers::CONTROL),
+        (8, KeyModifiers::SUPER),
+        (16, KeyModifiers::HYPER),
+        (32, KeyModifiers::META),
+    ] {
+        if bits & bit != 0 {
+            modifiers |= modifier;
+        }
+    }
+    let kind = match number(parts.next())? {
+        1 => KeyEventKind::Press,
+        2 => KeyEventKind::Repeat,
+        3 => KeyEventKind::Release,
+        _ => return None,
+    };
+    Some((modifiers, kind))
+}
+
+/// A key in the Kitty protocol, `CSI code:shifted ; modifiers:event ; text
+/// u`: the shifted key, or the text, says what Shift made of it where
+/// they're given.
+fn kitty_key(params: &str) -> Option<KeyEvent> {
+    let mut fields = params.split(';');
+    let mut codes = fields.next().unwrap_or("").split(':');
+    let (modifiers, kind) = held(fields.next())?;
+    let text = fields.next().and_then(|text| {
+        let first = text.split(':').next()?;
+        char::from_u32(first.parse().ok()?)
+    });
+    let number: u32 = codes.next()?.parse().ok()?;
+    let shifted = codes
+        .next()
+        .and_then(|shifted| char::from_u32(shifted.parse().ok()?));
+    let code = match number {
+        13 | 57414 => KeyCode::Enter,
+        9 => KeyCode::Tab,
+        27 => KeyCode::Esc,
+        127 => KeyCode::Backspace,
+        // The protocol's own numbers, for keys with no character: the
+        // keypad's, the modifiers' on their own, and the like.
+        57344.. => return None,
+        _ => {
+            let c = char::from_u32(number)?;
+            let c = match (shifted, text) {
+                _ if !modifiers.contains(KeyModifiers::SHIFT) => c,
+                (Some(shifted), _) => shifted,
+                (None, Some(text)) => text,
+                (None, None) => shifted_char(c),
+            };
+            KeyCode::Char(c)
+        }
+    };
+    if code == KeyCode::Tab && modifiers.contains(KeyModifiers::SHIFT) {
+        return Some(KeyEvent::new_with_kind(KeyCode::BackTab, modifiers, kind));
+    }
+    Some(KeyEvent::new_with_kind(code, modifiers, kind))
+}
+
+/// The character Shift makes of `c` on a US keyboard: what [`unshifted`]
+/// undoes.
+fn shifted_char(c: char) -> char {
+    let pairs = "1!2@3#4$5%6^7&8*9(0)-_=+[{]}\\|;:'\",<.>/?`~";
+    let chars: Vec<char> = pairs.chars().collect();
+    match chars.chunks(2).find(|pair| pair[0] == c) {
+        Some(pair) => pair[1],
+        None => c.to_uppercase().next().unwrap_or(c),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,5 +861,118 @@ mod tests {
         assert_eq!(encoded(key(KeyCode::F(1))), b"\x1bOP");
         assert_eq!(encoded(key(KeyCode::F(12))), b"\x1b[24~");
         assert_eq!(encode(&key(KeyCode::F(13)), false), None);
+    }
+
+    /// What `bytes` read back as, with the bytes each took.
+    fn decoded(bytes: &[u8]) -> Vec<(Typed, Range<usize>)> {
+        decode(bytes)
+    }
+
+    /// The one thing `bytes` read back as, which takes them all.
+    fn decoded_one(bytes: &[u8]) -> Typed {
+        let mut decoded = decode(bytes);
+        assert_eq!(decoded.len(), 1, "{decoded:?}");
+        let (typed, range) = decoded.remove(0);
+        assert_eq!(range, 0..bytes.len());
+        typed
+    }
+
+    fn typed(code: KeyCode, modifiers: KeyModifiers) -> Typed {
+        Typed::Key(with(code, modifiers))
+    }
+
+    #[test]
+    fn keys_the_old_way_read_back() {
+        use KeyModifiers as M;
+        let cases: &[(&[u8], Typed)] = &[
+            (b"a", typed(KeyCode::Char('a'), M::NONE)),
+            (b"V", typed(KeyCode::Char('V'), M::SHIFT)),
+            ("é".as_bytes(), typed(KeyCode::Char('é'), M::NONE)),
+            (b"\r", typed(KeyCode::Enter, M::NONE)),
+            (b"\x7f", typed(KeyCode::Backspace, M::NONE)),
+            (b"\x02", typed(KeyCode::Char('b'), M::CONTROL)),
+            (b"\x1c", typed(KeyCode::Char('4'), M::CONTROL)),
+            (b"\x1b", typed(KeyCode::Esc, M::NONE)),
+            (b"\x1bb", typed(KeyCode::Char('b'), M::ALT)),
+            (b"\x1b[A", typed(KeyCode::Up, M::NONE)),
+            (b"\x1bOA", typed(KeyCode::Up, M::NONE)),
+            (b"\x1b[1;5A", typed(KeyCode::Up, M::CONTROL)),
+            (b"\x1b[5~", typed(KeyCode::PageUp, M::NONE)),
+            (b"\x1b[6;2~", typed(KeyCode::PageDown, M::SHIFT)),
+            (b"\x1b[Z", typed(KeyCode::BackTab, M::SHIFT)),
+        ];
+        for (bytes, key) in cases {
+            assert_eq!(
+                &decoded_one(bytes),
+                key,
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn keys_in_the_kitty_protocol_read_back() {
+        use KeyModifiers as M;
+        let release = |code, modifiers| {
+            Typed::Key(KeyEvent::new_with_kind(
+                code,
+                modifiers,
+                KeyEventKind::Release,
+            ))
+        };
+        let cases: &[(&[u8], Typed)] = &[
+            (b"\x1b[98;5u", typed(KeyCode::Char('b'), M::CONTROL)),
+            (b"\x1b[27u", typed(KeyCode::Esc, M::NONE)),
+            (b"\x1b[13;2u", typed(KeyCode::Enter, M::SHIFT)),
+            (b"\x1b[92;5:3u", release(KeyCode::Char('\\'), M::CONTROL)),
+            // Caps Lock on doesn't count.
+            (b"\x1b[92;69u", typed(KeyCode::Char('\\'), M::CONTROL)),
+            // Shift's key, from the shifted key, the text, or a US keyboard.
+            (b"\x1b[118:86;2u", typed(KeyCode::Char('V'), M::SHIFT)),
+            (b"\x1b[47;2;63u", typed(KeyCode::Char('?'), M::SHIFT)),
+            (b"\x1b[47;2u", typed(KeyCode::Char('?'), M::SHIFT)),
+            (b"\x1b[9;2u", typed(KeyCode::BackTab, M::SHIFT)),
+            // Left Shift on its own.
+            (b"\x1b[57441;2u", Typed::Other),
+        ];
+        for (bytes, key) in cases {
+            assert_eq!(
+                &decoded_one(bytes),
+                key,
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn what_isnt_a_key_reads_back_whole_as_other() {
+        for bytes in [
+            &b"\x1b[<64;3;2M"[..],
+            b"\x1b[M #\"",
+            b"\x1b[I",
+            b"\x1b[?1u",
+            b"\x1b[92;5",
+        ] {
+            let what = String::from_utf8_lossy(bytes);
+            assert_eq!(decoded_one(bytes), Typed::Other, "{what:?}");
+        }
+    }
+
+    #[test]
+    fn a_paste_reads_back_whole_and_each_key_with_its_bytes() {
+        let bytes = b"a\x1b[A\x1b[200~hi\r\x1b[201~\x1bOBz";
+        let read: Vec<(Typed, Range<usize>)> = decoded(bytes);
+        assert_eq!(
+            read,
+            [
+                (typed(KeyCode::Char('a'), KeyModifiers::NONE), 0..1),
+                (typed(KeyCode::Up, KeyModifiers::NONE), 1..4),
+                (Typed::Paste("hi\r".into()), 4..19),
+                (typed(KeyCode::Down, KeyModifiers::NONE), 19..22),
+                (typed(KeyCode::Char('z'), KeyModifiers::NONE), 22..23),
+            ]
+        );
     }
 }

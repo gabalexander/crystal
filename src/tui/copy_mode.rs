@@ -1,8 +1,10 @@
 //! Copy mode: vi's keys move a cursor over a pane's screen and back
-//! through its history, select from it, and search it, and what's selected
-//! goes to the clipboard; `o` opens the link under the cursor. The program
-//! in the pane goes on running, and its output on showing. Kept apart from I/O: the keys work on the pane's
-//! screen, and say what's to be copied.
+//! through its history, select from it, and search it as the search is
+//! typed, and what's selected goes to the clipboard; `o` opens the link
+//! under the cursor. The program in the pane goes on running, and its
+//! output on showing. The TUI's panes and `crystal attach` both have it.
+//! Kept apart from I/O: the keys work on the screen, and say what's to be
+//! copied.
 
 use super::text_input::TextInput;
 use crate::vt::{self, Motion, SelectionKind};
@@ -18,12 +20,59 @@ pub struct CopyMode {
     g: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SearchPrompt {
-    pub input: TextInput,
+    input: TextInput,
     /// `/` searches down, `?` up.
-    pub forward: bool,
+    forward: bool,
+    /// Where copy mode was as the search began: each key searches from
+    /// there, and `Esc` goes back.
+    from: vt::Spot,
+    /// The match the cursor is on, for what's typed so far.
+    found: Option<vt::Found>,
 }
+
+impl SearchPrompt {
+    /// What leads the search on the line it's typed on.
+    pub fn label(&self) -> &'static str {
+        if self.forward {
+            " search down: "
+        } else {
+            " search up: "
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        self.input.text()
+    }
+
+    /// The cursor's place in the text, counted in characters.
+    pub fn cursor(&self) -> usize {
+        self.input.cursor()
+    }
+
+    /// Whether what's typed so far matches anything.
+    pub fn matches(&self) -> bool {
+        self.found.is_some()
+    }
+
+    /// What what's typed so far found: which match the cursor is on, `3 of
+    /// 12`, or that nothing matches. Nothing before anything's typed.
+    pub fn count(&self) -> Option<String> {
+        if self.input.text().is_empty() {
+            return None;
+        }
+        Some(self.found.map_or_else(|| NO_MATCH.to_string(), place))
+    }
+
+    /// Searches for what's typed, from where the search began.
+    fn search(&mut self, screen: &mut vt::Screen) {
+        self.found = screen.search_from(&self.from, self.input.text(), self.forward);
+    }
+}
+
+/// What a search says when nothing matches it.
+const NO_MATCH: &str = "no match";
 
 /// What a key in copy mode asks for, beyond what it did to the screen.
 #[derive(Debug, PartialEq, Eq)]
@@ -85,8 +134,8 @@ impl CopyMode {
                     None => Outcome::Say("there's no link under the cursor".into()),
                 };
             }
-            KeyCode::Char('/') => self.open_prompt(true),
-            KeyCode::Char('?') => self.open_prompt(false),
+            KeyCode::Char('/') => self.open_prompt(screen, true),
+            KeyCode::Char('?') => self.open_prompt(screen, false),
             KeyCode::Char('n') => return self.search_again(screen, self.forward),
             KeyCode::Char('N') => return self.search_again(screen, !self.forward),
             KeyCode::Char('q') => return Outcome::Leave,
@@ -104,38 +153,61 @@ impl CopyMode {
     }
 
     /// Text pasted while copy mode has the keyboard: into the search being
-    /// typed, if there is one.
-    pub fn on_paste(&mut self, text: &str) {
+    /// typed, if there is one, which it searches for.
+    pub fn on_paste(&mut self, screen: &mut vt::Screen, text: &str) {
         if let Some(prompt) = &mut self.prompt {
             prompt.input.insert_str(text);
+            prompt.search(screen);
         }
     }
 
-    fn open_prompt(&mut self, forward: bool) {
+    fn open_prompt(&mut self, screen: &vt::Screen, forward: bool) {
         self.prompt = Some(SearchPrompt {
             input: TextInput::default(),
             forward,
+            from: screen.spot(),
+            found: None,
         });
     }
 
-    /// Keys while a search is being typed: Enter searches, Esc doesn't, and
-    /// the rest edit it.
+    /// Keys while a search is being typed: each one that changes it
+    /// searches again from where it began, the cursor going to the nearest
+    /// match; Enter keeps it, and Esc (or Ctrl+C) goes back to where it
+    /// began, and to the search before.
     fn on_prompt_key(&mut self, screen: &mut vt::Screen, key: KeyEvent) -> Outcome {
         let Some(prompt) = &mut self.prompt else {
             return Outcome::Stay;
         };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let cancel = key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c'));
         match key.code {
-            KeyCode::Esc => self.prompt = None,
+            _ if cancel => {
+                screen.go_back(&prompt.from);
+                self.prompt = None;
+            }
             KeyCode::Enter => {
-                let SearchPrompt { input, forward } = self.prompt.take().unwrap_or_default();
-                let text = input.text();
-                if text.is_empty() {
+                let Some(SearchPrompt {
+                    input,
+                    forward,
+                    found,
+                    ..
+                }) = self.prompt.take()
+                else {
+                    return Outcome::Stay;
+                };
+                if input.text().is_empty() {
                     return Outcome::Stay;
                 }
                 self.forward = forward;
-                return said(screen.search(text, forward), text);
+                return said(found, input.text());
             }
-            _ => prompt.input.on_key(&key),
+            _ => {
+                let before = prompt.input.text().to_string();
+                prompt.input.on_key(&key);
+                if prompt.input.text() != before {
+                    prompt.search(screen);
+                }
+            }
         }
         Outcome::Stay
     }
@@ -146,7 +218,7 @@ impl CopyMode {
         }
         match screen.search_again(forward) {
             Some(found) => Outcome::Say(place(found)),
-            None => Outcome::Say("no match".into()),
+            None => Outcome::Say(NO_MATCH.into()),
         }
     }
 }
@@ -335,12 +407,66 @@ mod tests {
     }
 
     #[test]
-    fn esc_in_a_search_being_typed_drops_only_the_search() {
+    fn a_search_goes_to_the_nearest_match_as_it_is_typed() {
+        let (mut copy, mut screen) = (CopyMode::default(), screen());
+        press(&mut copy, &mut screen, "?line 4");
+        let prompt = copy.prompt.as_ref().unwrap();
+        assert_eq!(screen.copy_cursor_line(), "line 4 of ten");
+        assert_eq!(prompt.count().as_deref(), Some("1 of 1"));
+        // A letter taken back searches again from where it began: up from
+        // the bottom, line 9 is nearest.
+        copy.on_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(screen.copy_cursor_line(), "line 9 of ten");
+        let prompt = copy.prompt.as_ref().unwrap();
+        assert_eq!(prompt.count().as_deref(), Some("10 of 10"));
+
+        press(&mut copy, &mut screen, "x");
+        assert_eq!(screen.copy_cursor_line(), "", "back where it began");
+        let prompt = copy.prompt.as_ref().unwrap();
+        assert_eq!(prompt.count().as_deref(), Some("no match"));
+    }
+
+    #[test]
+    fn enter_keeps_the_match_the_search_went_to() {
+        let (mut copy, mut screen) = (CopyMode::default(), screen());
+        let outcome = press(&mut copy, &mut screen, "?line 4\r");
+        assert_eq!(outcome, Outcome::Say("line 4: 1 of 1".into()));
+        assert!(copy.prompt.is_none());
+        assert_eq!(screen.copy_cursor_line(), "line 4 of ten");
+        assert!(screen.searched());
+    }
+
+    #[test]
+    fn esc_in_a_search_being_typed_goes_back_to_where_it_began() {
         let (mut copy, mut screen) = (CopyMode::default(), screen());
         let outcome = press(&mut copy, &mut screen, "/of\x1b");
         assert_eq!(outcome, Outcome::Stay);
         assert!(copy.prompt.is_none());
         assert!(!screen.searched());
+
+        // With a search before, the cursor goes back, and n goes on with
+        // the search before.
+        press(&mut copy, &mut screen, "?ten\rk");
+        assert_eq!(screen.copy_cursor_line(), "line 8 of ten");
+        press(&mut copy, &mut screen, "?line 2");
+        assert_eq!(screen.copy_cursor_line(), "line 2 of ten");
+        assert_ne!(screen.scrolled_back(), 0);
+        press(&mut copy, &mut screen, "\x1b");
+        assert_eq!(screen.copy_cursor_line(), "line 8 of ten");
+        assert_eq!(screen.scrolled_back(), 0);
+        assert_eq!(
+            press(&mut copy, &mut screen, "n"),
+            Outcome::Say("8 of 10".into())
+        );
+
+        // Ctrl+C goes back too.
+        press(&mut copy, &mut screen, "/line 0");
+        assert_eq!(copy.on_key(&mut screen, ctrl('c')), Outcome::Stay);
+        assert!(copy.prompt.is_none());
+        assert_eq!(screen.copy_cursor_line(), "line 7 of ten");
     }
 
     #[test]
@@ -380,10 +506,11 @@ mod tests {
     #[test]
     fn a_paste_goes_into_the_search_being_typed() {
         let (mut copy, mut screen) = (CopyMode::default(), screen());
-        copy.on_paste("ignored");
+        copy.on_paste(&mut screen, "ignored");
         assert!(copy.prompt.is_none());
         press(&mut copy, &mut screen, "/");
-        copy.on_paste("line 4\n");
+        copy.on_paste(&mut screen, "line 4\n");
+        assert_eq!(screen.copy_cursor_line(), "line 4 of ten");
         let outcome = press(&mut copy, &mut screen, "\r");
         assert_eq!(outcome, Outcome::Say("line 4: 1 of 1".into()));
     }

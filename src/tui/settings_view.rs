@@ -1917,7 +1917,8 @@ fn shown(setting: Setting, config: &Config) -> Shown {
             "off, your terminal selects as it would without crystal",
         ),
         S::CopyOnSelect => Shown {
-            dim: !config.mouse.capture,
+            // What crystal attach selects too, while it takes the mouse.
+            dim: !config.mouse.capture && !config.mouse.attach_capture,
             ..switch(
                 config.mouse.copy_on_select,
                 "as you let go; off, it waits in copy mode for y",
@@ -1945,7 +1946,7 @@ fn shown(setting: Setting, config: &Config) -> Shown {
         },
         S::AttachCapture => switch(
             config.mouse.attach_capture,
-            "crystal attach's wheel scrolls its history",
+            "crystal attach's wheel scrolls its history, a drag selects",
         ),
         S::ProgramsCopy => switch(
             config.clipboard.allow_programs,
