@@ -3,11 +3,12 @@
 //! a session.
 
 use crate::client;
-use crate::config::Config;
+use crate::config::{Config, Embedder, MemorySettings};
 use crate::distill;
-use crate::embed::{self, Models};
+use crate::embed::{self, Embed, Models};
 use crate::env;
 use crate::events::{self, Event};
+use crate::gemini;
 use crate::git::Checkout;
 use crate::memory::{
     self, Added, Entry, Forgotten, Kind, Listed, Memory, Merge, New, Source, Store, Wanted,
@@ -279,7 +280,7 @@ pub fn search(
     let dir = dir_or_current(dir)?;
     let settings = Config::load()?.memory;
     let downloaded = embed::models_dir().is_some_and(|dir| embed::is_downloaded(&dir));
-    if settings.embeddings && !downloaded {
+    if settings.embeddings && settings.embedder == Embedder::Local && !downloaded {
         errln!(
             "the models that search by meaning aren't downloaded yet, so this goes by words \
              alone: the daemon gets them as it starts, or `crystal memory embed` does now"
@@ -476,11 +477,26 @@ fn tell(socket: &Path, event: Event) {
     }
 }
 
-/// Downloads the models that search by meaning if they aren't here yet,
-/// then gives every entry of every project its vector, and says how many
-/// that was.
+/// Gives every entry of every project its vector from what searches by
+/// meaning, and says how many that was: with Gemini, from it first, and
+/// what Google counted; then downloads the models here if they aren't yet,
+/// which with Gemini are the reranker and what a search falls back on.
 pub fn embed(socket: &Path) -> Result<()> {
     check_on()?;
+    let settings = Config::load()?.memory;
+    let gemini = settings.embedder == Embedder::Gemini;
+    if gemini {
+        let remote = embed::gemini_alone(&settings);
+        let counted = |remote: &embed::Remote| remote.status().tokens;
+        let before = counted(&remote);
+        let count = Store::open(socket)?.embed_missing(&remote)?;
+        let tokens = counted(&remote) - before;
+        outln!(
+            "embedded {count} entries with {}: {tokens} tokens, {}",
+            remote.model(),
+            gemini::cost(tokens)
+        )?;
+    }
     let root = match embed::models_dir().filter(|root| embed::is_downloaded(root)) {
         Some(root) => root,
         None => {
@@ -488,17 +504,120 @@ pub fn embed(socket: &Path) -> Result<()> {
             embed::download(std::io::stderr().is_terminal())?
         }
     };
-    // Embedding needs only the one model.
-    let models = Models::load(&root, false)?;
-    let count = Store::open(socket)?.embed_missing(&models)?;
-    outln!("embedded {count} entries with {}", embed::MODEL)?;
-    if !Config::load()?.memory.embeddings {
+    if !gemini {
+        // Embedding needs only the one model.
+        let models = Models::load(&root, false)?;
+        let count = Store::open(socket)?.embed_missing(&models)?;
+        outln!("embedded {count} entries with {}", embed::MODEL)?;
+    }
+    if !settings.embeddings {
         outln!(
             "searches use it once `embeddings = true` is under `[memory]` in {}",
             crate::config::path().display()
         )?;
     }
     Ok(())
+}
+
+/// Says how search by meaning stands: as the daemon has it, which keeps
+/// what Gemini last answered, or as it is here with no daemon.
+pub fn status(socket: &Path) -> Result<()> {
+    check_on()?;
+    let settings = Config::load()?.memory;
+    let status = match client::ask(socket, &Request::EmbeddingStatus, false) {
+        Ok(Some(Response::EmbeddingStatus(status))) => status,
+        _ => embed::status(socket, &settings)?,
+    };
+    for (label, said) in status_lines(&settings, &status) {
+        outln!("{label:<18}{said}")?;
+    }
+    Ok(())
+}
+
+/// The lines `crystal memory status` prints, each a label and what it says.
+fn status_lines(settings: &MemorySettings, status: &embed::Status) -> Vec<(&'static str, String)> {
+    let mut lines = Vec::new();
+    let downloaded = status.is_downloaded();
+    let models = match (&status.preparing, downloaded, status.loaded) {
+        (Some(doing), false, _) => format!(
+            "{doing}: {} of {} MB",
+            status.on_disk / 1_000_000,
+            status.size / 1_000_000
+        ),
+        (Some(doing), true, _) => format!("{doing}…"),
+        (None, false, _) => format!(
+            "not downloaded ({} MB): `crystal memory embed` gets them",
+            status.size / 1_000_000
+        ),
+        (None, true, true) => "downloaded, loaded".to_string(),
+        (None, true, false) => "downloaded, loaded once a search needs them".to_string(),
+    };
+    if !settings.embeddings {
+        lines.push((
+            "search by meaning",
+            "off: by words alone (`embeddings = false` under [memory])".to_string(),
+        ));
+    } else if let Some(gemini) = &status.gemini {
+        lines.push((
+            "search by meaning",
+            format!(
+                "by {gemini_model} through Google's Gemini API: entries' text and searches go \
+                 to Google",
+                gemini_model = gemini.model
+            ),
+        ));
+        let key = match (&gemini.key, gemini.key_shared) {
+            (Some(key), false) => key.clone(),
+            (Some(key), true) => format!("{key} (others can read it: chmod 600 it)"),
+            (None, _) => "none found".to_string(),
+        };
+        lines.push(("key", key));
+        let meanwhile = match downloaded {
+            true => format!("searches go by {} meanwhile", embed::MODEL),
+            false => "searches go by words meanwhile".to_string(),
+        };
+        let said = match (&gemini.failed, gemini.failed_secs_ago) {
+            (Some(failed), Some(secs)) => {
+                let when = match ago(0, secs) {
+                    now if now == "now" => "just now".to_string(),
+                    ago => format!("{ago} ago"),
+                };
+                format!("failed {when}: {failed}; {meanwhile}")
+            }
+            (Some(failed), None) => format!("{failed}; {meanwhile}"),
+            (None, _) if gemini.tokens == 0 => "nothing asked yet".to_string(),
+            (None, _) => format!(
+                "working: {} tokens sent since the daemon started, {}",
+                gemini.tokens,
+                gemini::cost(gemini.tokens)
+            ),
+        };
+        lines.push(("gemini", said));
+    } else {
+        lines.push((
+            "search by meaning",
+            format!("by {}, on this machine", embed::MODEL),
+        ));
+    }
+    if settings.embeddings {
+        lines.push((
+            "entries",
+            format!(
+                "{} of {} have their vector from {}",
+                status.embedded, status.entries, status.embedder
+            ),
+        ));
+    }
+    lines.push(("models here", format!("{}: {models}", embed::names())));
+    if let Some(failed) = &status.failed {
+        lines.push(("", format!("couldn't get them ready: {failed}")));
+    }
+    let rerank = match settings.rerank {
+        true => "the reranker reads the best of each search again",
+        false => "off (`rerank = false` under [memory])",
+    };
+    lines.push(("rerank", rerank.to_string()));
+    lines
 }
 
 /// Has the daemon run the distiller over what the session `name` did, and
@@ -739,5 +858,82 @@ mod tests {
             merges_text(&[], false),
             "no two entries say the same thing\n"
         );
+    }
+
+    #[test]
+    fn the_status_says_what_makes_vectors_where_gemini_s_key_is_and_how_it_went() {
+        let mut settings = MemorySettings::default();
+        let status = embed::Status {
+            size: 2_449_000_000,
+            entries: 512,
+            embedded: 512,
+            embedder: embed::MODEL.into(),
+            ..embed::Status::default()
+        };
+        let said = |settings: &MemorySettings, status: &embed::Status| {
+            status_lines(settings, status)
+                .iter()
+                .map(|(label, said)| format!("{label:<18}{said}\n"))
+                .collect::<String>()
+        };
+        let here = said(&settings, &status);
+        assert!(
+            here.contains(
+                "search by meaning by jinaai/jina-embeddings-v5-text-small, on this machine"
+            ),
+            "{here}"
+        );
+        assert!(
+            here.contains("512 of 512 have their vector from jinaai/"),
+            "{here}"
+        );
+        assert!(here.contains("not downloaded (2449 MB)"), "{here}");
+        settings.embedder = Embedder::Gemini;
+        let working = gemini::Status {
+            model: "gemini-embedding-2@768".into(),
+            key: Some("~/.config/crystal/gemini.key".into()),
+            tokens: 31_691,
+            ..gemini::Status::default()
+        };
+        let through = embed::Status {
+            on_disk: 2_449_000_000,
+            loaded: true,
+            embedder: working.model.clone(),
+            gemini: Some(working.clone()),
+            ..status.clone()
+        };
+        let gemini = said(&settings, &through);
+        assert!(
+            gemini.contains("by gemini-embedding-2@768 through Google's Gemini API: entries' text"),
+            "{gemini}"
+        );
+        assert!(gemini.contains("key               ~/.config/crystal/gemini.key\n"));
+        assert!(gemini.contains("working: 31691 tokens sent"), "{gemini}");
+        assert!(gemini.contains("downloaded, loaded"), "{gemini}");
+        let failed = embed::Status {
+            gemini: Some(gemini::Status {
+                failed: Some("gemini-embedding-2: Quota exceeded. (RESOURCE_EXHAUSTED)".into()),
+                failed_secs_ago: Some(180),
+                key_shared: true,
+                ..working
+            }),
+            ..through
+        };
+        let failing = said(&settings, &failed);
+        assert!(
+            failing.contains(
+                "failed 3m ago: gemini-embedding-2: Quota exceeded. (RESOURCE_EXHAUSTED); \
+                 searches go by jinaai/jina-embeddings-v5-text-small meanwhile"
+            ),
+            "{failing}"
+        );
+        assert!(
+            failing.contains("(others can read it: chmod 600 it)"),
+            "{failing}"
+        );
+        settings.embeddings = false;
+        let off = said(&settings, &failed);
+        assert!(off.contains("off: by words alone"), "{off}");
+        assert!(!off.contains("have their vector"), "{off}");
     }
 }

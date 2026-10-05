@@ -12,7 +12,7 @@ use crate::artifacts;
 use crate::backlog;
 use crate::catalog;
 use crate::codex;
-use crate::config::{Config, MemorySettings};
+use crate::config::{self, Config, MemorySettings};
 use crate::db;
 use crate::db::Db;
 use crate::distill::{self, Job};
@@ -1766,35 +1766,36 @@ impl Daemon {
         })
     }
 
-    /// How the model that searches memory by meaning stands. Asked while
-    /// the config says not to search with it, the daemon lets it go; while
-    /// it has it loaded and entries have no vector yet, it gives them one,
-    /// in the background, rather than at the next search.
+    /// How the models that search memory by meaning stand. Asked while
+    /// the config says not to search with them, the daemon lets them go;
+    /// while entries have no vector yet from what searches use, and it
+    /// could give them one (the models here loaded, or Gemini with a key
+    /// and not resting after a failure), it does, in the background, rather
+    /// than at the next search.
     fn embedding_status(&self) -> Result<embed::Status> {
         let settings = settings().memory;
         embed::let_go_unless(&settings);
-        let on_disk = embed::models_dir().map_or(0, |dir| embed::on_disk(&dir));
-        let (entries, embedded) = memory::Store::open(&self.socket)?.counts(embed::MODEL)?;
-        if embed::is_loaded() && embedded < entries {
-            self.prepare_embeddings(true);
+        let mut status = embed::status(&self.socket, &settings)?;
+        let could = match status.gemini {
+            Some(_) => embed::gemini_ready(&settings),
+            None => embed::is_loaded(),
+        };
+        if could && status.embedded < status.entries {
+            self.prepare_embeddings(false);
         }
         let preparing = self.preparing.lock().unwrap();
-        Ok(embed::Status {
-            on_disk,
-            size: embed::size(),
-            loaded: embed::is_loaded(),
-            preparing: preparing.doing.map(String::from),
-            failed: preparing.failed.clone(),
-            entries,
-            embedded,
-        })
+        status.preparing = preparing.doing.map(String::from);
+        status.failed = preparing.failed.clone();
+        Ok(status)
     }
 
-    /// Gets the models that search memory by meaning ready, on a thread of
-    /// their own, unless that's being done already: downloads them if they
-    /// aren't here and `download` says to, then, while the config still says
-    /// to search with them, loads them, lets go of other models' vectors and
-    /// gives every entry its vector.
+    /// Gets what searches memory by meaning ready, on a thread of its own,
+    /// unless that's being done already: with Gemini, gives every entry its
+    /// vector from it first, which takes seconds; then downloads the models
+    /// here if they aren't yet and `download` says to, which takes minutes,
+    /// and, while the config still says to search by meaning, loads them,
+    /// lets go of the vectors of models it doesn't search with or fall back
+    /// on, and with no Gemini, gives every entry its vector from them.
     fn prepare_embeddings(&self, download: bool) {
         {
             let mut preparing = self.preparing.lock().unwrap();
@@ -1802,7 +1803,7 @@ impl Daemon {
                 return;
             }
             *preparing = Preparing {
-                doing: Some("downloading the models"),
+                doing: Some("getting the models ready"),
                 failed: None,
             };
         }
@@ -1811,24 +1812,40 @@ impl Daemon {
         thread::spawn(move || {
             let doing = |what| preparing.lock().unwrap().doing = Some(what);
             let prepared = (|| -> Result<()> {
+                let settings = settings().memory;
+                let mut store = memory::Store::open(&socket)?;
+                let gemini = settings.embedder == config::Embedder::Gemini;
+                if gemini && let Some(remote) = embed::shared(&settings) {
+                    doing("embedding the entries with Gemini");
+                    // A failure is said as it happens, and kept for the
+                    // status: the models here are got ready all the same.
+                    if let Ok(count @ 1..) = store.embed_missing(&*remote) {
+                        errln!(
+                            "crystal daemon: embedded {count} entries of memory with {}",
+                            remote.model()
+                        );
+                    }
+                }
                 let downloaded = embed::models_dir().is_some_and(|dir| embed::is_downloaded(&dir));
                 if !downloaded {
                     if !download {
                         return Ok(());
                     }
+                    doing("downloading the models");
                     errln!("crystal daemon: downloading {}", embed::names());
                     embed::download(false)?;
                 }
                 doing("loading the models");
-                let Some(models) = embed::shared_now() else {
+                let Some(models) = embed::shared(&settings) else {
                     return Ok(());
                 };
-                doing("embedding the entries");
-                let mut store = memory::Store::open(&socket)?;
-                store.forget_vectors_but(embed::MODEL)?;
-                match store.embed_missing(&*models)? {
-                    0 => {}
-                    count => errln!("crystal daemon: embedded {count} entries of memory"),
+                store.forget_vectors_but(&[embed::MODEL, &embed::gemini_model(&settings)])?;
+                if !gemini {
+                    doing("embedding the entries");
+                    match store.embed_missing(&*models)? {
+                        0 => {}
+                        count => errln!("crystal daemon: embedded {count} entries of memory"),
+                    }
                 }
                 Ok(())
             })();

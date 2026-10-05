@@ -200,7 +200,7 @@ impl Crystal {
         command.arg(&self.socket);
         command.args(args);
         command.cwd(self.dir.path());
-        for variable in crystal_variables() {
+        for variable in crystal_variables().into_iter().chain(gemini_keys()) {
             command.env_remove(variable);
         }
         // A notification's click brings the TUI's terminal to the front by
@@ -497,11 +497,18 @@ fn crystal_variables() -> Vec<std::ffi::OsString> {
         .collect()
 }
 
-/// A command for `program`, without [`crystal_variables`]: how every test
-/// runs anything.
+/// The variables crystal reads Gemini's key from: a test that searches
+/// memory through Gemini gives its fake one in a file, so the developer's
+/// own never reaches a test's daemon, nor a server.
+fn gemini_keys() -> Vec<std::ffi::OsString> {
+    vec!["GEMINI_API_KEY".into(), "GOOGLE_API_KEY".into()]
+}
+
+/// A command for `program`, without [`crystal_variables`] or
+/// [`gemini_keys`]: how every test runs anything.
 fn outside_crystal(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
-    for variable in crystal_variables() {
+    for variable in crystal_variables().into_iter().chain(gemini_keys()) {
         command.env_remove(variable);
     }
     command
@@ -9089,6 +9096,197 @@ fn what_its_worktree_changed_comes_first_in_what_an_agent_is_shown() {
         ),
         "{args}"
     );
+}
+
+/// Google's Gemini API, as memory asks it for vectors, on a web server of
+/// the test's own: each text's vector is 768 numbers, all naught but the
+/// one for what it's about, the database, deploys, or anything else; or,
+/// once it's told to, a 429. It keeps each request's head and body.
+struct FakeGemini {
+    url: String,
+    asked: Arc<Mutex<Vec<(String, String)>>>,
+    out_of_quota: Arc<Mutex<bool>>,
+}
+
+impl FakeGemini {
+    fn new() -> FakeGemini {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1beta", listener.local_addr().unwrap());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let out_of_quota = Arc::new(Mutex::new(false));
+        let (kept, quota) = (asked.clone(), out_of_quota.clone());
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let (head, body) = read_request(&stream);
+                kept.lock().unwrap().push((head, body.clone()));
+                let (code, reply) = match *quota.lock().unwrap() {
+                    true => (
+                        429,
+                        r#"{"error": {"code": 429, "message": "Quota exceeded.",
+                            "status": "RESOURCE_EXHAUSTED"}}"#
+                            .to_string(),
+                    ),
+                    false => (200, fake_vectors(&body)),
+                };
+                let mut stream = stream;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        FakeGemini {
+            url,
+            asked,
+            out_of_quota,
+        }
+    }
+
+    fn asked(&self) -> Vec<(String, String)> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+/// An HTTP request's head and body.
+fn read_request(stream: &std::net::TcpStream) -> (String, String) {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+    let (mut head, mut length) = (String::new(), 0);
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+            length = value.trim().parse().unwrap();
+        }
+        head.push_str(&line);
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+    (head, String::from_utf8(body).unwrap())
+}
+
+/// What the fake Gemini answers a `batchEmbedContents` with.
+fn fake_vectors(body: &str) -> String {
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    let requests = body["requests"].as_array().unwrap();
+    let embeddings: Vec<serde_json::Value> = requests
+        .iter()
+        .map(|request| {
+            let text = request["content"]["parts"][0]["text"].as_str().unwrap();
+            let text = text.to_lowercase();
+            let about = if text.contains("database") || text.contains("postgres") {
+                0
+            } else if text.contains("deploy") || text.contains("release") {
+                1
+            } else {
+                2
+            };
+            let mut values = vec![0.0; 768];
+            values[about] = 1.0;
+            serde_json::json!({ "values": values })
+        })
+        .collect();
+    serde_json::json!({
+        "embeddings": embeddings,
+        "usageMetadata": {"promptTokenCount": requests.len() * 10},
+    })
+    .to_string()
+}
+
+#[test]
+fn memory_searches_by_meaning_through_gemini_with_the_key_from_its_file_alone() {
+    let gemini = FakeGemini::new();
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    let key_file = crystal.dir.path().join("gemini.key");
+    std::fs::write(&key_file, "AQ.fake-key-for-the-e2e-test\n").unwrap();
+    crystal.configure(&format!(
+        "notify = false\nname_by_agent = false\n\n[memory]\ndistill = false\n\
+         embedder = \"gemini\"\ngemini_key_file = \"{}\"\n",
+        key_file.display()
+    ));
+    let run = |args: &[&str]| {
+        let out = crystal
+            .command(args)
+            .env("CRYSTAL_GEMINI_URL", &gemini.url)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "crystal {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    // A daemon to ask, which keeps how Gemini last answered.
+    run(&["new", "-d", "-n", "here", "sleep", "30"]);
+    run(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "Postgres has to be up for the ledger tests",
+    ]);
+    run(&["remember", "-C", repo_dir, "Deploys go out on Tuesdays"]);
+    // Not a word in common: found by what it means, Gemini says.
+    let found = run(&["memory", "-C", repo_dir, "search", "start the database"]);
+    assert!(found.contains("Postgres has to be up"), "{found}");
+    assert!(!found.contains("Deploys"), "{found}");
+    let asked = gemini.asked();
+    assert!(!asked.is_empty());
+    for (head, body) in &asked {
+        let request_line = head.lines().next().unwrap();
+        assert_eq!(
+            request_line,
+            "POST /v1beta/models/gemini-embedding-2:batchEmbedContents HTTP/1.1"
+        );
+        assert!(
+            head.contains("x-goog-api-key: AQ.fake-key-for-the-e2e-test\r\n"),
+            "{head}"
+        );
+        assert!(body.contains("\"outputDimensionality\":768"), "{body}");
+    }
+    let bodies: String = asked.iter().map(|(_, body)| body.as_str()).collect();
+    assert!(bodies.contains("title: none | text: Postgres has to be up"));
+    assert!(bodies.contains("| query: start the database"));
+    let status = run(&["memory", "status"]);
+    assert!(
+        status.contains("by gemini-embedding-2@768 through Google's Gemini API"),
+        "{status}"
+    );
+    assert!(
+        status.contains("entries' text and searches go to Google"),
+        "{status}"
+    );
+    assert!(
+        status.contains(&format!("key               {}", key_file.display())),
+        "{status}"
+    );
+    assert!(
+        status.contains("2 of 2 have their vector from gemini-embedding-2@768"),
+        "{status}"
+    );
+    let config = std::fs::read_to_string(crystal.config_file()).unwrap();
+    assert!(!config.contains("AQ.fake"), "the key stays in its file");
+
+    // Out of quota: a search goes by its words, and a remember still
+    // keeps its entry; the status says why.
+    *gemini.out_of_quota.lock().unwrap() = true;
+    let found = run(&["memory", "-C", repo_dir, "search", "ledger outage"]);
+    assert!(found.contains("Postgres has to be up"), "{found}");
+    let remembered = run(&["remember", "-C", repo_dir, "Releases are tagged by hand"]);
+    assert!(remembered.starts_with("remembered 3"), "{remembered}");
+    let status = run(&["memory", "status"]);
+    assert!(
+        status.contains("Quota exceeded. (RESOURCE_EXHAUSTED); searches go by words meanwhile"),
+        "{status}"
+    );
+    let tried = gemini.asked().len();
+    run(&["memory", "-C", repo_dir, "search", "another outage"]);
+    assert_eq!(gemini.asked().len(), tried, "it rests after a 429");
 }
 
 #[test]
