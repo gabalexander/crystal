@@ -1,7 +1,8 @@
 //! Finding things by typing a little of them, for `/` in the sidebar: a
 //! session, in any tab; a project crystal knows that nothing runs in, or a
-//! worktree with no sessions; a flow run, by its steps; and an open pull
-//! request of any project whose forge has listed them.
+//! worktree with no sessions; a flow run, by its steps; an open pull
+//! request or issue of any project whose forge has listed them; and an
+//! item to do on a project's backlog.
 //!
 //! A query matches when its letters turn up in order, not necessarily side
 //! by side, ignoring case: `rfx` finds `refund-fix`. Each word of the query
@@ -9,8 +10,9 @@
 //! branch, command, agent, tab or flow run, so `pay fix` finds a fixer in
 //! the payments project. Long texts, a directory or a flow's goal, only
 //! count where a word turns up in them whole, or nearly every query would
-//! find them. Where a word turns up in the name, or a pull request's
-//! title, those letters are marked, so the eye can see why it matched.
+//! find them. Where a word turns up in the name, a pull request's or an
+//! issue's title or a backlog item's line, those letters are marked, so
+//! the eye can see why it matched.
 //!
 //! Tab narrows what's found to the sessions with one status, as the keys
 //! of herdr's goto picker do: see [`StatusFilter`].
@@ -18,8 +20,8 @@
 use super::groups::Row;
 use super::status::Status;
 use crate::flow_run::FlowRun;
-use crate::forge::PullRequest;
-use crate::protocol::{Front, SessionInfo, Worktree};
+use crate::forge::{Issue, PullRequest};
+use crate::protocol::{BacklogItem, Front, SessionInfo, Worktree};
 use crate::shell;
 use std::path::{Path, PathBuf};
 
@@ -81,6 +83,30 @@ pub fn pull_request_match(
         project.to_string(),
     ];
     found(query, &pull_request.title, &also, &[])
+}
+
+/// Whether `issue`, of the project called `project`, matches `query`, and
+/// if it does, which characters of its title to mark. It's found by its
+/// title, its number (`12`, or `#12`), its author, its labels and its
+/// project.
+pub fn issue_match(query: &str, issue: &Issue, project: &str) -> Option<Vec<usize>> {
+    let mut also = vec![
+        format!("#{}", issue.number),
+        issue.author.clone(),
+        project.to_string(),
+    ];
+    also.extend(issue.labels.iter().cloned());
+    found(query, &issue.title, &also, &[])
+}
+
+/// Whether `item`, on the backlog of the project called `project`, matches
+/// `query`, and if it does, which characters of its line to mark. It's
+/// found by its line, its number (`3`, or `#3`), its tags and its project,
+/// and by its body, a word of it whole.
+pub fn backlog_match(query: &str, item: &BacklogItem, project: &str) -> Option<Vec<usize>> {
+    let mut also = vec![format!("#{}", item.number), project.to_string()];
+    also.extend(item.tags.iter().cloned());
+    found(query, &item.text, &also, std::slice::from_ref(&item.body))
 }
 
 /// Whether every word of `query` turns up in `name` or in one of `also`,
@@ -448,6 +474,54 @@ mod tests {
         assert_eq!(pull_request_match("ana", &fix, "app"), Some(vec![]));
         assert!(pull_request_match("app redirect", &fix, "app").is_some());
         assert_eq!(pull_request_match("58", &fix, "app"), None);
+    }
+
+    #[test]
+    fn an_issue_is_found_by_its_title_number_author_labels_or_project() {
+        let issue = Issue {
+            number: 12,
+            title: "Login fails on Safari".into(),
+            labels: vec!["bug".into()],
+            updated_at: "2026-10-02T09:30:00Z".into(),
+            author: "zoe".into(),
+            url: "https://github.com/acme/app/issues/12".into(),
+        };
+        assert_eq!(
+            issue_match("safari", &issue, "app"),
+            Some(vec![15, 16, 17, 18, 19, 20])
+        );
+        assert_eq!(issue_match("12", &issue, "app"), Some(vec![]));
+        assert_eq!(issue_match("#12", &issue, "app"), Some(vec![]));
+        assert_eq!(issue_match("zoe", &issue, "app"), Some(vec![]));
+        assert_eq!(issue_match("bug", &issue, "app"), Some(vec![]));
+        assert!(issue_match("app login", &issue, "app").is_some());
+        assert_eq!(issue_match("13", &issue, "app"), None);
+    }
+
+    #[test]
+    fn a_backlog_item_is_found_by_its_line_number_tags_project_or_body() {
+        let item = BacklogItem {
+            number: 3,
+            text: "Retry failed charges".into(),
+            body: "the payment client gives up after one timeout".into(),
+            tags: vec!["billing".into()],
+            done: false,
+            created: 0,
+            closed: None,
+        };
+        assert_eq!(
+            backlog_match("retry", &item, "payments"),
+            Some(vec![0, 1, 2, 3, 4])
+        );
+        assert_eq!(backlog_match("#3", &item, "payments"), Some(vec![]));
+        assert_eq!(backlog_match("billing", &item, "payments"), Some(vec![]));
+        assert_eq!(backlog_match("pay", &item, "payments"), Some(vec![]));
+        assert_eq!(backlog_match("timeout", &item, "app"), Some(vec![]));
+        assert_eq!(
+            backlog_match("tmt", &item, "app"),
+            None,
+            "scattered in the body"
+        );
     }
 
     #[test]

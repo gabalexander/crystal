@@ -20,6 +20,8 @@ pub const NO_TUI: &str = "no TUI is running";
 /// one of the TUI's; one that isn't named is the session the command was
 /// run in, or else the one selected.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "LayoutCommand"))]
 #[serde(tag = "do", rename_all = "snake_case")]
 pub enum Command {
     /// Nothing: the layout as it is.
@@ -124,6 +126,7 @@ pub enum Command {
 
 /// How big a popup is: so many cells, or a share of the screen, each way.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Popup {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub width: Option<Extent>,
@@ -133,6 +136,8 @@ pub struct Popup {
 
 /// A command as a TUI gets it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "LayoutOrder"))]
 pub struct Order {
     pub command: Command,
     /// The id of the session the command was run in, when it was run in
@@ -142,6 +147,8 @@ pub struct Order {
 
 /// An order the daemon passes on to a TUI, numbered for its answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "RelayedLayoutOrder"))]
 pub struct Relayed {
     pub id: u64,
     pub order: Order,
@@ -149,6 +156,8 @@ pub struct Relayed {
 
 /// What a TUI tells the daemon, a line at a time, once it takes orders.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "LayoutReport"))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Report {
     /// The user did something in it, so orders go to it from now on.
@@ -165,6 +174,7 @@ pub enum Report {
 
 /// A TUI's tabs and their panes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Layout {
     pub tabs: Vec<TabLayout>,
     /// Whether the user is at crystal, by what every TUI's terminal says of
@@ -174,6 +184,7 @@ pub struct Layout {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct TabLayout {
     /// Its number, from 1, as the tab bar shows it.
     pub number: usize,
@@ -192,6 +203,7 @@ pub struct TabLayout {
 
 /// A tab's panes: a pane, or a split of its room in two.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Tile {
     /// A session split off, or with `selection`, the pane that follows the

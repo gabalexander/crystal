@@ -55,6 +55,7 @@ const BRANCH_WORDS_MAX: usize = 40;
 
 /// The forges crystal speaks to, each through its own CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Forge {
     GitHub,

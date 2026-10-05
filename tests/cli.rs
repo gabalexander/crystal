@@ -3566,12 +3566,139 @@ fn the_tui_says_what_a_restart_couldn_t_start_and_starts_it_again() {
     tui.shows("after the restart: 1 couldn't start: lost");
     tui.shows("couldn't start");
     tui.shows("isn't there");
+    // It needs you: pinned at the top, and listed with why.
+    tui.shows("needs you · 1");
+    tui.type_keys("U");
+    tui.shows("couldn't start again");
+    tui.shows("r starts it again");
+    tui.type_keys("\x1b");
+    tui.hides("r starts it again");
     // Put right, Enter starts it again.
     std::fs::create_dir(&gone).unwrap();
     tui.type_keys("\r");
     tui.shows("start lost again? y/n");
     tui.type_keys("y");
     eventually("it has started", || status(&crystal, "lost") == "running");
+    crash(daemon);
+}
+
+#[test]
+fn a_terminal_shows_what_it_showed_before_a_crash_only_when_asked_to() {
+    let crystal = Crystal::new();
+    let daemon = crystal.start_daemon();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "shell",
+        "sh",
+        "-c",
+        "echo pid $$; exec sleep 300",
+    ]);
+    let before = crystal.pid("shell");
+    shows_on_screen(&crystal, "shell", &format!("pid {before}"));
+    eventually("it's saved", || crystal.saved().contains("shell"));
+    let kept = || crystal.query("SELECT coalesce(group_concat(screen), '') FROM screens");
+    // Off unless asked for: a screen can hold secrets.
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(kept().as_deref(), Some(""));
+
+    let quiet = "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
+                 [sound]\nenabled = false\n";
+    crystal.configure(&format!("{quiet}\n[sessions]\nrestore_screens = true\n"));
+    eventually("its screen is kept", || {
+        kept().is_some_and(|kept| kept.contains(&format!("pid {before}")))
+    });
+
+    crash(daemon);
+    // Left behind by the crash, it would pass for the next daemon's.
+    std::fs::remove_file(&crystal.socket).unwrap();
+    let daemon = crystal.start_daemon();
+    let after = crystal.pid("shell");
+    assert_ne!(after, before);
+    // What it showed, above what its program shows now.
+    let read = || crystal.ok(&["read", "shell", "--history"]);
+    eventually("its program has written", || {
+        read().contains(&format!("pid {after}"))
+    });
+    let screen = read();
+    let at = |text: &str| {
+        screen
+            .find(text)
+            .unwrap_or_else(|| panic!("{text}: {screen}"))
+    };
+    assert!(at(&format!("pid {before}")) < at("crystal restarted"));
+    assert!(at("crystal restarted") < at(&format!("pid {after}")));
+
+    // Turned off, what was kept is forgotten.
+    crystal.configure(quiet);
+    eventually("the screens are forgotten", || {
+        kept().as_deref() == Some("")
+    });
+    crash(daemon);
+}
+
+#[test]
+fn a_name_given_stays_through_a_rename_in_claude_code_after_a_restart() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let daemon = crystal.start_daemon_with(&[("PATH", &path)]);
+    let out = crystal
+        .command(&["new", "-n", "refunds", "claude"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let args = written(&crystal.dir.path().join("args"));
+    let args: Vec<&str> = args.lines().collect();
+    let settings: serde_json::Value = serde_json::from_str(args[3]).unwrap();
+    let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let id = || {
+        let sessions: serde_json::Value =
+            serde_json::from_str(&crystal.ok(&["ls", "--json"])).unwrap();
+        sessions[0]["id"].as_str().unwrap().to_string()
+    };
+    // Where Claude Code keeps the conversation, and its name beside it.
+    let projects = crystal.dir.path().join("projects");
+    let transcript = projects.join("talk-1.jsonl");
+    let named = projects.join("talk-1").join("custom-title.json");
+    std::fs::create_dir_all(named.parent().unwrap()).unwrap();
+    std::fs::write(&transcript, "{}\n").unwrap();
+    std::fs::write(&named, r#"{"customTitle":"Fix refund rounding"}"#).unwrap();
+    let event = |name: &str| {
+        format!(
+            r#"{{"hook_event_name":"{name}","session_id":"talk-1","transcript_path":"{}"}}"#,
+            transcript.display()
+        )
+    };
+    let says = |event: &str| {
+        let id = id();
+        let env = [("CRYSTAL_SESSION", "refunds"), ("CRYSTAL_SESSION_ID", &id)];
+        hook_says(&crystal, &env, &hook, event)
+    };
+    assert_eq!(says(&event("SessionStart")), "");
+    eventually("its conversation is written down", || {
+        crystal.saved().contains("talk-1")
+    });
+
+    crash(daemon);
+    // Left behind by the crash, it would pass for the next daemon's.
+    std::fs::remove_file(&crystal.socket).unwrap();
+    let daemon = crystal.start_daemon_with(&[("PATH", &path)]);
+    assert_eq!(status(&crystal, "refunds"), "running");
+    eventually("claude picks its conversation up", || {
+        written(&crystal.dir.path().join("args")).contains("talk-1")
+    });
+    // The name Claude Code has is where it starts; a rename after it is
+    // followed but for a name the user gave, before the restart as after.
+    assert_eq!(says(&event("Stop")), "");
+    std::fs::write(&named, r#"{"customTitle":"Something else"}"#).unwrap();
+    assert_eq!(says(&event("Stop")), "");
+    assert!(crystal.row("refunds").is_some());
+    assert!(crystal.row("something-else").is_none());
     crash(daemon);
 }
 
@@ -4326,6 +4453,35 @@ fn api_snapshot_holds_everything_and_the_seq_to_follow_on_from() {
     let news = events(&crystal, &["--after", &after]);
     assert_eq!(names(&news), ["session.started"]);
     assert_eq!(news[0]["session"]["name"], "second");
+}
+
+#[test]
+fn api_schema_says_what_it_covers_prints_it_and_writes_it_to_a_file() {
+    let crystal = Crystal::new();
+    let summary = crystal.ok(&["api", "schema"]);
+    assert!(summary.contains(env!("CARGO_PKG_VERSION")), "{summary}");
+    for message in ["request", "response", "event", "snapshot"] {
+        assert!(summary.contains(message), "{summary}");
+    }
+
+    let printed = crystal.ok(&["api", "schema", "--json"]);
+    let bundled = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/crystal-api.schema.json"),
+    )
+    .unwrap();
+    assert_eq!(printed, bundled);
+    let schema: serde_json::Value = serde_json::from_str(&printed).unwrap();
+    assert_eq!(schema["schemas"]["request"]["$ref"], "#/$defs/Request");
+    assert!(schema["$defs"]["Event"].is_object(), "{schema}");
+
+    let path = crystal.dir.path().join("crystal-api.schema.json");
+    let wrote = crystal.ok(&["api", "schema", "--output", path.to_str().unwrap()]);
+    assert!(wrote.starts_with("wrote the API schema to "), "{wrote}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), printed);
+    let err = crystal.fails(&["api", "schema", "--json", "--output", "x.json"]);
+    assert!(err.contains("cannot be used with"), "{err}");
+    // None of it needs the daemon, so none was started.
+    assert!(!crystal.socket.exists());
 }
 
 #[test]
@@ -7377,6 +7533,93 @@ fn killing_the_last_session_in_a_worktree_can_take_the_worktree_with_it() {
     assert!(crystal.row("planner").is_some());
 }
 
+#[test]
+fn closing_a_tab_with_its_sessions_asks_about_the_worktrees_it_empties() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+    crystal.ok(&[
+        "new", "-n", "fixer", "-c", repo_arg, "-w", "fix", "sleep", "30",
+    ]);
+    crystal.ok(&[
+        "new", "-n", "spiker", "-c", repo_arg, "-w", "spike", "sleep", "30",
+    ]);
+    crystal.ok(&["tab", "new", "fixing"]);
+    crystal.ok(&["tab", "move", "fixer", "fixing"]);
+    crystal.ok(&["tab", "move", "spiker", "fixing"]);
+    let trees = crystal.dir.path().join("app.worktrees");
+
+    let mut tui = crystal.tui();
+    tui.shows(" 2 fixing ");
+    tui.type_keys("&");
+    tui.shows("close tab 2 and kill its 2 sessions? y/n");
+    tui.type_keys("y");
+    tui.shows("nothing else is in worktrees fix and spike: remove them too? y/n");
+    tui.type_keys("y");
+    eventually("both worktrees are gone", || {
+        !trees.join("fix").exists() && !trees.join("spike").exists()
+    });
+    assert!(crystal.row("planner").is_some());
+}
+
+#[test]
+fn crystal_kill_removes_the_worktree_it_empties_as_told_or_says_how() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    let named = [
+        ("a", "one"),
+        ("b", "two"),
+        ("c", "three"),
+        ("d", "four"),
+        ("e", "five"),
+    ];
+    for (name, branch) in named {
+        crystal.ok(&[
+            "new", "-d", "-n", name, "-c", repo_arg, "-w", branch, "sleep", "30",
+        ]);
+    }
+    let trees = crystal.dir.path().join("app.worktrees");
+
+    // Nobody at a terminal to ask: it stays, and how to remove it is said.
+    let out = crystal.run(&["kill", "a"]);
+    assert!(out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("nothing else is in worktree one: `crystal worktree rm"),
+        "{said}"
+    );
+    assert!(trees.join("one").is_dir());
+
+    // Told to, it goes without asking; told not to, it stays, saying nothing.
+    let removed = crystal.ok(&["kill", "b", "--remove-worktree"]);
+    assert_eq!(removed, "removed worktree two\n");
+    assert!(!trees.join("two").exists());
+    let out = crystal.run(&["kill", "c", "--keep-worktree"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    assert!(trees.join("three").is_dir());
+
+    // The settings can say to remove it without asking.
+    let config = std::fs::read_to_string(crystal.config_file()).unwrap();
+    crystal.configure(&format!(
+        "{config}\n[worktrees]\nremove_emptied = \"always\"\n"
+    ));
+    std::fs::write(trees.join("four/notes.txt"), "not committed\n").unwrap();
+    // But not one with changes not committed, with nobody to say so.
+    let out = crystal.run(&["kill", "d"]);
+    assert!(out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("has uncommitted changes, so it stays"),
+        "{said}"
+    );
+    assert!(trees.join("four").is_dir());
+    assert_eq!(crystal.ok(&["kill", "e"]), "removed worktree five\n");
+    assert!(!trees.join("five").exists());
+}
+
 /// The config of a test whose new worktrees go in `directory`.
 fn worktrees_in(directory: &Path) -> String {
     format!(
@@ -7590,6 +7833,8 @@ fn worktree_move_starts_a_session_again_in_the_worktree() {
         "here",
         "-c",
         repo_arg,
+        "-t",
+        "tidy up",
         "sh",
         "-c",
         "pwd > where; exec sleep 30",
@@ -7608,6 +7853,9 @@ fn worktree_move_starts_a_session_again_in_the_worktree() {
     eventually("it runs on the worktree's branch", || {
         crystal.row("here").is_some_and(|row| row[4] == "fix")
     });
+    // Its task stays open, stopped though its program was.
+    let card = crystal.ok(&["tasks", "show", "here"]);
+    assert!(card.starts_with("t1  running  tidy up"), "{card}");
 
     // Moved again to where it is, nothing happens.
     let said = crystal.ok(&["worktree", "move", "fix", "-n", "here"]);
@@ -7690,6 +7938,117 @@ fn an_agent_moved_mid_turn_moves_once_the_turn_ends_and_carries_on_there() {
     let row = crystal.row("agent").unwrap();
     assert_eq!(row[4], "fix");
     assert_ne!(crystal.pid("agent"), pid);
+}
+
+#[test]
+fn a_move_still_to_come_is_carried_out_by_a_cold_restart() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    let bin = fake_claude(crystal.dir.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = crystal
+        .command(&["new", "-n", "agent", "-c", repo_arg, "claude"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // In a conversation, in the middle of a turn, it's asked to move.
+    let args = written(&repo.join("args"));
+    let settings: serde_json::Value = claude_settings(&args);
+    let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    let transcript = crystal.dir.path().join("abc-123.jsonl");
+    std::fs::write(&transcript, "{}\n").unwrap();
+    let prompted = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "abc-123",
+        "transcript_path": transcript,
+    });
+    run_hook(&crystal, "agent", hook, &prompted.to_string());
+    eventually("the agent is working", || {
+        crystal.row("agent").is_some_and(|row| row[1] == "working")
+    });
+    let said = crystal.ok(&["worktree", "move", "fix", "-n", "agent"]);
+    assert!(said.contains("once its agent's turn ends"), "{said}");
+    let fix = crystal.dir.path().join("app.worktrees/fix");
+
+    // Written down on its way, it starts there after a crash or a reboot,
+    // in its conversation, told it has moved.
+    eventually("the session is written down with its move", || {
+        crystal
+            .query("SELECT group_concat(moved) FROM sessions")
+            .is_some_and(|moved| moved.contains("app.worktrees/fix"))
+    });
+    let out = crystal
+        .command(&["restart-server", "--cold"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let args = written(&fix.join("args"));
+    let args: Vec<&str> = args.lines().collect();
+    let resume = args.iter().position(|arg| *arg == "--resume").unwrap();
+    assert_eq!(args[resume + 1], "abc-123");
+    let told = args.last().unwrap();
+    assert!(
+        told.starts_with("[crystal] This session has moved"),
+        "{told}"
+    );
+    eventually("it runs on the worktree's branch", || {
+        crystal.row("agent").is_some_and(|row| row[4] == "fix")
+    });
+    // Started there, it's written down as it is.
+    eventually("the move is done with", || {
+        let moved = "SELECT CAST(count(moved) AS TEXT) FROM sessions";
+        crystal.query(moved).as_deref() == Some("0")
+    });
+}
+
+#[test]
+fn a_background_task_moves_once_its_run_ends_and_carries_on_there() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = git_repo(dir, "app");
+    let repo_arg = repo.to_str().unwrap();
+    let path = path_with(&print_claude(dir));
+    let out = crystal
+        .command(&["task", "-n", "fixer", "-c", repo_arg, "fix", "the", "tests"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    runs(&repo, 1);
+
+    let out = crystal
+        .command(&["worktree", "move", "fix", "-n", "fixer"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains("fixer moves into"), "{said}");
+    assert!(said.contains("once its run ends"), "{said}");
+    let fix = dir.join("app.worktrees/fix");
+    thread::sleep(Duration::from_millis(600));
+    assert!(!fix.join("runs").exists(), "it waits for its run to end");
+
+    finish_run(&repo, 1);
+    let moved = runs(&fix, 1);
+    assert!(moved[0].contains("--resume conv-1"), "{moved:?}");
+    assert!(
+        moved[0]
+            .contains(" -- [crystal] This session has moved into the worktree on the branch `fix`"),
+        "{moved:?}"
+    );
+    eventually("it runs on the worktree's branch", || {
+        crystal.row("fixer").is_some_and(|row| row[4] == "fix")
+    });
 }
 
 #[test]
@@ -10463,6 +10822,56 @@ fn slash_finds_a_pull_request_a_project_with_nothing_running_and_keeps_to_a_stat
 }
 
 #[test]
+fn slash_finds_an_issue_and_a_backlog_item_and_a_click_on_a_count_lists_them() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = github_repo(dir);
+    let issues = r#"[{"number": 42, "title": "Fix login redirect", "labels": [{"name": "bug"}],
+        "updatedAt": "2026-10-01T10:00:00Z", "author": {"login": "ana"},
+        "url": "https://github.com/acme/app/issues/42"}]"#;
+    let bin = fake_gh(dir, OPEN_PULL_REQUEST, issues);
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["backlog", "add", "Retry failed charges", "-C", repo_arg]);
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("▸ planner");
+    tui.shows("1 pr · 1 issue");
+
+    // An issue, by its label, opens in the issues view on it.
+    tui.type_keys("/bug");
+    tui.shows("#42 Fix login");
+    tui.shows("1 match");
+    tui.type_keys("\r");
+    tui.shows("issues · app");
+    tui.type_keys("\x1b");
+    tui.shows("▸ planner");
+
+    // An item on the backlog, by a word of its line, opens the backlog on
+    // it.
+    tui.type_keys("/charges");
+    tui.shows("#1 Retry failed");
+    tui.type_keys("\r");
+    tui.shows("backlog · app");
+    tui.type_keys("\x1b");
+    tui.shows("▸ planner");
+
+    // A click on a count on the tab bar lists what it counts.
+    let click = |tui: &mut Terminal, text: &str| {
+        let top = tui.text().lines().next().unwrap().to_string();
+        let column = top[..top.find(text).unwrap()].chars().count() + 1;
+        tui.type_keys(&format!("\x1b[<0;{column};1M\x1b[<0;{column};1m"));
+    };
+    click(&mut tui, "1 pr");
+    tui.shows("pull requests · app");
+    tui.type_keys("\x1b");
+    tui.shows("▸ planner");
+    click(&mut tui, "1 issue");
+    tui.shows("issues · app");
+}
+
+#[test]
 fn an_issue_takes_a_comment_and_a_new_title() {
     let crystal = Crystal::new();
     let repo = github_repo(crystal.dir.path());
@@ -13006,9 +13415,9 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
     );
     tui.shows("couldn't get them ready");
 
-    // A setting typed in, one up from the last of the sessions' tab, and
+    // A setting typed in, two up from the last of the sessions' tab, and
     // its default put back.
-    tui.type_keys("3Gk\r");
+    tui.type_keys("3Gkk\r");
     tui.type_keys("develop\r");
     eventually("the base branch is written down", || {
         config().contains("[worktrees]\nbase = \"develop\"")

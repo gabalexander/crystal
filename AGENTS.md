@@ -16,6 +16,12 @@ roadmap.
 
 Run lint, format and tests before every commit.
 
+Every type a request, a response or an event reaches derives `schemars::JsonSchema` in test builds alone
+(`#[cfg_attr(test, derive(schemars::JsonSchema))]`, schemars being a dev-dependency), a new one too, and one
+whose name another has, or says little alone, takes `#[cfg_attr(test, schemars(rename = "..."))]`. A test
+keeps `docs/crystal-api.schema.json` what they make: after changing one, `CRYSTAL_UPDATE_API_SCHEMA=1 cargo test
+api_schema` writes it again.
+
 ## Releasing
 
 Releases are built by `.github/workflows/release.yml`, for macOS (Apple silicon and Intel) and Linux (x86_64
@@ -82,6 +88,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   attached again after a handover, and `control`'s commands on standard input (input, keys, resize, release)
 - `src/api.rs`: `crystal api snapshot`: the sessions, layout, projects, open tasks, flow runs and archive in one
   JSON document, with the latest event's seq to follow on from
+  - `api/schema.rs`: `crystal api schema`: the JSON Schema of the socket protocol, `docs/crystal-api.schema.json`
+    bundled as it is, a line on each message it names, or the whole of it printed or written to a file; and the
+    tests that make it from the types, keep the file in step and check messages crystal writes against it
 - `src/messages.rs`: what `crystal send` carries from one session to another: the text tidied and cut to 8 KiB,
   the line ahead of it saying which session sent it, the guard that holds a session to 20 sends a minute, the
   refusal of a message that only acknowledges (`ok`, `thanks`, `👍`), and the `agent_blocked:` refusal for an
@@ -136,7 +145,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     resting on one out of sight; the forge's lists, one asked before the one kept dropped, and the issues
     edited in the issues view laid over what was asked before the forge saved them; the worktrees being
     removed, for this TUI and for anyone else, as the daemon lists them; killing the last session in a linked
-    worktree asking whether the worktree goes too; `q` asking first (`confirm_quit`); `D` opening the
+    worktree, or closing a tab with the last in some, asking whether they go too once the event loop has
+    asked the daemon what's archived there, as `[worktrees] remove_emptied` says; the footer's questions
+    waiting their turn; `q` asking first (`confirm_quit`); `D` opening the
     new-session panel like the selected session; `+`'s question, its `Tab` handed to the event loop to finish
     the directory; what crystal's processes take, and where the footer drew its readout of it, for a click;
     no I/O, so it's unit-tested
@@ -149,10 +160,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     after a handover or a restart, each one an event for the loop, and its answers, that it was used (a
     key, the mouse, a paste, focus gained) and when its terminal gains and loses the focus  sent back
   - `ui.rs`: the layout and drawing (the tab bar, on top or over the footer or left out, its tabs and what
-    it shows at its right, the counts of what's open on the selected session's forge first, pane headers,
-    footer and its readout of the memory crystal takes, the column each pane's scrollbar takes, the key
-    pressed last while `show_keys` is on), one column on a terminal as narrow as a phone's (`[sidebar]
-    phone_width`), the sidebar over the pane while it has the keyboard, and what's under the mouse
+    it shows at its right, the counts of what's open on the selected session's forge first, which a click
+    lists, pane headers, footer and its readout of the memory crystal takes, the column each pane's
+    scrollbar takes, the key pressed last while `show_keys` is on), one column on a terminal as narrow as a
+    phone's (`[sidebar] phone_width`), the sidebar over the pane while it has the keyboard, and what's under
+    the mouse
   - `scrollbar.rs`: a pane's scrollbar: where its thumb is for how far back the pane is, how far back a
     dragged thumb takes it, and drawing it; pure, so it's unit-tested
   - `tabs.rs`: tabs, as many as the user likes, each holding its own sessions (each session in exactly one)
@@ -177,8 +189,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     what git is in the middle of there, their changes not committed and how far they are from their upstream,
     Claude Code's own named by their commits and a labelled one by its label, sessions with their mark, their
     agent's model and how long ago, the line reported for one under it, terminals drawn apart from agents, the
-    sessions that need the user pinned on top with the tab each is in, and the rail of marks a folded sidebar
-    keeps; what doesn't fit left out
+    sessions that need the user pinned on top with the tab each is in, the pull requests, issues and backlog
+    items `/` found, and the rail of marks a folded sidebar keeps; what doesn't fit left out
   - `keymap.rs`: the sidebar's commands, each with the id `[keys]` names it by, what it does and its default
     keys; keys as the config writes them and as terminals send them, folded into one form; the config's
     keys laid over the defaults, a key given to one command taken from the one that had it, and those written
@@ -192,14 +204,17 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `command_list.rs`: the command list (`:`): every command, the user's own keys' commands and plugin action
     by name, with its keys, filtered as you type, the latest run first; its state and keys, kept apart from
     I/O, and its drawing
-  - `status.rs`: a session's status as the TUI shows it, and its mark
+  - `status.rs`: a session's status as the TUI shows it, its mark, and what it needs of the user, which the
+    sidebar's pinned rows and `u` go by
   - `theme.rs`: every color, named for what it's for, and `THEMES`, the one table of every theme by its names:
     crystal's own `dark`, `light` and `terminal`, and the well-known schemes (catppuccin, nord, …), each a
     palette of ten colors given their roles, its tints blended toward the background; the theme for a light
     or dark appearance, a scheme's other side; the user's `[colors]` over it, and none for `NO_COLOR`
   - `appearance.rs`: light or dark, which the theme follows with `[appearance] auto_switch`: the system's (a
     Mac's defaults, the desktop portal, GNOME's), asked every two seconds off the event loop, or over ssh the
-    terminal's background, asked once as the TUI starts, before the input reader reads anything
+    terminal's background, asked once as the TUI starts, before the input reader reads anything; not the
+    terminal's mode 2031 reports, which crossterm 0.29 takes for an unfinished key and swallows the keys
+    after
   - `window.rs`: the title the TUI gives its terminal: `[window] title`'s tokens filled in and checked, what
     an empty token leaves at either end taken off, and the title stack it's saved on and put back from
   - `status_bar.rs`: what the tab bar shows at its right (`[tab_bar] right`): the hostname, a clock through
@@ -237,8 +252,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     event loop does the writing
   - `search.rs`: `/`'s matching, letters in order (a directory or a goal only whole): a session of any
     tab by its name, project, branch, command, agent, tab or flow run; a worktree with no sessions or a
-    project nothing runs in; an open pull request; the status Tab keeps to; and where what it finds goes
-    under its project in the sidebar's rows
+    project nothing runs in; an open pull request or issue; an item to do on a backlog, its body only
+    whole; the status Tab keeps to; and where what it finds goes under its project in the sidebar's rows
   - `issues.rs`: the issues view (`i`): its state and keys, kept apart from I/O, commenting on an issue and
     changing its title and text, and its drawing
   - `pull_requests.rs`: the pull requests view (`O`): its state and keys, kept apart from I/O, the open ones
@@ -301,8 +316,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     its task kept, listed, the one the bar is on previewed, and opened in the editor; its state and keys,
     kept apart from I/O (the event loop looks for the notes and reads the kept files), and its drawing
   - `needs_you.rs`: the needs-you view (`U`): everything waiting on the user, in every tab, the most urgent
-    first, from the sessions and flow runs the TUI has; answering a permission or a gate in place, the bar
-    kept on its row as rows come and go, and its drawing
+    first, from the sessions and flow runs the TUI has, those that couldn't start again after a restart among
+    them; answering a permission or a gate in place, or starting one of those again, the bar kept on its row
+    as rows come and go, and its drawing
   - `ram_view.rs`: the RAM view (`#`): the memory each session's processes take, the biggest first, its
     share of all of it, and crystal's own; Enter goes to the session, the bar kept on its session as a new
     look reorders the rows; its state, keys and drawing, and the footer's readout
@@ -328,17 +344,21 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   `scrollback_lines` says, and keeps the list of projects sessions ran in;
   after a cold restart, puts the sessions written down back in their places and starts them again, agents
   `[sessions] restart_spacing_ms` apart on a thread of their own, those that can't start kept, failed, saying
-  why; opens a background task in a terminal, in its place, its task carried on; hands itself over to a new
-  crystal, and takes over from the daemon that handed over
+  why, a name the user gave still theirs, and with `[sessions] restore_screens` a terminal below what it
+  showed before, which it keeps in the database meanwhile; opens a background task in a terminal, in its
+  place, its task carried on; hands itself over to a new crystal, and takes over from the daemon that handed
+  over
   - `daemon/removal.rs`: removing a worktree, for `W` and `crystal worktree rm`: refused while a session runs
     there, git started and reaped while the removals are held, the sessions that had ended there killed,
     `worktree.removed`, and everyone who asked answered, a second ask waiting with the first; the worktrees
     being removed listed for anyone who asks, as each TUI does; one in flight handed over with its git still
     running, which the next daemon waits for, then has git try again if the worktree is still there
   - `daemon/moving.rs`: moving a session into another worktree of its project, for `crystal worktree move`:
-    its program stopped once its agent's turn is over (never reminded of its task meanwhile), then started
-    again there in its place, under its name and id, an agent in its conversation and told where it is now,
-    or failed, saying why; the moves still to come handed over
+    its program stopped once its agent's turn is over, or a background task's run (never reminded of its
+    task meanwhile, which stays open), then started again there in its place, under its name and id, an
+    agent in its conversation and told where it is now, a task told with a follow-up, or failed, saying
+    why; the moves still to come handed over, and written down with the sessions as they'll be there, for a
+    cold restart to start them there
 - `src/worktree_hooks.rs`: the worktree hooks, `crystal.worktreeCreateHook` and `crystal.worktreeDeleteHook`
   in git config (adapted from docket's): run on `worktree.created` and `worktree.removed` from the daemon's
   bus, one at a time, as they're named with the main worktree and the worktree, their output in a log, stopped
@@ -437,8 +457,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   the rows it wrapped onto, as `vt::Link`; the
   times the program rang the bell; the text it last asked to copy (OSC 52), a read of the clipboard never
   answered; the progress a program reports (OSC 9;4), picked out of its output, which
-  alacritty_terminal passes over; how much history a screen keeps, changed on a running one; and a screen
-  saved for a handover, both its screens and the history, and restored. The only module that uses
+  alacritty_terminal passes over; how much history a screen keeps, changed on a running one; a screen saved
+  for a handover, both its screens and the history, and restored; and the main screen and its history kept to
+  show again, without what its program set, above the program a cold restart starts in its place. The only
+  module that uses
   `alacritty_terminal`
 - `src/links.rs`: opening a link a pane shows: `open` or `xdg-open`, or over ssh (or with neither) the link put
   on the user's clipboard instead
@@ -475,7 +497,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   for mermaid to draw in the browser
 - `src/spending.rs`: what background tasks have spent today, kept in the database by the day: the TUI footer's
   `$X today`, and what `daily_budget_usd` is held against
-- `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
+- `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends; their
+  JSON Schema is `docs/crystal-api.schema.json` (see `api/schema.rs`)
 - `src/socket.rs`: where the socket lives: a server's, named after it in crystal's socket directory, or one
   given by its path; which a command is for (`-S`, `--server`, `CRYSTAL_SOCKET`, then `CRYSTAL_SERVER`); and
   which server a socket is, however it's spelled and whoever starts its daemon, so the same socket always gets
@@ -483,7 +506,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/state.rs`: where the daemon's state is: a server's directory in the state dir (the default server's is
   the state dir itself), or beside a socket given by its path; the database, the directory of the files each
   task kept, and the files kept before the database (the sessions, the flow runs, each project's directory); a
-  running session as it's written down to start it again
+  running session as it's written down to start it again, and the worktree it was on its way into
 - `src/server_cli.rs`: `crystal server`: every server with whether it's running and how many sessions it has,
   stopping one, and deleting a stopped one's state
 - `src/db.rs`: the SQLite database the daemon and the TUI keep their state in (WAL, `synchronous=NORMAL`,
@@ -491,7 +514,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   the projects on crystal's list, each project's backlog (each item's line, body and tags) and closed tasks, the files tasks kept, the tasks waiting to start and the last task number, what each
   task carried beside its goal (its acceptance criteria, pull request and issue), what background
   tasks spent each day, the event log, read from a point on or a page of a timeline's scope at a time back
-  from its end, and the TUI's
+  from its end, what each terminal written down showed (`[sessions] restore_screens`), and the TUI's
   tabs, layouts, the new-session panel's memory, the diff view's reviewed marks, the projects folded in the
   sidebar and the latest event the user had seen, each a JSON document; and bringing in the JSON files from before, a project's the first time it's
   asked for. Settings stay in the config file and memory in `memory.db`
@@ -519,7 +542,12 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   task started for one is asked; its markdown export and reading a markdown list of checkboxes back, and
   `enabled`, the one gate everything the backlog adds goes through
 - `src/worktree_cli.rs`: `crystal worktree list`, `create`, `open` (finding the worktree; `main.rs` starts the
-  session), `label` and `move`, which makes the worktree a session moves into when there's none
+  session), `label` and `move`, which makes the worktree a session moves into when there's none; and `crystal
+  kill`, which asks at the terminal whether the worktree it empties goes too, says how to remove it with
+  nobody there to ask, or does as `--remove-worktree`, `--keep-worktree` or the settings say
+- `src/emptied.rs`: the linked worktrees killing sessions leaves with nothing in them, the archived sessions
+  that ran in each, the question whether they go too, and what `[worktrees] remove_emptied` makes of it,
+  for the TUI and `crystal kill`; pure, so it's unit-tested
 - `src/work.rs`: `crystal done` (with `--artifact`), `handoff`, `tasks` and its commands (`new`, `start`, `show`,
   `cancel`, `log`, `terminal`), reading what a new task carries (`--accept`, and `--pr` and `--issue` from the
   forge, a pull request's worktree found or made), and `backlog` with its commands, an item's card with the
@@ -529,7 +557,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   names, the colors `[colors]` takes, what the mouse does (`[mouse]`) and whether programs' copies go on the
   clipboard (`[clipboard]`); what background tasks may spend and do unasked (`[tasks]`); the shell a new terminal runs
   (`[terminal]`, `-l` for a login shell) and where the TUI starts one, the window's title, the tab bar and
-  the appearance; where new worktrees start and go (`[worktrees]`); and the settings view's edits to the
+  the appearance; where new worktrees start and go, and what's done with one emptied (`[worktrees]`); and the
+  settings view's edits to the
   file (`apply`), several at once, a line set or taken out for its default, the rest of the file as the user
   wrote it, written only if what they come to is read
 - `src/memory.rs`: what a project's sessions learned: the SQLite store in the state directory with its FTS5

@@ -188,12 +188,12 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `Z` | the archive: start an archived session again, in its conversation, or delete it |
 | `!` | run the selected worktree's [project](#projects), with its `run` command, in a terminal of its own; again, stop it |
 | `.` | open the selected worktree with its project's `open` command, like `code .` |
-| `u` | select the next session that needs you: waiting on you first, then done |
+| `u` | select the next session that needs you: waiting on you first, then one that couldn't start again after a restart, then done |
 | `U` | list everything that [needs you](#timeline), in every tab, and answer a permission or a gate where it stands |
 | `a` | the [timeline](#timeline): what happened, the newest first, as it happens |
 | `I` | the [timeline](#timeline) of the selected session; `Ctrl+S` there goes on to its task's, its project's and everything |
 | `M` | what the selected session leaves for the next: its worktree's [handoff notes](#the-handoff-file) and the files its task [kept](#kept-files), each read beside the list |
-| `/` | find a session in any tab, a project or worktree with nothing running, a flow run or an open pull request, by typing a little of it; `Tab` keeps to one status; picking a session in another tab takes you there: [finding with `/`](#finding-with-) |
+| `/` | find a session in any tab, a project or worktree with nothing running, a flow run, an open pull request or issue, or an item on a backlog, by typing a little of it; `Tab` keeps to one status; picking a session in another tab takes you there: [finding with `/`](#finding-with-) |
 | `:` | the [command list](#keys-and-commands): every command by its name, with its key, the latest you ran first; `Enter` runs one |
 | `(` / `)` | make the [sidebar](#the-sidebar) narrower or wider; its edge drags with the mouse too |
 | `\` | fold the [sidebar](#the-sidebar) down to a rail of marks, or unfold it |
@@ -331,8 +331,15 @@ The sidebar groups sessions by project, then by worktree: `⌂` marks a reposito
 linked one, each named by its branch, or by the label it was given (`crystal worktree create --label`), then
 its branch. Sessions outside any repository come last, under their directory. `w` makes its worktree in the
 selected session's project, or in the repository you started `crystal` in. Killing the last session in a
-linked worktree with `x` asks next whether the worktree goes too: `y` removes it, as `W` would, and any other
-key keeps it.
+linked worktree with `x`, or closing a tab with the last sessions in some (`&`), asks next whether the
+worktree goes too, one question for all of them: `y` removes it, as `W` would, and any other key keeps it.
+Archived sessions that ran there are counted in the question (`nothing else is in worktree fix but 2 archived
+sessions, which won't start there again`): they stay in the archive, but couldn't start there again.
+`crystal kill` asks the same at your terminal; with nobody there to ask, it keeps the worktree and says how to
+remove it, and `--remove-worktree` or `--keep-worktree` answers for it. `remove_emptied` under `[worktrees]`
+in the [settings](#settings) skips the question: `"always"` removes the worktree without asking, unless
+archived sessions ran there, and `"never"` keeps it. A worktree with changes you haven't committed is asked
+about again before they're lost, either way. The main worktree and Claude Code's own are never asked about.
 
 A linked worktree with no sessions left stays at the end of its project, with a `· no sessions` row under it,
 until it's removed: it's still on disk, maybe with work in it. Select it, and `n` or `Enter` starts something
@@ -460,13 +467,14 @@ its time in the sidebar until you look at it, rings your terminal from the TUI t
 `session.bell`. A program ringing over and over rings yours at most twice a second.
 
 `/` finds a session by typing a little of it, in any tab, and a project or worktree with nothing running, a
-flow run or an open pull request too; `Tab` keeps it to the sessions with one status: see [finding with
-`/`](#finding-with-).
+flow run, an open pull request or issue, or an item on a backlog too; `Tab` keeps it to the sessions with one
+status: see [finding with `/`](#finding-with-).
 
 For a project on GitHub or GitLab, each worktree line shows its branch's pull request, `#57` (a merge request,
 `!57`, on GitLab), with a mark for what matters most about it, `merged` once it has; the tab bar counts the
-pull requests and issues open on the selected session's project; `o` opens its pull request in your browser,
-`O` lists the project's pull requests and `i` its issues: see [pull requests and issues](#pull-requests-and-issues).
+pull requests and issues open on the selected session's project, and a click on either count lists them; `o`
+opens its pull request in your browser, `O` lists the project's pull requests and `i` its issues: see [pull
+requests and issues](#pull-requests-and-issues).
 
 Everything is also a command, for scripts and for agents:
 
@@ -496,9 +504,10 @@ crystal read review --since 10m             # only what it wrote in the last ten
 crystal ps review                           # what runs in its terminal, and where (process-info)
 crystal observe review                      # its terminal as JSON lines, for a program; `control` drives it
 crystal api snapshot                        # everything at once, as JSON, for a client of your own
+crystal api schema --json                   # the JSON Schema of what crystal says over its socket
 crystal rename review reviewer              # give a session another name
 crystal respawn reviewer                    # run an ended session again; an agent in its conversation
-crystal kill review                         # stop one session
+crystal kill review                         # stop one session; asks if its emptied worktree goes too
 crystal archive review                      # stop it and keep it in the archive, out of the list
 crystal unarchive review                    # start it again where it was, in its conversation
 crystal ls --archived                       # the archived sessions
@@ -561,8 +570,11 @@ worktree of its project: the one on that branch, or else a new one, made as `cre
 stops and starts again there, under its name, an agent in its conversation (Claude Code and Codex are told
 where they are now, and to carry on). An agent in the middle of a turn moves once the turn ends, so an agent
 can run it about itself: Claude Code is told to, when you ask it to work in a worktree, rather than make one
-of its own, then end its turn. What it changed and didn't commit stays where it was. A background task can't
-move, and a move still to come is carried over `crystal restart-server`, but not a cold restart.
+of its own, then end its turn. Its task stays open meanwhile. A [background task](#background-tasks) moves
+once its run ends: its `claude` starts again there in its conversation, and is told where it is now as a
+follow-up, which carries it on. What it changed and didn't commit stays where it was. A move still to come is
+carried over `crystal restart-server`, and it's written down with the sessions, so after a crash or a reboot
+the session starts again in the worktree it was on its way to, told it has moved.
 
 `crystal worktree rm` (or `W` in the TUI) takes the worktree's directory or its branch, refuses while a
 session is still running in it, and leaves the rest to `git worktree remove`, which keeps a worktree with
@@ -618,11 +630,22 @@ the first agent, but the agents after it start a quarter of a second apart (`res
 says `starting`. A session that can't start again, because its directory has gone or its command isn't there
 any more, isn't dropped, and never starts somewhere else instead: it stays in its place, its row says
 `couldn't start`, its screen and `crystal ls` say why, and it stays written down, to try again with the next
-restart. Put it right and `Enter` on it (or `crystal respawn`) starts it, or kill it. Once they've all started
+restart. It's pinned with what [needs you](#the-sidebar), and `U` lists it with why. Put it right and `Enter`
+on it (or `crystal respawn`, or `r` in `U`'s list) starts it, or kill it. Once they've all started
 or failed, the TUI's footer says how it went, like `after the restart: 6 sessions back · 1 couldn't start:
 docs`, and the [event log](#events) has a `session.start_failed` for each that couldn't and a
 `daemon.restarted` for the lot. `crystal kill-server` is asked to stop everything, so after it nothing comes
-back.
+back. A session comes back under its name, and one you or a script named keeps it through a `/rename` in
+Claude Code, as [before the restart](#starting-a-session).
+
+A shell or any other program starts again afresh, on a clear screen. With `restore_screens = true` under
+`[sessions]`, its terminal shows what it showed before instead, history and all, above a line saying crystal
+restarted, and its program starts under it: crystal keeps what each terminal shows in its database, as soon as
+there's something on it and then at most every 15 seconds while it changes. It's off unless you turn it on,
+since a screen can show secrets, like a token a command printed. Claude Code and Codex picked up in their
+conversation show their own, so their screens aren't kept, and a background task draws its transcript again.
+Turning it off forgets what was kept, and so does `crystal kill-server`.
+
 The list is kept in crystal's database, `~/.local/state/crystal/crystal.db`, without the sessions' environment
 variables, since those can hold secrets; a session started again gets the environment of whoever started the
 daemon again.
@@ -771,7 +794,8 @@ a row, so a session waiting on you still shows while the panes take the room; `\
 edge, unfolds it. While it's folded, or the tab is zoomed, `/` brings it out over the panes to look through.
 
 Whatever needs you, in every tab, is pinned at the top under **needs you**: the agents waiting on you, then
-those that finished a turn you haven't looked at. One in another tab says which tab, and a click on it takes
+the sessions that couldn't start again after a [restart](#usage), then those that finished a turn you haven't
+looked at. One in another tab says which tab, and a click on it takes
 you there. `u` goes to each in turn, and `U` lists them with what each waits for.
 
 A row says what fits of what there is to say, and leaves the rest out as the sidebar narrows:
@@ -834,16 +858,20 @@ selection where it was. What it finds, and what picking it does:
 | a flow run | its name, its flow's or its goal, which find its steps too | selects the step it's at |
 | a project nothing runs in, or a worktree with no sessions | its project, its branch, or its directory | puts the selection on it, where `Enter` starts something |
 | an open pull request (a merge request on GitLab) | its title, number (`57` or `#57`), branch, author or project | opens it in [the pull requests view](#pull-requests-and-issues) |
+| an open issue, marked `issue` | its title, number (`12` or `#12`), author, labels or project | opens it in [the issues view](#pull-requests-and-issues) |
+| an item to do on a project's [backlog](#the-backlog), marked `to do` | its line, number (`3` or `#3`), tags or project, or a word of its body | opens the backlog view on it |
 
-A directory or a goal only counts where a word turns up in it whole, or nearly anything would find it. Before
-you type, only sessions show; projects, worktrees and pull requests join them as you type. The pull requests are
-those the sidebar already asked the forge for, and `/` asks, in the background, about the projects with nothing
-running the first time it opens, so typing never waits on the forge.
+A directory, a goal or a backlog item's body only counts where a word turns up in it whole, or nearly anything
+would find it. Before you type, only sessions show; the rest join them as you type, each under its project, a
+project's pull requests, then its issues, then its backlog items. The pull requests and issues are those the
+sidebar already asked the forge for, and `/` asks, in the background, about the projects with nothing running
+the first time it opens, so typing never waits on the forge; it asks the daemon for every project's backlog
+each time it opens.
 
 `Tab` keeps to the sessions with one status, the footer saying which, round `waiting`, `working`, `done` (a
 finished turn nobody has looked at), `idle` (at the prompt) and `ended`, then back to all of them; `Shift+Tab`
-goes the other way. Typing narrows them further. Projects and pull requests have no status, so they don't show
-while it keeps to one.
+goes the other way. Typing narrows them further. Projects, pull requests, issues and backlog items have no
+status, so they don't show while it keeps to one.
 
 ### Tabs
 
@@ -1158,7 +1186,8 @@ A pull request that's simply ready shows its number alone. `o` opens the selecte
 browser. On the right of the [tab bar](#terminals-the-window-and-the-tab-bar), after the sessions, are how many
 pull requests and issues are open on the selected session's project, `3 prs · 5 issues` (`mrs` on GitLab):
 none says nothing, a list as long as the forge gives at once counts `100+`, and a narrow terminal leaves them
-out before the tabs, or what you have the bar show at its right, give way.
+out before the tabs, or what you have the bar show at its right, give way. A click on `3 prs` lists them, as
+`O` does, and on `5 issues`, as `i` does.
 
 crystal asks the forge's own command line tool, [`gh`](https://cli.github.com) for GitHub and
 [`glab`](https://gitlab.com/gitlab-org/cli) for GitLab, as soon as it sees a project and then once a minute for
@@ -1716,6 +1745,16 @@ in `flows`, and the `archived` sessions. `crystal events --follow --after <seq>`
 nothing missed: an event says what changed, and the client asks again for what it shows. It never starts the
 daemon.
 
+`crystal api schema` says what the schema of crystal's socket protocol covers, the one bundled with that crystal:
+`--json` prints the whole JSON Schema (draft 2020-12), and `--output PATH` writes it to a file. It's
+[`docs/crystal-api.schema.json`](docs/crystal-api.schema.json) too. Its `schemas` name each message: the
+`request` a client sends, a JSON object a line with its kind in `type` and the `version` of the crystal sending
+it, which must be the daemon's; the `response` the daemon answers with; each `event` a `subscribe` streams,
+`crystal events --json` prints and plugins' hooks are given, its kind in `event` with when it happens; the
+`layout_order` and `layout_report` lines a TUI taking layout orders and the daemon trade; and the `snapshot`
+`crystal api snapshot` prints. `$defs` holds every type they're made of, described as crystal reads it: a field
+it can do without is optional, though crystal may always write it.
+
 `crystal ls --json` prints the sessions as a JSON array. Each object holds what the daemon knows about the
 session, plus `status`, the word the STATE column shows:
 
@@ -1969,10 +2008,11 @@ sessions, `I` opens its project's.
 
 `U` lists everything that needs you now, in every tab, the most urgent first: background tasks asking for a
 permission, flow runs at a gate, tasks whose agent ended its turn with the task still open, agents asking you
-something, then agents that finished a turn you haven't seen. Within each, whatever has waited longest comes
-first, and each thing has one row. `y`, `n` and `Y` answer a permission where it stands, and `g` and `f` a
-gate (go on, or send it back with your notes), as on the session's own row; the list stays open, and an
-answered row leaves it. `Enter` goes to the session, and `Esc` closes the list.
+something, sessions that couldn't start again after a [restart](#usage), with why, then agents that finished
+a turn you haven't seen. Within each, whatever has waited longest comes first, and each thing has one row.
+`y`, `n` and `Y` answer a permission where it stands, `g` and `f` a gate (go on, or send it back with your
+notes), as on the session's own row, and `r` starts again a session that couldn't start, once you've put
+right what stopped it; the list stays open, and an answered row leaves it. `Enter` goes to the session, and `Esc` closes the list.
 
 When you come back to crystal, the footer says what happened while you were away, in one line:
 
@@ -2128,6 +2168,9 @@ crystal tasks terminal docs                                          # carry on 
   under its number: one still open is closed with `crystal done` from then on, as an agent's in a terminal
   is. There's no way back to the background. It's refused while a run is going on: `crystal wait` for it, or
   `crystal interrupt` it, first.
+- `crystal worktree move <branch> -n <task>`, or the task itself running it in a run, moves it into another
+  worktree of its project once its run ends: its `claude` starts again there in its conversation, and is told
+  where it is now as a follow-up, which carries it on (see [usage](#usage)).
 - After a restart, a task comes back at rest rather than running its prompt again: its pane is drawn again
   from the transcript Claude Code keeps of its conversation (`~/.claude/projects/…/<id>.jsonl`, in
   `CLAUDE_CONFIG_DIR` when that's set), the last 512 KiB of it: the prompts, what Claude said, each tool it
@@ -2492,7 +2535,8 @@ notice along the way on the backlog with `crystal backlog add`, rather than into
 command works on the current directory's project; `-C <dir>` names another.
 
 In the TUI, `b` opens the selected session's project's backlog, and the sidebar counts what each project has
-to do beside its name: `payments ──── 3 to do`. In the view, what's to do comes first and what's done after,
+to do beside its name: `payments ──── 3 to do`. [`/`](#finding-with-) finds an item to do on any project's
+backlog, and picking it opens the backlog on it. In the view, what's to do comes first and what's done after,
 and under the list, the item the bar is on: its tags, the tasks started for it and its body. `a` adds an item
 and `e` changes its line, `Space` ticks one off or opens it again, `x` removes one once you've said `y`, `/`
 filters the list as you type, and `t` keeps it to each tag in turn. `Enter` opens the new-session panel with
@@ -2980,9 +3024,9 @@ that makes no sense is said there too, and the settings stay as they were until 
 | `[tasks]` | | what [background tasks](#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none); and what they may do without asking: `permission_mode` (`"default"`), `allowed_tools` (none) and `allow_bypass` (`false`) |
 | `[events]` | | `keep_days`, how long the [event log](#events) keeps what happened: 30 days, or `0` for ever |
 | `[handoff]` | | `in_git`, the projects, by their main worktree, whose [handoff notes](#the-handoff-file) go in git |
-| `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set; `directory`, where new worktrees [go](#usage), each project's in a directory of its own, from `/` or `~`: beside the project, in `<repo>.worktrees`, unless set |
+| `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set; `directory`, where new worktrees [go](#usage), each project's in a directory of its own, from `/` or `~`: beside the project, in `<repo>.worktrees`, unless set; `remove_emptied`, what's done with a linked worktree once [its last session is killed](#usage): `"ask"` (the default), `"always"` removes it without asking, unless archived sessions ran there, and `"never"` keeps it |
 | `[forge]` | | `hide_draft_prs`, leave draft pull requests out of [the pull requests](#pull-requests), the tab bar's count and `/` (`false`) |
-| `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"`; `restart_spacing_ms`, how far apart the agents a [crash or a reboot](#usage) starts again start (`250`, or `0` for all at once) |
+| `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"`; `restart_spacing_ms`, how far apart the agents a [crash or a reboot](#usage) starts again start (`250`, or `0` for all at once); `restore_screens`, whether a terminal a crash or a reboot starts again shows what it showed before, kept in crystal's database (`false`: a screen can hold secrets) |
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's, and the [plugins it ships](#a-projects-own-plugins) that are on for it, `plugins` |
 | `[keys]` | | the TUI's keys, by command, its prefixes, the key back to the sidebar, answering's, resize mode's and the views', and `[[keys.command]]`, keys of your own that run commands: [keys and commands](#keys-and-commands) |
 | `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, whether what needs you is pinned, and how narrow a terminal shows [one column](#on-a-phone): [the sidebar](#the-sidebar) |
@@ -3009,7 +3053,7 @@ offered as a profile of its own.
 The daemon reads the notification and sound settings each time it tells you something, `[plugins]` each time it
 does something a plugin adds, `[memory]` each time a task closes or a search runs, `[tasks]` each time a
 background task's run starts, `[handoff]` each time a note is written, `[sessions]` every 15 seconds and as it
-starts sessions again, a flow
+starts sessions again (`restore_screens` every second), a flow
 each time one starts, `[[project]]` each time a project's commands run,
 `name_from_prompt` each time it names a session, `resume_reported_agents` as it starts sessions again,
 `[clipboard]` each time a program copies out of sight,
@@ -3095,7 +3139,9 @@ your terminal. On a Mac the TUI asks the system's appearance every two seconds, 
 settings portal (GNOME's and KDE's), or else GNOME's own setting. Over ssh the system isn't yours, and some
 systems can't say: there the TUI asks your terminal what its background is as it starts, and goes by that,
 which follows a change only the next time it starts. (A terminal can tell a program each time its appearance
-changes, but crystal's keyboard reader would take that for the start of a key it waits to see the end of.)
+changes, mode 2031, but crystal's keyboard reader, crossterm's, would take that report for the start of a key
+it waits to see the end of, and swallow the keys after it, until crossterm reads it: see crossterm's
+[#1104](https://github.com/crossterm-rs/crossterm/issues/1104).)
 Picking a theme in the [settings view](#the-settings-view) stops the following, as that's the theme you want.
 `[appearance.light_colors]` and `[appearance.dark_colors]` take colors of your own, as `[colors]` below does,
 for while it's light or dark, over `[colors]`.
@@ -3197,7 +3243,7 @@ bar.
 |---|---|
 | General | [notifications](#usage): whether, after how long, only while you're away, and a command of your own in place of them; sounds; whether `q` asks before it quits; looking for a [newer crystal](#updating); how long the [event log](#events) keeps what happened; and whether [draft pull requests](#pull-requests) are hidden |
 | Look | the [theme](#themes), whether it follows your system's appearance (the row says which theme each side is) and the theme for each side; the [tab bar](#terminals-the-window-and-the-tab-bar)'s place, whether it's left out with one tab, and its separator; the window's title; the [sidebar](#the-sidebar)'s width, whether it starts folded, what folding keeps, whether what needs you is pinned, and how narrow a terminal shows [one column](#on-a-phone); whether keys pressed show at the footer (`show_keys`), and whether [mermaid diagrams](#the-file-finder-and-the-tree-browser) are drawn in ASCII |
-| Sessions | what the [new-session panel](#starting-a-session) offers first, naming sessions for their prompt, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents start again after a [crash or a reboot](#usage) and whether one resumes as it said; a new terminal's shell, whether it's a login shell and where it starts; how much each session's history keeps, the running ones' too; and the branch new worktrees start from and where they go |
+| Sessions | what the [new-session panel](#starting-a-session) offers first, naming sessions for their prompt, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents start again after a [crash or a reboot](#usage) and whether one resumes as it said; a new terminal's shell, whether it's a login shell and where it starts; how much each session's history keeps, the running ones' too, and whether a terminal shows it again after a crash or a reboot; and the branch new worktrees start from, where they go and whether one its last session is killed from is removed |
 | Mouse | [the mouse](#usage), and whether programs' copies go on [your clipboard](#zoom-copy-mode-and-search) |
 | Tasks | the permission mode [background tasks](#background-tasks) start in, and what a run and a day may spend |
 | Memory | how memory learns ([the distiller](#the-distiller), its model and what it may spend) and whether it searches [by meaning](#search-by-meaning) and reranks |
@@ -3371,7 +3417,11 @@ make build      # cargo build
 make test       # cargo test
 make lint       # cargo fmt --check, and clippy with warnings as errors
 make install    # a release build into ~/.local/bin, and the daemon handed over to it
+CRYSTAL_UPDATE_API_SCHEMA=1 cargo test api_schema  # write docs/crystal-api.schema.json again
 ```
+
+A test keeps [`docs/crystal-api.schema.json`](docs/crystal-api.schema.json) what the protocol's types make, and
+fails once one of them changes until the schema is written again.
 
 If you're an AI agent working on this repository, read [`AGENTS.md`](AGENTS.md) before making changes.
 

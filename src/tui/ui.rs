@@ -709,34 +709,45 @@ fn draw_top_bar(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     ]);
     frame.render_widget(name, area);
     draw_tabs(frame, app, look, area);
-    let mut right = summary(app.sessions(), app.server(), theme);
-    let counts = counts_width(app, area.width) > 0;
-    let status = status_shown(app, area.width);
-    if counts || status.is_some() {
-        // After the count, before the space the summary ends with.
-        let end = right.spans.pop();
-        let separator = Span::styled(
-            app.tab_bar().separator.clone(),
-            Style::new().fg(theme.muted),
-        );
-        let mut shown = Vec::new();
-        if counts {
-            shown.extend(forge_counts(app.open_on_forge(), theme));
-        }
-        let text = Style::new().fg(theme.text);
-        shown.extend(
-            status
-                .into_iter()
-                .flatten()
-                .map(|said| Span::styled(said, text)),
-        );
-        for said in shown {
-            right.spans.push(separator.clone());
-            right.spans.push(said);
-        }
-        right.spans.extend(end);
+    let right = bar_right(app, theme, area.width)
+        .into_iter()
+        .map(|(said, _)| said);
+    frame.render_widget(Line::from_iter(right).right_aligned(), area);
+}
+
+/// What the tab bar shows at its right, on a bar `width` columns wide,
+/// each piece with what a click on it does: the summary, then the forge's
+/// counts, which open the views of what they count, then what `[tab_bar]
+/// right` shows.
+fn bar_right<'a>(app: &App, theme: &Theme, width: u16) -> Vec<(Span<'a>, Option<Hit>)> {
+    let summary = summary(app.sessions(), app.server(), theme);
+    let mut right: Vec<(Span, Option<Hit>)> =
+        summary.spans.into_iter().map(|said| (said, None)).collect();
+    let counts = counts_width(app, width) > 0;
+    let status = status_shown(app, width);
+    if !counts && status.is_none() {
+        return right;
     }
-    frame.render_widget(right.right_aligned(), area);
+    // After the count, before the space the summary ends with.
+    let end = right.pop();
+    let separator = Span::styled(
+        app.tab_bar().separator.clone(),
+        Style::new().fg(theme.muted),
+    );
+    let mut shown = Vec::new();
+    if counts {
+        let counts = forge_counts(app.open_on_forge(), theme);
+        shown.extend(counts.into_iter().map(|(said, hit)| (said, Some(hit))));
+    }
+    let text = Style::new().fg(theme.text);
+    let status = status.into_iter().flatten();
+    shown.extend(status.map(|said| (Span::styled(said, text), None)));
+    for said in shown {
+        right.push((separator.clone(), None));
+        right.push(said);
+    }
+    right.extend(end);
+    right
 }
 
 /// The columns the tabs keep at least, before what the tab bar shows at
@@ -769,17 +780,17 @@ fn status_width(app: &App, width: u16) -> u16 {
 
 /// What the tab bar counts on the forge of the selected session's
 /// project, after the sessions: `3 prs` in the accent and `5 issues` in
-/// green.
-fn forge_counts<'a>(open: Option<OpenOnForge>, theme: &Theme) -> Vec<Span<'a>> {
+/// green, each with what a click on it is.
+fn forge_counts<'a>(open: Option<OpenOnForge>, theme: &Theme) -> Vec<(Span<'a>, Hit)> {
     count_words(open)
         .into_iter()
         .map(|(said, pull_requests)| {
-            let color = if pull_requests {
-                theme.accent
+            let (color, hit) = if pull_requests {
+                (theme.accent, Hit::PullRequestCount)
             } else {
-                theme.done
+                (theme.done, Hit::IssueCount)
             };
-            Span::styled(said, Style::new().fg(color))
+            (Span::styled(said, Style::new().fg(color)), hit)
         })
         .collect()
 }
@@ -948,9 +959,22 @@ fn server_label(server: &str) -> String {
 }
 
 /// The tab drawn at `column` of the top bar in `area`, if there's one
-/// there.
+/// there, or the forge's count, if that's there.
 fn tab_hit(app: &App, area: Rect, column: u16) -> Hit {
     let column = column - area.x;
+    // What's at the right, right-aligned: its colors don't move it.
+    let right = bar_right(app, &Theme::plain(), area.width);
+    let shown: u16 = right.iter().map(|(said, _)| said.width() as u16).sum();
+    let mut start = area.width.saturating_sub(shown);
+    for (said, hit) in right {
+        let end = start + said.width() as u16;
+        if let Some(hit) = hit
+            && (start..end).contains(&column)
+        {
+            return hit;
+        }
+        start = end;
+    }
     let labels = tab_labels(
         app.tabs().all(),
         &tab_statuses(app),
@@ -2323,6 +2347,55 @@ mod tests {
     }
 
     #[test]
+    fn slash_shows_an_issue_and_a_backlog_item_it_found_marked_as_what_they_are() {
+        use crate::forge::{Forge, Issue};
+        use crate::protocol::{Backlog, BacklogItem};
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_worktree("planner", "main", true)]);
+        let project = PathBuf::from("/code/app");
+        let issue = Issue {
+            number: 12,
+            title: "Login fails".into(),
+            labels: Vec::new(),
+            updated_at: "2026-10-02T09:30:00Z".into(),
+            author: "zoe".into(),
+            url: "https://github.com/acme/app/issues/12".into(),
+        };
+        app.set_issues(&project, Ok((Forge::GitHub, vec![issue])), Instant::now());
+        let item = BacklogItem {
+            number: 3,
+            text: "Log logins".into(),
+            body: String::new(),
+            tags: Vec::new(),
+            done: false,
+            created: 0,
+            closed: None,
+        };
+        let backlog = Backlog {
+            project: "app".into(),
+            path: project.clone(),
+            items: vec![item],
+            tasks: Vec::new(),
+        };
+        app.set_backlog(&project, Ok(backlog));
+        let press = |app: &mut App, code| app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        press(&mut app, KeyCode::Char('/'));
+        for letter in "login".chars() {
+            press(&mut app, KeyCode::Char(letter));
+        }
+        let lines = sidebar_text(&app);
+        let heading = line_with(&lines, "app ─");
+        let issue = line_with(&lines, "#12 Login fails");
+        assert!(issue > heading, "{lines:?}");
+        assert!(lines[issue].contains("Login fails    issue"), "{lines:?}");
+        let item = line_with(&lines, "#3 Log logins");
+        assert!(item > issue, "{lines:?}");
+        assert!(lines[item].contains("Log logins      to do"), "{lines:?}");
+        let screen = screen_text(&app).join("\n");
+        assert!(screen.contains("2 matches"), "{screen}");
+    }
+
+    #[test]
     fn the_keys_overlay_draws_over_an_80_by_24_screen_a_page_at_a_time() {
         let mut app = App::new(None);
         app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
@@ -2598,7 +2671,10 @@ mod tests {
             pull_requests: counted(3, false),
             issues: counted(1, false),
         };
-        let said = Line::from(forge_counts(Some(open), &theme));
+        let counts = forge_counts(Some(open), &theme);
+        let hits: Vec<Hit> = counts.iter().map(|(_, hit)| *hit).collect();
+        assert_eq!(hits, [Hit::PullRequestCount, Hit::IssueCount]);
+        let said = Line::from_iter(counts.into_iter().map(|(said, _)| said));
         assert_eq!(text_of(&said), "3 prs1 issue");
         let prs = said.spans.iter().find(|span| span.content == "3 prs");
         assert_eq!(prs.unwrap().style.fg, Some(theme.accent));
@@ -2608,7 +2684,11 @@ mod tests {
             pull_requests: counted(100, true),
             issues: counted(0, false),
         };
-        let said = Line::from(forge_counts(Some(gitlab), &theme));
+        let said = Line::from_iter(
+            forge_counts(Some(gitlab), &theme)
+                .into_iter()
+                .map(|(s, _)| s),
+        );
         assert_eq!(text_of(&said), "100+ mrs");
         let unlisted = OpenOnForge {
             issues: None,
@@ -2707,6 +2787,52 @@ mod tests {
             top(&app, 60)
         );
         assert!(top(&app, 50).ends_with("1 session "), "{}", top(&app, 50));
+    }
+
+    #[test]
+    fn a_click_on_the_forge_counts_hits_what_they_count() {
+        use crate::forge::{Checks, Forge, Issue, PullRequest, Review};
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_worktree("planner", "main", true)]);
+        let project = PathBuf::from("/code/app");
+        let pull_request = PullRequest {
+            forge: Forge::GitHub,
+            number: 57,
+            title: "a change".into(),
+            author: "ana".into(),
+            branch: "b".into(),
+            from_fork: false,
+            local_branch: "b".into(),
+            draft: false,
+            conflicts: false,
+            merged: false,
+            checks: Checks::None,
+            review: Review::None,
+            updated_at: String::new(),
+            url: String::new(),
+        };
+        let listed = Ok((Forge::GitHub, vec![pull_request]));
+        app.set_pull_requests(project.clone(), listed, Instant::now());
+        let issue = Issue {
+            number: 12,
+            title: "a bug".into(),
+            labels: Vec::new(),
+            updated_at: String::new(),
+            author: "zoe".into(),
+            url: String::new(),
+        };
+        app.set_issues(&project, Ok((Forge::GitHub, vec![issue])), Instant::now());
+        let top = screen_text_at(&app, 100, 24).remove(0);
+        assert!(top.ends_with("1 session · 1 pr · 1 issue "), "{top}");
+        let column = |text: &str| top[..top.find(text).unwrap()].chars().count() as u16;
+        let areas = Areas::of(&app, Rect::new(0, 0, 100, 24));
+        let at = |column: u16| hit(&areas, &app, column, 0);
+        assert_eq!(at(column("1 pr")), Hit::PullRequestCount);
+        assert_eq!(at(column("1 pr") + 3), Hit::PullRequestCount);
+        assert_eq!(at(column("1 issue") + 6), Hit::IssueCount);
+        assert_eq!(at(column("1 issue") - 2), Hit::Elsewhere, "the separator");
+        assert_eq!(at(column("1 session")), Hit::Elsewhere);
+        assert_eq!(at(99), Hit::Elsewhere, "the space at the end");
     }
 
     #[test]
