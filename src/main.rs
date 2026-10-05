@@ -53,6 +53,7 @@ mod messages;
 mod model;
 mod names;
 mod notify;
+mod open;
 mod output;
 mod output_ring;
 mod plugin_cli;
@@ -80,6 +81,7 @@ mod sound;
 mod spending;
 mod state;
 mod stream;
+mod subagents;
 mod syntax;
 mod task;
 mod tasks;
@@ -98,7 +100,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use client::Restart;
 use output::{out, outln};
 use profile::{Launch, Profile, StartIn};
-use protocol::{ArchivedSession, Request, Response, SessionInfo, TaskSpec, TaskState};
+use protocol::{ArchivedSession, NotifySound, Request, Response, SessionInfo, TaskSpec, TaskState};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -212,15 +214,26 @@ enum Command {
     },
     /// Tell the user something with a notification, the way crystal tells
     /// them a session needs them; a click on it takes them to the session.
-    /// The notification settings count, `unfocused_only` among them.
+    /// The notification settings count, `unfocused_only` among them, and
+    /// `[sound]`'s.
     Notify {
         /// The session it's about, which a click takes the user to
         /// [default: the one this runs in, if any]
         #[arg(short, long)]
         name: Option<String>,
 
+        /// Its title [default: crystal]. Alone, with no message, it's what
+        /// the notification says.
+        #[arg(short, long)]
+        title: Option<String>,
+
+        /// The sound that plays with it: crystal's for an agent asking you
+        /// something, or for one that's done, or none.
+        #[arg(short, long, value_enum, default_value = "request")]
+        sound: NotifySound,
+
         /// What to tell them. Several words are joined with spaces.
-        #[arg(required = true)]
+        #[arg(required_unless_present = "title")]
         message: Vec<String>,
     },
     /// Say what the agent in this session is doing, for an agent crystal
@@ -468,6 +481,15 @@ enum Command {
         #[command(subcommand)]
         command: TitleCommand,
     },
+    /// Show files in the TUI used last, in a view of their own: a markdown
+    /// file as its page, its mermaid diagrams drawn, and Enter opening one
+    /// in your $EDITOR. What an agent runs when you ask to see a file.
+    /// Text files only.
+    Open {
+        /// The files, from the current directory or absolute.
+        #[arg(required = true, value_name = "FILE")]
+        files: Vec<PathBuf>,
+    },
     /// Print the TUI's tabs: each one's sessions, and how its panes split
     /// the room. Or write them to a layout file, or lay them out the way
     /// one says, starting what isn't there.
@@ -531,6 +553,8 @@ enum Command {
         interrupt: bool,
 
         /// Then wait for the turn it starts to end, and print how it ended.
+        /// An agent that isn't seen starting on it within 5 seconds has
+        /// stalled: that exits 3.
         #[arg(long)]
         wait: bool,
 
@@ -539,13 +563,15 @@ enum Command {
         timeout: Option<f64>,
     },
     /// Wait until a session's agent isn't working, or its program has
-    /// ended, and print which: done, waiting, idle, exited 0…
+    /// ended, and print which: done, waiting, idle, exited 0… Or until a
+    /// task closes, and print how it went: done, failed or cancelled.
     Wait {
+        /// The session, or a task by its number, like t12.
         name: String,
 
         /// Wait for this instead, and print it once it's reached: working,
-        /// waiting, done, idle, or ended (exited). Several, with commas
-        /// between, wait for any of them.
+        /// waiting, done, idle, ended (exited), or closed, its task. Several,
+        /// with commas between, wait for any of them.
         #[arg(
             long,
             value_enum,
@@ -641,6 +667,15 @@ enum Command {
         #[arg(long)]
         ansi: bool,
     },
+    /// Clear a session's screen and history, but for the line its cursor
+    /// is on, which goes to the top: a shell's prompt and what's typed on
+    /// it. Its program is sent nothing. A program drawing on the alternate
+    /// screen, like an editor, is left as it is.
+    Clear {
+        /// The session [default: the one this runs in]
+        #[arg(short, long)]
+        name: Option<String>,
+    },
     /// Print what runs in a session's terminal: the processes in front,
     /// the job its keys go to, its leader first, each with its command and
     /// the directory it works in.
@@ -682,6 +717,15 @@ enum Command {
     },
     /// Give a session another name.
     Rename { name: String, new_name: String },
+    /// Name the session this runs in, in a few words, as crystal asks
+    /// Claude Code to with its first prompt: only while crystal still names
+    /// the session itself.
+    #[command(hide = true)]
+    Name {
+        /// The words, joined with dashes for the name.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        title: Vec<String>,
+    },
     /// Run an ended session's command again, in the same directory and
     /// under the same name. Claude Code comes back in its conversation. One
     /// that couldn't start again after a restart tries again.
@@ -2056,6 +2100,11 @@ enum BacklogCommand {
 /// script can tell "not yet" from anything else going wrong.
 const TIMED_OUT: u8 = 2;
 
+/// What `crystal send --wait` exits with when the agent was never seen
+/// starting on what it was sent: 3, so a script can read it before sending
+/// it again.
+const STALLED: u8 = 3;
+
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -2078,9 +2127,12 @@ fn main() -> ExitCode {
             // standard error may be a pipe that has gone too.
             let said = format!("{err:#}");
             let _ = writeln!(std::io::stderr(), "crystal: {}", printable::text(&said));
-            match err.is::<drive::TimedOut>() {
-                true => ExitCode::from(TIMED_OUT),
-                false => ExitCode::FAILURE,
+            if err.is::<drive::TimedOut>() {
+                ExitCode::from(TIMED_OUT)
+            } else if err.is::<drive::Stalled>() {
+                ExitCode::from(STALLED)
+            } else {
+                ExitCode::FAILURE
             }
         }
     }
@@ -2123,7 +2175,12 @@ fn run(cli: Cli) -> Result<()> {
             summary,
         } => work::done(&socket, name, failed, &summary.join(" "), artifacts)?,
         Command::Handoff { name, note } => work::handoff(&socket, name, &note.join(" "))?,
-        Command::Notify { name, message } => {
+        Command::Notify {
+            name,
+            title,
+            sound,
+            message,
+        } => {
             let id = name
                 .is_none()
                 .then(|| env::own_session_id(&socket))
@@ -2132,6 +2189,8 @@ fn run(cli: Cli) -> Result<()> {
                 text: message.join(" "),
                 id,
                 name,
+                title,
+                sound,
             };
             match client::ask(&socket, &request, true)? {
                 Some(Response::Done) => {}
@@ -2199,6 +2258,7 @@ fn run(cli: Cli) -> Result<()> {
             drive::answer(&socket, &task, answer, message)?;
         }
         Command::Interrupt { task } => drive::interrupt(&socket, &task)?,
+        Command::Clear { name } => drive::clear(&socket, name)?,
         Command::Backlog {
             dir,
             all,
@@ -2242,6 +2302,7 @@ fn run(cli: Cli) -> Result<()> {
             };
             client::lay_out(&socket, layout::Command::Title { text })?;
         }
+        Command::Open { files } => open::run(&socket, &files)?,
         Command::Layout {
             command: Some(LayoutCommand::Export { tab }),
             ..
@@ -2301,22 +2362,21 @@ fn run(cli: Cli) -> Result<()> {
                 [dash] if dash == drive::FROM_STDIN => drive::read_stdin()?,
                 words => words.join(" "),
             };
-            drive::send(&socket, &name, &text, !no_enter, force, interrupt)?;
-            if wait {
-                drive::wait_for_turn(&socket, &name, seconds(timeout), false)?;
-            }
+            let sending = drive::Sending {
+                enter: !no_enter,
+                force,
+                interrupt,
+                wait,
+                timeout: seconds(timeout),
+            };
+            drive::send(&socket, &name, &text, sending)?;
         }
         Command::SendKeys {
             name,
             keys,
             wait,
             timeout,
-        } => {
-            drive::send_keys(&socket, &name, keys)?;
-            if wait {
-                drive::wait_for_turn(&socket, &name, seconds(timeout), false)?;
-            }
-        }
+        } => drive::send_keys(&socket, &name, keys, wait, seconds(timeout))?,
         Command::Wait {
             name,
             until,
@@ -2401,6 +2461,7 @@ fn run(cli: Cli) -> Result<()> {
             stream::control(&socket, &name, size)?
         }
         Command::Rename { name, new_name } => client::rename(&socket, &name, &new_name)?,
+        Command::Name { title } => client::name_by_agent(&socket, &title.join(" "))?,
         Command::Respawn { name } => client::respawn(&socket, &name)?,
         Command::Archive { names } => {
             for name in names {
@@ -2778,19 +2839,28 @@ fn new_session(socket: &Path, new: NewArgs) -> Result<()> {
         }
         None => catalog::first_prompt_in(&command),
     };
+    // Its name printed, a script may use it later: only one attached to
+    // may be named by its agent.
     let purpose = client::Purpose {
         task,
+        agent_names: attaches(detached),
         ..client::Purpose::default()
     };
     let name = client::new_session_with(socket, name, cwd, command, purpose, &env)?.name;
     attach_or_print(socket, &name, detached)
 }
 
+/// Whether a command that starts a session attaches to it, run in a
+/// terminal, unless `detached`, rather than printing its name.
+fn attaches(detached: bool) -> bool {
+    let in_a_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    in_a_terminal && !detached
+}
+
 /// Attaches to the new session `name` when run in a terminal, unless
 /// `detached`; prints its name otherwise.
 fn attach_or_print(socket: &Path, name: &str, detached: bool) -> Result<()> {
-    let in_a_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    if in_a_terminal && !detached {
+    if attaches(detached) {
         attach::run(socket, Some(name))
     } else {
         outln!("{name}")?;

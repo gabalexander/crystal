@@ -5,16 +5,21 @@
 //! whose point is to go somewhere: making a tab, going to one, focusing a
 //! session, and a layout applied that says which tab is in front.
 
-use super::{Action, App, PluginPane, Popup, Slot, resize_step};
+use super::{Action, App, PluginPane, Popup, Slot, View, resize_step, worktree_label};
+use crate::events::Event;
 use crate::flow_run::FlowRun;
 use crate::layout::{Command, Layout, NO_TUI, Order, TabLayout, Tile};
 use crate::notify::Presence;
 use crate::protocol::SessionInfo;
 use crate::session::UNSEEN_SIZE;
+use crate::shell;
+use crate::tui::layout_events::{self, Focus, Look};
+use crate::tui::opened_view::OpenedView;
 use crate::tui::split_tree::{Direction, Pane, SplitTree, Way};
 use crate::tui::tabs::Tabs;
 use crate::tui::ui::Areas;
 use ratatui::layout::Rect;
+use std::path::{Path, PathBuf};
 
 /// What came of a layout command carried out with no TUI open.
 pub struct Alone {
@@ -24,6 +29,8 @@ pub struct Alone {
     pub tabs: Tabs,
     /// The sessions a tab closed with them leaves to be killed.
     pub kill: Vec<String>,
+    /// What it changed, as events: see [`layout_events`].
+    pub events: Vec<Event>,
 }
 
 impl App {
@@ -38,8 +45,10 @@ impl App {
         order: Order,
     ) -> Result<Alone, String> {
         // The title is the TUI's terminal's, and there's none; nor is
-        // there anything to show a pane over.
-        if let Command::Title { .. } | Command::Overlay { .. } = order.command {
+        // there anything to show a pane or files over.
+        if let Command::Title { .. } | Command::Overlay { .. } | Command::Open { .. } =
+            order.command
+        {
             return Err(format!("{NO_TUI} to show it"));
         }
         let mut app = App::new(None);
@@ -50,6 +59,12 @@ impl App {
         app.set_sessions(sessions);
         app.set_tabs(tabs);
         app.set_tiles(Areas::of(&app, screen).tiles);
+        // Nobody is at a TUI to be on a session: what changed is the tabs.
+        let look = |app: &App| Look {
+            focused: None,
+            ..app.look()
+        };
+        let before = look(&app);
         let kill = match app.obey(order)? {
             Some(Action::KillAll(names)) => names,
             _ => Vec::new(),
@@ -58,7 +73,18 @@ impl App {
             layout: app.layout(),
             tabs: app.tabs_to_keep(),
             kill,
+            events: layout_events::changes(&before, &look(&app), &app.sessions),
         })
+    }
+
+    /// The tabs, with their ids, and the session the user is on, to tell
+    /// what changed in them: see [`layout_events`].
+    pub fn look(&self) -> Look {
+        let ids = self.tabs.all().iter().map(|tab| tab.id);
+        Look {
+            tabs: ids.zip(self.layout().tabs).collect(),
+            focused: self.selected().map(Focus::of),
+        }
     }
 
     /// Carries out a layout command from the command line, or says why it
@@ -215,6 +241,7 @@ impl App {
                 self.put_float_back_in(index);
             }
             Command::Title { text } => self.title_override = text,
+            Command::Open { dir, files } => return self.show_opened(&dir, &files, caller),
             Command::Apply { tabs, replace } => self.apply(&tabs, replace)?,
             Command::Overlay {
                 session,
@@ -239,6 +266,30 @@ impl App {
             }
         }
         Ok(None)
+    }
+
+    /// Shows `files` in a view of their own, in place of whatever view is
+    /// open, as `crystal open` asks: each by its path from `dir`, under the
+    /// name of the session it was run in when that's one of the TUI's, and
+    /// its worktree. What else was open is there again once it's closed.
+    fn show_opened(
+        &mut self,
+        dir: &Path,
+        files: &[PathBuf],
+        caller: Option<&str>,
+    ) -> Result<Option<Action>, String> {
+        if files.is_empty() {
+            return Err("there's nothing to open".to_string());
+        }
+        let by = caller.and_then(|id| self.sessions.iter().find(|session| session.id == id));
+        let place = match by.and_then(|session| session.worktree.as_ref()) {
+            Some(worktree) => worktree_label(worktree),
+            None => shell::home_relative(dir),
+        };
+        let by = by.map(|session| session.name.clone());
+        let (view, read) = OpenedView::new(by, place, dir, files);
+        self.view = Some(View::Opened(view));
+        Ok(read)
     }
 
     /// The session called `name`, if there is one.
@@ -762,8 +813,8 @@ mod tests {
     use super::*;
     use crate::protocol::{SessionInfo, State};
     use crate::tui::app::Focus;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
-    use std::path::PathBuf;
 
     fn session(name: &str) -> SessionInfo {
         SessionInfo {
@@ -884,6 +935,61 @@ mod tests {
         };
         let tabs = Tabs::default();
         let alone = App::obey_alone(vec![session("notes-board")], Vec::new(), tabs, order);
+        assert_eq!(alone.err().unwrap(), format!("{NO_TUI} to show it"));
+    }
+
+    #[test]
+    fn files_opened_are_shown_in_a_view_of_their_own_and_only_by_a_tui() {
+        let mut app = app_with(&["explainer", "other"]);
+        let open = |files: &[&str]| Command::Open {
+            dir: PathBuf::from("/code/app"),
+            files: files.iter().map(PathBuf::from).collect(),
+        };
+        let order = Order {
+            command: open(&["/code/app/docs/explain.md", "/code/app/src/main.rs"]),
+            caller: Some("id-explainer".into()),
+        };
+        assert_eq!(
+            app.obey(order).unwrap(),
+            Some(Action::ReadPreview {
+                dir: PathBuf::from("/code/app"),
+                path: "docs/explain.md".into(),
+            })
+        );
+        let Some(View::Opened(view)) = app.view() else {
+            panic!("the files aren't shown");
+        };
+        assert_eq!(view.by.as_deref(), Some("explainer"));
+        assert_eq!(view.place, "/code/app", "the session isn't in git");
+
+        // Keys are the view's, and Enter edits the file in a session of its
+        // own, the view closed.
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(
+            app.on_key(key(KeyCode::Tab)),
+            Some(Action::ReadPreview {
+                dir: PathBuf::from("/code/app"),
+                path: "src/main.rs".into(),
+            })
+        );
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::Edit {
+                dir: PathBuf::from("/code/app"),
+                path: "src/main.rs".into(),
+                line: None,
+                name: "main.rs".into(),
+            })
+        );
+        assert!(app.view().is_none());
+
+        let said = obey(&mut app, open(&[])).unwrap_err();
+        assert_eq!(said, "there's nothing to open");
+        let order = Order {
+            command: open(&["/code/app/README.md"]),
+            caller: None,
+        };
+        let alone = App::obey_alone(vec![session("other")], Vec::new(), Tabs::default(), order);
         assert_eq!(alone.err().unwrap(), format!("{NO_TUI} to show it"));
     }
 

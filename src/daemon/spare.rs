@@ -14,8 +14,8 @@
 //! docket's prewarm pool.
 
 use super::{
-    Daemon, check_dir, claude_tools, exists, keep_scrollback, launch_notes, name_for, new_id,
-    new_task_info, settings,
+    Daemon, check_dir, claude_tools, exists, keep_scrollback, launch_notes, name_for, names_itself,
+    new_id, new_task_info, settings,
 };
 use crate::agents;
 use crate::catalog;
@@ -194,6 +194,7 @@ pub(super) fn adopt(sessions: &mut Vec<Session>, spare: Spare, new: NewSession) 
     let mut session = spare.session;
     let config = settings();
     let program = new.command.first().context("no command to run")?;
+    let agent_names = new.agent_names && names_itself(new.name.as_deref(), &new.command, &config);
     let named = name_for(sessions, new.name, new.task.as_deref(), program, &config);
     let (name, named_after_program) = match named {
         Ok(named) => named,
@@ -206,6 +207,9 @@ pub(super) fn adopt(sessions: &mut Vec<Session>, spare: Spare, new: NewSession) 
     session.take_over(name.clone(), new.command);
     if named_after_program {
         session.mark_named_after_program();
+    }
+    if agent_names {
+        session.let_agent_name();
     }
     session.set_about(&new.brief);
     if let Some(goal) = new.task.filter(|_| tasks::enabled(&config)) {

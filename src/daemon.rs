@@ -38,10 +38,9 @@ use crate::plugin_hooks;
 use crate::printable;
 use crate::project;
 use crate::protocol::{
-    self, Activity, AgentEvent, ArchivedSession, Artifact, ArtifactKind, Backlog, Conversation,
-    Frame, Front, NewSession, NewTask, PendingTask, Request, Response, SessionInfo, State,
-    TaskBrief, TaskInfo, TaskOutcome, TaskRecord, TaskSpec, TaskStart, TaskState, TaskView,
-    Worktree,
+    self, AgentEvent, ArchivedSession, Artifact, ArtifactKind, Backlog, Conversation, Frame, Front,
+    NewSession, NewTask, PendingTask, Request, Response, SessionInfo, State, TaskBrief, TaskInfo,
+    TaskOutcome, TaskRecord, TaskSpec, TaskStart, TaskState, TaskView, Worktree,
 };
 use crate::report;
 use crate::resources;
@@ -418,7 +417,9 @@ impl Daemon {
             }
             Request::TakeLayoutOrders { used } => {
                 drop(ticket);
-                return self.layout.serve(&conn, input, used);
+                return self
+                    .layout
+                    .serve(&conn, input, used, |event| self.events.emit(event));
             }
             Request::WaitOutput {
                 name,
@@ -635,6 +636,7 @@ impl Daemon {
                     task: goal.as_ref().map(|goal| goal.goal.clone()),
                     backlog,
                     brief,
+                    agent_names: false,
                 };
                 start_as(
                     id,
@@ -933,9 +935,14 @@ impl Daemon {
             if known.listed.contains(project) {
                 continue;
             }
-            match self.db.lock().unwrap().list_project(project, true) {
-                Ok(()) => {
+            let listed = self.db.lock().unwrap().list_project(project, true);
+            match listed {
+                Ok(added) => {
                     known.listed.insert(project.to_path_buf());
+                    if added {
+                        let event = Event::project_listed(true, project.to_path_buf());
+                        self.events.emit(event);
+                    }
                 }
                 Err(err) => eprintln!(
                     "crystal daemon: couldn't keep {} in the list of projects: {err:#}",
@@ -990,12 +997,15 @@ impl Daemon {
             );
         }
         let mut known = self.projects.lock().unwrap();
-        self.db.lock().unwrap().list_project(&project, listed)?;
+        let changed = self.db.lock().unwrap().list_project(&project, listed)?;
         if listed {
             known.checkouts.insert(project.clone(), Some(checkout));
         } else {
             known.listed.remove(&project);
             known.checkouts.remove(&project);
+        }
+        if changed {
+            self.events.emit(Event::project_listed(listed, project));
         }
         Ok(Response::Done)
     }
@@ -1245,13 +1255,8 @@ impl Daemon {
             // does, but its step's session has ended and can't say so.
             if run.state() == RunState::Failed {
                 let session = run.steps[step].session.clone();
-                let notice = Notice {
-                    session: session.clone().unwrap_or_default(),
-                    activity: Activity::Waiting,
-                    text: format!("{} failed at {}", run.name, run.step_name(step)),
-                    jump: session,
-                    agent: None,
-                };
+                let text = format!("{} failed at {}", run.name, run.step_name(step));
+                let notice = Notice::of_crystal(text, session);
                 notify::tell(notice, &self.socket);
             }
         }
@@ -1336,6 +1341,7 @@ impl Daemon {
                 task: Some(asked),
                 backlog: None,
                 brief: TaskBrief::default(),
+                agent_names: false,
             };
             start(sessions, &self.socket, new, None, None)?
         } else {
@@ -2047,8 +2053,39 @@ impl Daemon {
         let new_name = unique_name(&base, taken);
         let session = &mut sessions[index];
         let old_name = std::mem::replace(&mut session.name, new_name);
-        session.keep_name();
+        session.named_from_prompt();
         self.tell_renamed(session, &old_name);
+    }
+
+    /// Names the session with id `id` in `title`'s words, which its agent
+    /// picked as crystal asked it to, while crystal still names it itself.
+    fn name_by_agent(&self, id: &str, title: &str) -> Result<()> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let index = sessions
+            .iter()
+            .position(|session| session.id == id)
+            .context("this session has gone")?;
+        let session = &sessions[index];
+        ensure!(
+            settings().name_by_agent && session.awaits_agent_name(),
+            "{} keeps its name",
+            session.name
+        );
+        let base = names::from_title(title).context("say in a few words what it's about")?;
+        let taken = |name: &str| {
+            let others = sessions.iter().enumerate().filter(|(at, _)| *at != index);
+            others
+                .map(|(_, session)| session)
+                .any(|session| session.name == name)
+        };
+        let new_name = unique_name(&base, taken);
+        let session = &mut sessions[index];
+        session.keep_name();
+        if session.name != new_name {
+            let old_name = std::mem::replace(&mut session.name, new_name);
+            self.tell_renamed(session, &old_name);
+        }
+        Ok(())
     }
 
     /// Names the session with id `id` after `title`, the name Claude Code
@@ -2163,10 +2200,10 @@ impl Daemon {
                 // that keeps the agent from ending its turn.
                 let can_remind = matches!(agent.as_str(), "claude" | "codex");
                 // Only Claude Code's prompt hook takes a name for its
-                // conversation.
+                // conversation, or more for it to read.
                 let can_retitle = agent == "claude" && prompt.is_some();
-                if let Some(prompt) = prompt {
-                    self.name_from_prompt(&mut sessions, &id, &prompt);
+                if let Some(prompt) = &prompt {
+                    self.name_from_prompt(&mut sessions, &id, prompt);
                 }
                 let moving = self.is_moving(&id);
                 let session = with_id(&mut sessions, &id)?;
@@ -2206,6 +2243,11 @@ impl Daemon {
                     });
                 }
                 let retitle = can_retitle.then(|| session.title_to_give()).flatten();
+                // Asked to name the session, the agent says better what it's
+                // about than the prompt's first words.
+                let ask_name = can_retitle
+                    && settings().name_by_agent
+                    && session.ask_agent_to_name(prompt.as_deref().unwrap_or_default());
                 // An agent that reports for itself holds the session's
                 // status: what hooks say counts again once it lets go.
                 if !session.is_claimed() {
@@ -2221,8 +2263,13 @@ impl Daemon {
                     }
                 }
                 self.tell_changes(session);
+                // A session the user renamed isn't asked about: its name
+                // stays.
                 match retitle {
                     Some(title) => Ok(Response::Retitle { title }),
+                    None if ask_name => Ok(Response::Context {
+                        text: names::ASK_AGENT.to_string(),
+                    }),
                     None => Ok(Response::Done),
                 }
             }
@@ -2279,8 +2326,13 @@ impl Daemon {
                 self.events.emit(*event);
                 Ok(Response::Done)
             }
-            Request::Notify { text, id, name } => {
-                ensure!(!text.trim().is_empty(), "say what to tell the user");
+            Request::Notify {
+                text,
+                id,
+                name,
+                title,
+                sound,
+            } => {
                 let mut sessions = self.sessions.lock().unwrap();
                 let session = match (id, name) {
                     (Some(id), _) => Some(with_id(&mut sessions, &id)?.name.clone()),
@@ -2288,16 +2340,8 @@ impl Daemon {
                     (None, None) => None,
                 };
                 drop(sessions);
-                let notice = Notice {
-                    text: match &session {
-                        Some(session) => format!("{session}: {text}"),
-                        None => text,
-                    },
-                    session: session.clone().unwrap_or_default(),
-                    activity: Activity::Waiting,
-                    jump: session,
-                    agent: None,
-                };
+                let notice = Notice::told(title.as_deref(), &text, session, sound)
+                    .context("say what to tell the user")?;
                 notify::tell(notice, &self.socket);
                 Ok(Response::Done)
             }
@@ -2339,6 +2383,10 @@ impl Daemon {
                 if new_name != name {
                     self.tell_renamed(session, &name);
                 }
+                Ok(Response::Done)
+            }
+            Request::NameByAgent { id, title } => {
+                self.name_by_agent(&id, &title)?;
                 Ok(Response::Done)
             }
             Request::Respawn { name, env } => self.respawn(&name, env),
@@ -2414,6 +2462,18 @@ impl Daemon {
                 };
                 let rows = term.read(history, unwrap, ansi, since_ms);
                 Ok(Response::Screen { rows })
+            }
+            Request::Clear { id, name } => {
+                let (name, term) = {
+                    let mut sessions = self.sessions.lock().unwrap();
+                    let session = id_or_name(&mut sessions, id, name)?;
+                    let name = session.name.clone();
+                    ensure!(session.is_running(), "{name} isn't running");
+                    (name, session.term())
+                };
+                term.clear()
+                    .with_context(|| format!("{name} wasn't cleared"))?;
+                Ok(Response::Done)
             }
             Request::Close {
                 id,
@@ -2833,13 +2893,9 @@ impl Daemon {
         let id = tasks::parse_id(handle).with_context(|| {
             format!("there's no task or session called {handle}: give a task's number, like t12")
         })?;
-        let pending = {
-            let db = self.db.lock().unwrap();
-            let pending = db.pending_task(id)?;
-            let pending = pending.with_context(|| format!("there's no open task t{id}"))?;
-            db.remove_pending_task(id)?;
-            pending
-        };
+        let pending = self.db.lock().unwrap().pending_task(id)?;
+        let pending = pending.with_context(|| format!("there's no open task t{id}"))?;
+        let project = project::of(&pending.cwd).path;
         let closed = now_seconds();
         let cancelled = TaskRecord {
             outcome: Some(TaskOutcome::new(
@@ -2850,7 +2906,18 @@ impl Daemon {
             pending: false,
             ..tasks::pending_record(&pending)
         };
-        self.write_down(&pending.cwd, None, &cancelled);
+        {
+            // Closed as it stops waiting to start, in one go, so that
+            // whoever looks for it meanwhile finds it one way or the other;
+            // and once, though it's cancelled twice at once.
+            let mut db = self.db.lock().unwrap();
+            ensure!(db.remove_pending_task(id)?, "there's no open task t{id}");
+            if let Err(err) = db.record_task(&project, &cancelled) {
+                eprintln!("crystal daemon: couldn't write down a closed task: {err:#}");
+            }
+        }
+        let event = Event::pending_task(Kind::TaskClosed, project, cancelled);
+        self.events.emit(event);
         Ok(())
     }
 
@@ -2881,6 +2948,7 @@ impl Daemon {
                     task: Some(goal),
                     backlog,
                     brief,
+                    agent_names: false,
                 };
                 start(&mut sessions, &self.socket, new, None, None)
             }
@@ -2966,6 +3034,7 @@ impl Daemon {
             task: open.map(|goal| goal.goal.clone()),
             backlog,
             brief,
+            agent_names: false,
         };
         // The task makes way, and comes back if Claude doesn't start.
         let background = sessions.remove(index);
@@ -3172,6 +3241,9 @@ impl Daemon {
             .map_err(|why| anyhow!(why))?;
         db.keep_ui(db::TABS, &alone.tabs)?;
         drop(db);
+        for event in alone.events {
+            self.events.emit(event);
+        }
         for name in &alone.kill {
             self.kill(name)?;
         }
@@ -3236,6 +3308,7 @@ impl Daemon {
                     task: launch.goal.as_ref().map(|goal| goal.goal.clone()),
                     backlog,
                     brief,
+                    agent_names: false,
                 };
                 // A terminal crystal stopped idle shows what it showed,
                 // above its shell started again.
@@ -3662,6 +3735,7 @@ fn start_as(
         task,
         backlog,
         brief,
+        agent_names,
     } = new;
     let Some(program) = command.first() else {
         bail!("no command to run");
@@ -3672,6 +3746,9 @@ fn start_as(
         "command not found: {program}"
     );
     let config = settings();
+    // Claude Code, asked to with its first prompt, names it better still,
+    // unless whoever started it holds on to the name it's given here.
+    let agent_names = agent_names && names_itself(name.as_deref(), &command, &config);
     let (name, named_after_program) = name_for(sessions, name, task.as_deref(), program, &config)?;
 
     let rollouts = codex::Rollouts::for_session(&command, &cwd, &env);
@@ -3745,6 +3822,9 @@ fn start_as(
     if named_after_program {
         session.mark_named_after_program();
     }
+    if agent_names {
+        session.let_agent_name();
+    }
     session.set_about(&brief);
     if let Some(goal) = task {
         session.give_task(new_task_info(goal, false, backlog, brief));
@@ -3787,11 +3867,18 @@ fn name_for(
     Ok((name, named_after_program))
 }
 
+/// Whether a new session started as `command`, given the name `name`, is
+/// for its agent to name, as the settings say: Claude Code, with a name
+/// nobody gave it.
+fn names_itself(name: Option<&str>, command: &[String], config: &Config) -> bool {
+    name.is_none() && config.name_by_agent && agents::program_name(command) == Some("claude")
+}
+
 /// What crystal tells an agent starting in `cwd` with `command` on top of
 /// what it's asked (see [`notes`]): of `task`, the task it's given, with
 /// tasks on, and of the pull request and the issue `brief` names, whether
-/// it's a task or not; how to work on several things at once here, for
-/// Claude Code; the notes its worktree's sessions left; and what its
+/// it's a task or not; how to work on several things at once here and show
+/// the user files, for Claude Code; the notes its worktree's sessions left; and what its
 /// project remembers that has to do with the words of `command`.
 fn launch_notes(
     socket: &Path,
@@ -3806,7 +3893,7 @@ fn launch_notes(
         tasks::forge_notes(brief, cwd, task.is_some()),
     ]);
     let parallel = (agents::program_name(command) == Some("claude"))
-        .then(|| agents::PARALLEL_WORK.to_string());
+        .then(|| format!("{} {}", agents::PARALLEL_WORK, agents::SHOWING_FILES));
     let remembered = remembered(socket, cwd, command);
     let said = [
         task,
@@ -3917,9 +4004,9 @@ fn launch_memory(socket: &Path, cwd: &Path, asked: &str, reader: memory::Reader)
 
 /// What gives a Claude Code session in `cwd` the tools crystal tells it
 /// to use, allowed up front so it never stops to ask for them: the crystal
-/// commands its notes name, and with memory on, crystal's MCP server, run
-/// by `crystal`, the path of this program, and its tools. Nothing for
-/// another program.
+/// commands its notes name, `crystal name` while crystal may ask it to name
+/// its session, and with memory on, crystal's MCP server, run by `crystal`,
+/// the path of this program, and its tools. Nothing for another program.
 fn claude_tools(
     socket: &Path,
     cwd: &Path,
@@ -3931,6 +4018,10 @@ fn claude_tools(
         return Vec::new();
     }
     let mut tools = crystal_commands(config);
+    // Asked to name its session, it does without stopping for the user.
+    if config.name_by_agent {
+        tools.push("Bash(crystal name:*)");
+    }
     let mut options = Vec::new();
     if memory::enabled(config) {
         options.extend([
@@ -3947,8 +4038,9 @@ fn claude_tools(
 
 /// Claude Code's permission rules for crystal's own commands, so that an
 /// agent doing what its notes and crystal's skill teach (starting and
-/// driving sessions of its own, reading them, closing its task, noting
-/// something for later) doesn't stop for the user at every step: a task in
+/// driving sessions of its own, reading them, showing the user a file,
+/// closing its task, noting something for later) doesn't stop for the user
+/// at every step: a task in
 /// the background that did would sit there with its work done, and one
 /// driving workers would wait on each. A plugin's commands only while it's
 /// on. What removes or cancels what's there (`crystal kill`, `worktree rm`,
@@ -3962,7 +4054,8 @@ fn claude_tools(
 /// only as whole words: `crystal send:*` isn't `crystal send-keys`, and
 /// `crystal task:*` isn't `crystal tasks cancel`.
 fn crystal_commands(config: &Config) -> Vec<&'static str> {
-    // Sessions: starting, driving and reading them, and what's on screen.
+    // Sessions: starting, driving and reading them, and what's on screen,
+    // files shown there among it.
     let mut rules = vec![
         "Bash(crystal ls:*)",
         "Bash(crystal new:*)",
@@ -3980,6 +4073,7 @@ fn crystal_commands(config: &Config) -> Vec<&'static str> {
         "Bash(crystal layout export:*)",
         "Bash(crystal pane split:*)",
         "Bash(crystal pane close:*)",
+        "Bash(crystal open:*)",
     ];
     if tasks::enabled(config) {
         rules.extend([
@@ -4606,6 +4700,7 @@ mod tests {
             "Bash(crystal send:*)",
             "Bash(crystal wait:*)",
             "Bash(crystal read:*)",
+            "Bash(crystal open:*)",
             "Bash(crystal task:*)",
             "Bash(crystal flow run:*)",
             "Bash(crystal backlog done:*)",

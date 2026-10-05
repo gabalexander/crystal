@@ -52,6 +52,7 @@ const SESSION_ARGS: &[(&[&str], &str)] = &[
     (&["wait"], "name"),
     (&["events"], "name"),
     (&["read"], "name"),
+    (&["clear"], "name"),
     (&["process-info"], "name"),
     (&["observe"], "name"),
     (&["control"], "name"),

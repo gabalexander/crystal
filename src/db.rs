@@ -790,15 +790,23 @@ impl Db {
     }
 
     /// Puts `project`, by its main worktree, in the list of those crystal
-    /// knows, or takes it off with `listed` false. Its backlog and tasks
-    /// stay either way.
-    pub fn list_project(&mut self, project: &Path, listed: bool) -> Result<()> {
+    /// knows, or takes it off with `listed` false, and says whether that
+    /// changed the list. Its backlog and tasks stay either way.
+    pub fn list_project(&mut self, project: &Path, listed: bool) -> Result<bool> {
+        let was: Option<bool> = self
+            .conn
+            .query_row(
+                "SELECT listed FROM projects WHERE path = ?1",
+                params![project.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .optional()?;
         let key = self.ready(project)?;
         self.conn.execute(
             "UPDATE projects SET listed = ?2 WHERE path = ?1",
             params![key, listed],
         )?;
-        Ok(())
+        Ok(was != Some(listed))
     }
 
     /// `project`'s key in the database, once it has its row there: the
@@ -1770,15 +1778,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Db::open(&socket_in(&dir)).unwrap();
         let (app, api) = (Path::new("/code/app"), Path::new("/code/api"));
-        db.list_project(app, true).unwrap();
-        db.list_project(api, true).unwrap();
+        assert!(db.list_project(app, true).unwrap());
+        assert!(db.list_project(api, true).unwrap());
+        assert!(!db.list_project(api, true).unwrap(), "it was there");
         db.change_backlog(api, |store| store.add("tidy up", "", Vec::new(), 1))
             .unwrap();
         assert_eq!(db.listed_projects().unwrap(), vec![api, app]);
-        db.list_project(api, false).unwrap();
+        assert!(db.list_project(api, false).unwrap());
         assert_eq!(db.listed_projects().unwrap(), vec![app]);
         assert_eq!(db.backlog(api).unwrap().items.len(), 1);
-        db.list_project(api, true).unwrap();
+        assert!(db.list_project(api, true).unwrap());
         assert_eq!(db.listed_projects().unwrap(), vec![api, app]);
     }
 

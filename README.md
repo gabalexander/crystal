@@ -280,6 +280,12 @@ after. `scroll_lines` is how far a notch of the wheel scrolls, and `scrollbars =
 column back to the pane. `capture = false` leaves the mouse to your terminal altogether: its own selection
 works with no key held, but nothing in crystal answers a click, and no program in a pane gets one either.
 
+A terminal can forget it was asked for the mouse: iTerm2's Session ▸ Reset does, and so does a stray reset
+written to it, after which every click goes to the terminal and the wheel scrolls its own scrollback. The TUI
+asks for the mouse again every two seconds, with bracketed paste, focus reports and the keys it tells apart,
+though never in the middle of a drag, so the mouse comes back on its own; resizing the window goes back to the
+TUI's screen too, should the terminal have left it, and draws all of it again.
+
 `Ctrl`+click opens a link in a pane, whoever has the mouse there: a URL written out in the text (`http://`,
 `https://` or `file://`), whole across the rows it wrapped onto, or a hyperlink a program wrote (OSC 8), which
 goes where it points rather than to the text it shows. Hold `Ctrl` and move the mouse over one to see it
@@ -395,6 +401,15 @@ it was doing goes with it. `crystal agent explain <session>` shows why crystal r
 does. While Claude Code's agent has subagents running, its row says how many after
 what's in front: `claude +2`.
 
+Claude Code runs subagents in the background: its turn ends and its prompt comes back while they go on, and it
+takes up what each finds in a turn of its own. So a turn that ends with subagents running isn't the agent done:
+it reads as working, isn't `✓`, tells you nothing, and an open task isn't waiting on you nor reminded of itself,
+until they've all stopped and the agent has taken their work up. crystal looks four times a second: once the last
+one has stopped, a turn of the agent's own, its prompt or its spinner, is the work going on, and its end the
+end of it; with none within a minute, the turn is over. Subagents that show no sign of life for 15 minutes,
+none starting or stopping, no tool finishing, no permission asked for, are taken for gone, and the turn is over
+too.
+
 A Claude Code or Codex you start yourself, typed into a session's shell, has no hooks of crystal's: crystal
 doesn't start it. `crystal integration install` puts crystal's hooks in their own settings, beside yours:
 
@@ -447,6 +462,15 @@ unfocused_only = true   # only while no crystal TUI's terminal has the focus
 
 `crystal notify` sends a notification of your own, through the same settings: a script's `crystal notify
 "deploy finished"`, or an agent's, which a click takes you back to its session (`-n <name>` names another).
+`--title` gives it a title of its own in place of crystal's, or alone, with no message, is what it says, and
+`--sound` plays the `request` sound (the default), the `done` one, or `none`:
+
+```sh
+crystal notify --title "Deploy" --sound done "api is out, 0 errors"
+crystal notify -t "build failed" -s none
+```
+
+A `notify_command` of your own finds the title in `CRYSTAL_NOTICE_TITLE`, beside `CRYSTAL_NOTICE`.
 
 A sound plays at the same moments: one for an agent asking you something, another for one that's done.
 crystal plays them with `afplay` on macOS, and on Linux with the first of `paplay`, `pw-play`, `ffplay`,
@@ -503,9 +527,11 @@ crystal attach review                       # show a session; Ctrl+\ hands your 
 crystal send review "check the diff"        # type into a session and press Enter
 crystal send-keys review 1                  # press keys: an answer, Enter, Escape, C-c, Up…
 crystal wait review                         # block until its agent stops working; print how it ended
+crystal wait t12                            # block until task t12 closes; print done, failed or cancelled
 crystal read review --lines 20              # print the last 20 rows of its screen
 crystal read review --history               # and what scrolled off it before
 crystal read review --since 10m             # only what it wrote in the last ten minutes
+crystal clear -n review                     # clear its screen and history but its prompt line
 crystal ps review                           # what runs in its terminal, and where (process-info)
 crystal observe review                      # its terminal as JSON lines, for a program; `control` drives it
 crystal api snapshot                        # everything at once, as JSON, for a client of your own
@@ -533,6 +559,7 @@ crystal profile show review                 # what a profile runs, and where it 
 crystal pane split review                   # show a session in a pane beside yours in the TUI (see below)
 crystal tab new review                      # a new tab in the TUI, in front
 crystal title set "deploying"               # the title of the TUI's terminal, until `crystal title clear`
+crystal open docs/plan.md                   # show a file in the TUI, a markdown file as its page (see below)
 crystal layout                              # the TUI's tabs and how each splits its panes
 crystal layout apply dev.json               # lay them out as a file says, starting what isn't there
 crystal skill --install                     # teach Claude Code to drive crystal (see below)
@@ -724,8 +751,8 @@ everywhere else. `[keys]` names them the same way:
 | `view-close` | `q` | in a view: close it, or step back out of what's open in it |
 
 A view is any of the lists that take the keyboard: the diff, the file finder, the tree browser, find in files,
-the branch switcher, memory, the handoff notes, the backlog, layouts, the archive, the plugins, the settings,
-what needs you, RAM, the timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
+the branch switcher, memory, the handoff notes, the files `crystal open` shows, the backlog, layouts, the
+archive, the plugins, the settings, what needs you, RAM, the timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
 one of them for the key they all take for it, `↓`, `↑`, `PgDn`, `PgUp`, `Enter` or `Esc`, which go on working
 whatever you give; the defaults you leave it without do nothing. While a view is taking what you type, like
 the file finder's query or a filter, a letter is typed rather than standing for anything, so a key there is
@@ -999,6 +1026,14 @@ so you can search, copy or save from it with the editor you know. It works on a 
 text is a copy, written beside the daemon's state in `~/.local/state/crystal/history/`: the session goes on as
 before, and editing the file changes nothing in it.
 
+`clear-pane` clears the selected session's screen and its history, but for the line its cursor is on, which goes
+to the top: a shell's prompt and what's typed on it, the rows it wrapped onto too. Its program is sent nothing,
+not even a `Ctrl+L`, so a command half typed stays as it was; every pane and `crystal attach` showing it is
+cleared with it, and a program on the alternate screen, like an editor or `less`, is left alone, as it draws all
+of it. What's cleared can't be had back, so it has no key until you give it one (`clear-pane = "ctrl+l"` under
+`[keys]`); the [command list](#keys-and-commands) and a pane's right-click menu have it, and `crystal clear`
+does the same from a shell, for the session it runs in or the one `-n` names.
+
 ### Starting a session
 
 `n` opens the new-session panel over the panes, titled with where the session will start: `New session ·
@@ -1023,6 +1058,16 @@ and the first that has words to go on names it, a slash command never. A name yo
 to, stays, and so does one a script has typed into the session by with `crystal send` or `send-keys`.
 `crystal new` and `crystal task` name a session the same way when you don't, and print the name.
 `name_from_prompt = false` in the [settings](#settings) names sessions after their programs.
+
+A prompt's first words don't always say what it's about, so Claude Code names a session better: with the first
+prompt you send it that says what you're asking for, crystal asks it to name the session in three or four words
+of its own, which it does with `crystal name`, like `crystal name Fix Login Redirect`, and the session is called
+`fix-login-redirect` from then on, as docket's AUTO-TITLE does. It's asked once, with that prompt alone, as
+Claude Code's hook tells crystal of it, and allowed the command without asking you. Only a session you start
+from the TUI, or with `crystal new` attaching it in your terminal, is named this way: one whose name crystal
+printed, with `-d` or for a script, keeps it, since whoever started it may know it by it, and so does one you've
+named or renamed, or a script has typed into by its name. A rename in Claude Code is followed all the same.
+`name_by_agent = false` in the [settings](#settings) keeps the name from the prompt.
 
 Claude Code's own name for a conversation, the one `/rename` gives it, and the session's name in crystal are
 kept in step, as far as Claude Code lets them be. `/rename Fix refund rounding` renames the session
@@ -1374,6 +1419,48 @@ $ printf 'sequenceDiagram\n  Alice->>Bob: hello\n  Bob-->>Alice: hi\n' | crystal
     │         │
 ```
 
+### Files an agent shows you
+
+Ask an agent to show you a file, "open it" or "show me the plan", and it runs `crystal open <file>...`: the
+files come up in the TUI you used last, in a view of their own over the tabs, rather than pasted into its
+answer. They're listed on the left, each by its path from the worktree they were opened in, and the one selected
+is read on the right, highlighted as the [file finder](#the-file-finder-and-the-tree-browser) shows it, a
+markdown file as its page with its mermaid diagrams drawn. That makes it the place to read an explanation an
+agent writes you: a markdown page with a diagram for each flow, which it opens once it's written.
+
+| Key | In the files shown |
+|---|---|
+| `↑` / `↓`, `Tab` / `Shift+Tab` | the file above or below; `Tab` goes round |
+| `Space` / `Shift+Space`, `PageDown` / `PageUp` | page through the preview |
+| `Home` / `End`, `Shift+↑` / `Shift+↓` | the top or end of the preview; a line up or down |
+| `Ctrl+R` | a markdown file's source, or its page again |
+| `Enter` | open the file in your `$EDITOR` (or `vi`) as a session of its own, as the finder's `Enter` does |
+| `Esc` | close it |
+
+A click picks a file, and the wheel scrolls the preview. The files take the place of any view that was open,
+like the diff, and files opened again take the place of those shown, read afresh; what else was open, like the
+new-session panel with what you'd typed in it, is there again once they're closed.
+
+A [profile](#profiles) can ask for a page every time, like docket's explainer:
+
+```toml
+[[profile]]
+name = "explainer"
+description = "Writes you a page on part of the code"
+agent = "claude"
+prompt = "Explain this part of the codebase:"
+postfix = """Change no code. Write the explanation to a markdown file: a summary, then the flow with \
+file and function names, a mermaid diagram for each flow or structure. Then crystal open it, \
+and keep your answer here short."""
+launch = "session"
+```
+
+Claude Code is told to open a file only when you ask, in a prompt or a profile like that one, since it takes
+your screen: a file it wrote or changed is no reason, and it names the path instead. `crystal open` takes text
+files only, from the directory it runs in or absolute, and refuses anything else, an image, a PDF or another
+binary, before anything is shown, so the agent names that path too. With no TUI open, nothing is shown and it
+fails, saying so. You can run it yourself, from any shell.
+
 ### Find in files
 
 `G` searches the files of the selected session's worktree for what you type, with `git grep`: the files git
@@ -1699,12 +1786,35 @@ crystal send-keys reviewer 1 --wait                       # answer a question: t
 
 `send` types the way a person does: the text first, marked as a paste when the program asks for that, then
 Enter on its own, so an agent takes it as a prompt and not as pasted text. `-` as the text reads it from
-standard input: `git diff | crystal send reviewer -`. `--wait` waits for the turn the text starts, not one that
-ended before it. `wait` returns once the agent isn't working: `done`, `waiting` when it asks something,
-`idle`, or how its program exited. It takes a `--timeout` in seconds, and gives up when that runs out, with
-exit status 2; anything else that goes wrong, a mistyped flag included, is 1, so 2 always means "not yet".
-`--quiet` (`-q`) prints nothing once it's there. `send --wait`, `send-keys --wait`, `task --wait` and `flow
-wait` give up the same way. A program that doesn't say what it's doing counts as busy until it ends.
+standard input: `git diff | crystal send reviewer -`. `wait` returns once the agent isn't working: `done`,
+`waiting` when it asks something, `idle`, or how its program exited. It takes a `--timeout` in seconds, and
+gives up when that runs out, with exit status 2; anything else that goes wrong, a mistyped flag included, is
+1, so 2 always means "not yet". `--quiet` (`-q`) prints nothing once it's there. `send --wait`, `send-keys
+--wait`, `task --wait` and `flow wait` give up the same way. A program that doesn't say what it's doing counts
+as busy until it ends.
+
+`send --wait` waits for the turn the text starts, never one that ended before it: it listens to the session
+from before the text goes, and looks at its screen once the text shows there. An agent that wasn't working has
+five seconds from then to be seen starting on it, working, asking something, or its program ending, or to change
+its screen. One whose screen changes took the text, though its turn wasn't seen: one too short to fall between
+two of crystal's looks, or one getting under way on a loaded machine. Once the five seconds are over and its
+screen has held still for two, the wait ends on how it stands. One that did neither, its screen as it was once
+the text went in, has stalled, and `send` fails with an error that starts `agent_prompt_stalled:`, with exit
+status 3, rather than taking what the agent said about its turn before for an answer. A stall doesn't prove the
+agent never got the text, which a turn shorter than the moment the screen is given to show it can take, so
+`read` it before sending the text again. An agent working already takes the text once its turn is over, and
+that turn's end may be what ends the wait. A program that doesn't say what it's doing is waited on until it's
+seen starting or it ends, or its screen changes and holds still. `send-keys --wait` waits for the turn the keys
+start the same way, but never stalls: keys that change nothing on the screen in five seconds end the wait on how
+the agent stands, as they can carry on a turn its agent doesn't say it's working on, like an answer to a
+permission.
+
+| Exit status | `wait`, `send --wait`, `send-keys --wait`, `task --wait`, `flow wait` |
+|---|---|
+| 0 | it got there, and printed where |
+| 1 | anything else went wrong: no such session, it ended or was killed first, a mistyped flag |
+| 2 | `--timeout` ran out first: not yet |
+| 3 | `send --wait` only: the agent was never seen starting on what it was sent, nor changed its screen (`agent_prompt_stalled:`) |
 
 An agent asking you something takes nothing `send` types, since the text would land in its question: `send`
 refuses with an error that starts `agent_blocked:`, saying what it asks and how to answer it, with `crystal
@@ -1731,8 +1841,10 @@ terminal is stopped by its own key, which crystal doesn't press for another sess
 
 ```sh
 crystal wait reviewer --until waiting         # until it asks something; prints waiting
-crystal wait reviewer --until done,idle       # any of them: working, waiting, done, idle, ended
+crystal wait reviewer --until done,idle       # any of them: working, waiting, done, idle, ended, closed
 crystal wait server --output 'listening on'   # until a line on its screen matches; prints the line
+crystal wait t12                              # until task t12 closes; prints done, failed or cancelled
+crystal wait t12 --until waiting,closed       # until its agent asks something, or the task closes
 ```
 
 `--until` returns at once if the session is there already, and catches a state it's in only a moment, like
@@ -1742,6 +1854,14 @@ what it waits for, is an error. `--output` takes a regular expression, matched a
 screen and the 200 rows above it, so output already there counts. Both take `--timeout`. Waits listen to the
 daemon's [events](#events) rather than asking it again and again, and `--output` looks each time the program
 writes.
+
+`wait` takes a [task](#tasks)'s number, like `t12`, where it takes a session's name, and waits until the task
+closes, printing how it went: `done`, `failed` or `cancelled`. It follows the task whichever session works on
+it, from a task made to start later to one whose session has gone, and returns at once for one that's closed
+already. `--until closed` waits for a session's task to close the same way; a session with no task is refused.
+Beside other states, as in `--until waiting,closed`, those are about the session working on the task. A
+session that ends, or is killed, with its task open closes it, failed or cancelled, which the wait prints
+rather than failing. A closed task isn't always over: a follow-up opens a background task again.
 
 `send-keys` presses keys instead, the way tmux's does: key names like `Enter`, `Escape`, `Tab`, `Up`, `Down`,
 `BSpace`, `C-c` or `M-x`, and any other word typed as keys. That's what answers an agent's question, since
@@ -1763,6 +1883,10 @@ since then out on a screen of its own, the session's size: what the program wrot
 before, so a line or two from up to a second before may come in. When that MiB doesn't reach back so far, or
 the program wrote before a `restart-server` handed it over, `--since` prints the history and the screen whole.
 `--ansi` keeps the style of the text as SGR codes, and nothing that moves the cursor or makes a link.
+
+`crystal clear` clears a session's screen and history but for the line its cursor is on, sending its program
+nothing: the one it's run in, or the one `-n` names. It's the TUI's
+[`clear-pane`](#zoom-copy-mode-and-search), and like it, leaves a program on the alternate screen alone.
 
 `crystal process-info <session>` (or `ps`) lists what runs in its terminal: the processes in front, the job
 its keys go to, a line each, with its pid, its name, the directory it works in and its command; `--json` adds
@@ -1963,7 +2087,9 @@ The install script installs it when it finds Claude Code (its `claude` command, 
 Every Claude Code session crystal starts is also told, on top of its system prompt, to work on several things
 at once as sessions of crystal's, one `crystal new -d -w <branch>` each, rather than in worktrees or subagents
 of its own: a session shows in the sidebar with its status, its diff and its screen, where you can step in,
-while a worktree Claude Code makes for itself shows only once it's left behind.
+while a worktree Claude Code makes for itself shows only once it's left behind. It's told too to show you a
+file you ask to see with [`crystal open`](#files-an-agent-shows-you), rather than paste it into its answer, and
+never to open one unasked.
 
 `--install` won't write over a skill file you've changed; `--force` does. The skill lives in
 [`skill/SKILL.md`](skill/SKILL.md), and each crystal carries its own copy. After an upgrade, the daemon brings
@@ -1974,7 +2100,8 @@ changed since; it never installs the skill where it isn't, or writes over one yo
 
 The daemon writes down everything that happens in an event log, kept in crystal's database
 (`~/.local/state/crystal/crystal.db`): sessions starting, working, waiting and ending, tasks opening and
-closing, background runs, what they asked and what they cost, flows, worktrees, memory and the backlog.
+closing, background runs, what they asked and what they cost, flows, worktrees, memory and the backlog, and
+the TUI's tabs and panes and the session you're on.
 `crystal events` prints it, one line each, the oldest first:
 
 ```sh
@@ -2005,7 +2132,9 @@ Each line of `--json` is one event, the same JSON the log keeps and plugins get:
 going back), `at` (milliseconds since the Unix epoch), its name as `event`, the `project` it's about, the
 `session` (its `name`, `id`, `command`, `cwd`, `project`, `worktree`, `branch`, `activity`, `task`, and its
 number as `task_id`, `status`, as `ls` words it, and `reporter` while an agent that reports for itself holds it), and what its kind carries:
-`from` (a renamed session's old name, what its agent was doing before, or the agent that let go), `task` (with
+`from` (a renamed session's old name, what its agent was doing before, or the agent that let go; a renamed
+tab's old name, a moved tab's number before, the number of the tab a session moved from, or the session or
+project you were on before), `tab` (the tab, as [`crystal layout --json`](#tabs) has it), `task` (with
 its `id`, `pending`, `waiting` and, once closed, its `outcome` and the `artifacts` kept with it), `run`
 (`prompt`; `asking`, with its `tool` and `gist`, and the `decision`; then `failed`, `answer` and `cost_usd`),
 `flow` (`run`, `flow`, `goal`, `step`, `state`, `said`, `cost_usd`), `worktree`, `handoff` (the file's `path`
@@ -2040,7 +2169,7 @@ so one done with no daemon running isn't written down.
 about, and what it says. It's live: while it's open, new events come in on top, and the bar stays on the line
 it was on. Type to filter the lines by anything in them (`fixer`, `task.closed`, `failed`, a branch), and
 `Tab` and `Shift+Tab` narrow them to one kind: sessions and worktrees, tasks with their runs, handoff notes
-and the backlog, flows, memory, or the others. `↑` and `↓` move; the line the bar is on is read whole under
+and the backlog, flows, memory, the tabs, panes and focus of the layout, or the others. `↑` and `↓` move; the line the bar is on is read whole under
 the list, with everything its event carries, and `PgUp` and `PgDn` scroll it. `Enter` goes to the session the
 line is about, whatever it's called now (for a flow run, its latest step's); `Esc` clears the filter, then
 closes. The timeline reads the log a page at a time, and further back as the bar reaches the end.
@@ -2174,7 +2303,7 @@ crystal tasks terminal docs                                          # carry on 
 - Every Claude Code session crystal starts, a task or in a terminal, may run the crystal commands it's told
   to without asking, so one driving others doesn't stop at every step:
   - starting and driving sessions: `ls`, `new`, `send`, `wait`, `read`, `result`, `interrupt`, `events`,
-    `rename`, `report`, `notify`, `layout` and `layout export`, `pane split` and `pane close`
+    `rename`, `report`, `notify`, `layout` and `layout export`, `pane split` and `pane close`, and `open`
   - with tasks on, `done`, `task`, and `tasks` with `show`, `log`, `new` and `start`; with flows on, `flow`
     with `run`, `wait`, `show`, `defs` and `retry`
   - with the backlog on, reading it and `add`, `list`, `show`, `edit`, `export`, `done`, `reopen` and
@@ -2434,6 +2563,7 @@ crystal tasks new --issue 7                         # to fix issue 7
 crystal tasks new --no-launch "Tidy the README"     # made now, started later: prints t13
 crystal tasks start t13                             # start it; prints its session's name
 crystal tasks show t12                              # how it stands, its session, what it asks for and costs
+crystal wait t12                                    # until it closes; prints done, failed or cancelled
 crystal tasks cancel t12                            # cancel it, and stop its session
 crystal tasks log t12                               # how it stands, then its session's transcript
 crystal tasks terminal t12                          # a background task, opened in a terminal
@@ -2988,6 +3118,17 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `plugin.paused` | a plugin is paused for failing |
 | `daemon.handed_over` | the daemon is handed over to another crystal, its sessions carrying on (see `restart-server`) |
 | `daemon.restarted` | the daemon, restarted cold, has started the sessions that were running again: its `daemon` says how many came back (`sessions`) and which couldn't (`failed`) |
+| `tab.created` | a TUI makes a tab: `t`, `crystal tab new`, a layout put back |
+| `tab.closed` | a TUI closes one; its `tab` is as it was |
+| `tab.renamed` | a tab is named, or its name taken back: its `from` is the name it had, empty for none |
+| `tab.moved` | a tab moves to another place among the tabs: its `from` is the number it had |
+| `tab.focused` | another tab comes to the front: its `from` is the number of the one in front before |
+| `pane.focused` | the selection settles on another session, the one you're on, in the sidebar or a pane: its `session`, the `tab` it's in, and the session you were on as `from` |
+| `pane.moved` | a session moves to another tab: its `from` is the number of the tab it left |
+| `layout.updated` | a tab's panes change: split, closed, resized, swapped, zoomed, floated or evened out; its `tab` has them |
+| `project.added` | a project goes on crystal's list: `crystal project add`, or a session starting in it |
+| `project.removed` | a project is taken off it |
+| `project.focused` | the selection settles on a session in another project: its `from` is the project you were in |
 
 A hook gets the event as a line of JSON on its standard input, the same as the [event log](#events) keeps it,
 and its name in `CRYSTAL_EVENT`:
@@ -2999,7 +3140,11 @@ and its name in `CRYSTAL_EVENT`:
 ```
 
 `task.closed` has a `task`, with its `goal`, `session`, `project`, `branch` and `outcome` (whether it `failed`,
-its `summary`, and when it `closed`). The worktree events have a `worktree`, with its `path`, `branch` and
+its `summary`, and when it `closed`). The tab and pane events have a `tab`, the tab as `crystal layout --json`
+has it: its `number`, `name`, the `sessions` in it, the one `selected`, and its `panes`. A TUI tells what
+changed in its tabs and panes once they've held still for a moment, so `j` held down through the sidebar, or a
+border dragged across the screen, is one event, about where it ended; with no TUI open, the daemon tells what
+a [layout command](#tabs) changed, but for the session you're on, as you aren't on one. The worktree events have a `worktree`, with its `path`, `branch` and
 `project`, and for `worktree.hook_failed`, `why`. `session.message` has a `message`, with its first `line` and,
 when another session sent it, that session's name (`from`) and id (`from_id`). The rest are under
 [events](#events).
@@ -3062,6 +3207,7 @@ that makes no sense is said there too, and the settings stay as they were until 
 | `theme` | `"dark"` | the TUI's colors: one of the [themes](#themes) |
 | `[colors]` | | colors of your own over the theme's: [themes](#themes) |
 | `name_from_prompt` | `true` | name a session you don't name for the [first thing it's asked](#starting-a-session) |
+| `name_by_agent` | `true` | have Claude Code name a session you don't name in [a few words of its own](#starting-a-session), as it's sent its first prompt |
 | `resume_reported_agents` | `true` | after a restart, run the command an agent [said resumes it](#teaching-crystal-about-your-agent), or the one that resumes an agent [typed into a shell](#usage) whose hooks named its conversation |
 | `confirm_quit` | `true` | `q` asks before it quits the TUI, since a key meant for an agent can land on the sidebar; the sessions keep running either way |
 | `show_keys` | `false` | show each key that runs a command at the right of the footer, with the command, for a few seconds: for whoever watches your screen shared or recorded |
@@ -3103,7 +3249,8 @@ does something a plugin adds, `[memory]` each time a task closes or a search run
 background task's run starts, `[handoff]` each time a note is written, `[sessions]` every 15 seconds and as it
 starts sessions again (`restore_screens` every second), a flow
 each time one starts, `[[project]]` each time a project's commands run,
-`name_from_prompt` each time it names a session, `resume_reported_agents` as it starts sessions again,
+`name_from_prompt` and `name_by_agent` each time they name a session, `resume_reported_agents` as it starts
+sessions again,
 `[clipboard]` each time a program copies out of sight,
 `scrollback_lines` as each session starts and every 15 seconds for the sessions running, and `mermaid_ascii` as
 each session starts and each background task's run does, so a change counts straight away (but for

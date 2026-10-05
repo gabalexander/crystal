@@ -7,7 +7,8 @@
 //! has gone on needing them for `[notifications] after_secs`; and with
 //! `unfocused_only`, only while no crystal TUI's terminal has the focus. A
 //! session shown in a TUI whose terminal has lost the focus isn't being
-//! watched. `crystal notify` tells the user something of its own.
+//! watched. `crystal notify` tells the user something of its own, under
+//! a title of its own if it likes, with either sound or none.
 //!
 //! A desktop notification does the telling: on macOS `terminal-notifier`
 //! when it's installed, which a click on takes the user to the session, or
@@ -18,6 +19,8 @@
 //!
 //! - `CRYSTAL_NOTICE`: the line a notification would show, like
 //!   "claude-2 is waiting on you · app fix/login"
+//! - `CRYSTAL_NOTICE_TITLE`: its title: `crystal`, or the one `crystal
+//!   notify` gave it
 //! - `CRYSTAL_NOTICE_SESSION`: the session's name
 //! - `CRYSTAL_NOTICE_ACTIVITY`: `waiting` or `done`
 //! - `CRYSTAL_NOTICE_JUMP`: a shell command that takes the user to the
@@ -25,12 +28,13 @@
 //!
 //! A sound plays at the same moments, unless `[sound]` says not to: see
 //! [`crate::sound`]. It goes with the notifications plugin, but not with
-//! `notify`, so the one can be on without the other.
+//! `notify`, so the one can be on without the other. `crystal notify` plays
+//! the one for an agent asking, unless it says which, or none.
 
 use crate::agents;
 use crate::config::Config;
 use crate::printable;
-use crate::protocol::{Activity, Front, SessionInfo};
+use crate::protocol::{Activity, Front, NotifySound, SessionInfo};
 use crate::sound::{self, Sound};
 use crate::tui::status_bar;
 use anyhow::{Result, bail};
@@ -59,6 +63,9 @@ pub struct Notice {
     pub session: String,
     /// What the session's agent is doing: waiting or done.
     pub activity: Activity,
+    /// What a notification is titled: crystal's name, unless it's given
+    /// another.
+    pub title: Option<String>,
     /// The line a notification shows.
     pub text: String,
     /// The session a click on it takes the user to, if any.
@@ -66,6 +73,8 @@ pub struct Notice {
     /// The program of the session's agent, like `claude`, for the sounds
     /// switched off for some agents.
     pub agent: Option<String>,
+    /// The sound that plays with it, if any.
+    pub sound: Option<Sound>,
 }
 
 impl Notice {
@@ -89,12 +98,69 @@ impl Notice {
         Notice {
             session: session.name.clone(),
             activity,
+            title: None,
             // A notification shows it, and the user's own command may
             // print it to a terminal.
             text: printable::line(&text).into_owned(),
             jump: Some(session.name.clone()),
             agent: agent_of(session),
+            sound: Some(Sound::of(activity)),
         }
+    }
+
+    /// `text`, said by crystal itself, as waiting on the user: about the
+    /// session called `session` when it's about one, which a click on it
+    /// takes them to.
+    pub fn of_crystal(text: String, session: Option<String>) -> Notice {
+        Notice {
+            session: session.clone().unwrap_or_default(),
+            activity: Activity::Waiting,
+            title: None,
+            text,
+            jump: session,
+            agent: None,
+            sound: Some(Sound::Request),
+        }
+    }
+
+    /// What `crystal notify` was asked to tell the user: `text` under
+    /// `title`, about the session called `session` when it's about one,
+    /// with `sound`. With no text, the title is what it says, under
+    /// crystal's name; with neither, there's nothing to tell. Each is made
+    /// one line fit for a notification.
+    pub fn told(
+        title: Option<&str>,
+        text: &str,
+        session: Option<String>,
+        sound: NotifySound,
+    ) -> Option<Notice> {
+        let tidy = |text: &str| printable::line(text.trim()).trim().to_string();
+        let title = title.map(tidy).filter(|title| !title.is_empty());
+        let text = tidy(text);
+        let (title, text) = match (title, text.is_empty()) {
+            (None, true) => return None,
+            (Some(title), true) => (None, title),
+            (title, false) => (title, text),
+        };
+        let text = match &session {
+            Some(session) => format!("{session}: {text}"),
+            None => text,
+        };
+        let sound = match sound {
+            NotifySound::None => None,
+            NotifySound::Done => Some(Sound::Done),
+            NotifySound::Request => Some(Sound::Request),
+        };
+        Some(Notice {
+            title,
+            sound,
+            ..Notice::of_crystal(text, session)
+        })
+    }
+
+    /// What it's titled.
+    fn title(&self) -> &str {
+        self.title.as_deref().unwrap_or("crystal")
     }
 }
 
@@ -250,8 +316,10 @@ pub fn may_tell(config: &Config, presence: Presence) -> bool {
 /// a notification, by the notification settings.
 fn tell_now(notice: &Notice, socket: &Path) -> Result<()> {
     let config = settings();
-    if sound::wanted(&config, notice.agent.as_deref()) {
-        sound::play(Sound::of(notice.activity), &config.sound);
+    if let Some(sound) = notice.sound
+        && sound::wanted(&config, notice.agent.as_deref())
+    {
+        sound::play(sound, &config.sound);
     }
     if !may_tell(&config, presence()) {
         return Ok(());
@@ -304,6 +372,7 @@ fn user_command(command: &str, notice: &Notice, jump: Option<&[String]>) -> Comm
     user.arg("-c")
         .arg(command)
         .env("CRYSTAL_NOTICE", &notice.text)
+        .env("CRYSTAL_NOTICE_TITLE", notice.title())
         .env("CRYSTAL_NOTICE_SESSION", &notice.session)
         .env("CRYSTAL_NOTICE_ACTIVITY", notice.activity.to_string());
     match jump {
@@ -327,7 +396,7 @@ fn desktop_command(notice: &Notice, jump: Option<&[String]>) -> Option<Desktop> 
     if cfg!(target_os = "macos") && on_path("terminal-notifier") {
         let mut notifier = Command::new("terminal-notifier");
         notifier
-            .args(["-title", "crystal", "-message"])
+            .args(["-title", notice.title(), "-message"])
             .arg(&notice.text)
             // A newer notice about the session takes the place of the last.
             .args(["-group", &format!("crystal-{}", notice.session)]);
@@ -336,17 +405,18 @@ fn desktop_command(notice: &Notice, jump: Option<&[String]>) -> Option<Desktop> 
         }
         Some(Desktop::Shown(notifier))
     } else if cfg!(target_os = "macos") {
-        // The text goes in as an argument, so nothing in it needs escaping
-        // the way it would inside the script.
+        // The text and the title go in as arguments, so nothing in them
+        // needs escaping the way it would inside the script.
         let mut osascript = Command::new("osascript");
         osascript
             .args(["-e", "on run argv"])
             .args([
                 "-e",
-                "display notification (item 1 of argv) with title \"crystal\"",
+                "display notification (item 1 of argv) with title (item 2 of argv)",
             ])
             .args(["-e", "end run"])
-            .arg(&notice.text);
+            .arg(&notice.text)
+            .arg(notice.title());
         Some(Desktop::Shown(osascript))
     } else if on_path("notify-send") {
         let mut notify_send = Command::new("notify-send");
@@ -362,7 +432,8 @@ fn desktop_command(notice: &Notice, jump: Option<&[String]>) -> Option<Desktop> 
         } else {
             notice.text.clone()
         };
-        notify_send.arg("crystal").arg(body);
+        // The summary is never read as markup.
+        notify_send.arg(notice.title()).arg(body);
         Some(if clickable {
             Desktop::Clickable(notify_send)
         } else {
@@ -673,6 +744,55 @@ mod tests {
 
         let notice = Notice::about(&session(None), Done);
         assert_eq!(notice.text, "claude-2 is done");
+    }
+
+    #[test]
+    fn a_notice_of_the_user_s_own_has_its_title_and_sound() {
+        let notice = Notice::told(Some("Deploy"), "it's out", None, NotifySound::Done).unwrap();
+        assert_eq!(
+            (notice.title(), notice.text.as_str()),
+            ("Deploy", "it's out")
+        );
+        assert_eq!(notice.sound, Some(Sound::Done));
+        assert_eq!(notice.jump, None);
+        // About a session, a click goes there, and the text says which.
+        let notice = Notice::told(None, "ready", Some("api".into()), NotifySound::None).unwrap();
+        assert_eq!(
+            (notice.title(), notice.text.as_str()),
+            ("crystal", "api: ready")
+        );
+        assert_eq!(notice.jump.as_deref(), Some("api"));
+        assert_eq!(notice.sound, None);
+        // A title alone is what it says, under crystal's name.
+        let notice = Notice::told(Some(" build failed "), "", None, NotifySound::Request).unwrap();
+        assert_eq!(
+            (notice.title(), notice.text.as_str()),
+            ("crystal", "build failed")
+        );
+        // With neither, there's nothing to tell.
+        assert_eq!(
+            Notice::told(Some(" \n "), "\x07", None, NotifySound::None),
+            None
+        );
+        // Each is one line, with nothing a terminal would take as an order.
+        let notice =
+            Notice::told(Some("a\x1b]0;x\x07\nb"), "c\nd", None, NotifySound::None).unwrap();
+        assert_eq!((notice.title(), notice.text.as_str()), ("a]0;x b", "c d"));
+    }
+
+    #[test]
+    fn a_notification_is_titled_as_its_notice_says() {
+        let notice = Notice::told(Some("Deploy"), "it's out", None, NotifySound::None).unwrap();
+        let command = match desktop_command(&notice, None) {
+            Some(Desktop::Shown(command) | Desktop::Clickable(command)) => command,
+            None => return,
+        };
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&"Deploy".to_string()), "{args:?}");
+        assert!(!args.contains(&"crystal".to_string()), "{args:?}");
     }
 
     #[test]

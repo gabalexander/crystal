@@ -62,17 +62,20 @@ pub enum Kinds {
     Tasks,
     Flows,
     Memory,
+    /// The tabs, panes and focus of the TUIs.
+    Layout,
     /// Every family the others don't take, new ones included.
     Other,
 }
 
 impl Kinds {
-    const ALL: [Kinds; 6] = [
+    const ALL: [Kinds; 7] = [
         Kinds::All,
         Kinds::Sessions,
         Kinds::Tasks,
         Kinds::Flows,
         Kinds::Memory,
+        Kinds::Layout,
         Kinds::Other,
     ];
 
@@ -83,6 +86,7 @@ impl Kinds {
             Kinds::Tasks => "tasks",
             Kinds::Flows => "flows",
             Kinds::Memory => "memory",
+            Kinds::Layout => "layout",
             Kinds::Other => "other",
         }
     }
@@ -93,6 +97,7 @@ impl Kinds {
             Kinds::Tasks => &["task", "run", "handoff", "backlog"],
             Kinds::Flows => &["flow"],
             Kinds::Memory => &["memory"],
+            Kinds::Layout => &["tab", "pane", "layout"],
             Kinds::All | Kinds::Other => &[],
         }
     }
@@ -671,6 +676,7 @@ mod tests {
     #[test]
     fn tab_narrows_to_a_kind_and_the_rest_takes_kinds_nobody_names() {
         let mut view = read(&[
+            (5, Kind::PaneFocused),
             (4, Kind::PluginPaused),
             (3, Kind::MemoryAdded),
             (2, Kind::RunAsking),
@@ -684,6 +690,9 @@ mod tests {
         press(&mut view, KeyCode::BackTab);
         press(&mut view, KeyCode::BackTab);
         assert_eq!((view.kinds, seqs(&view)), (Kinds::Other, vec![4]));
+        press(&mut view, KeyCode::BackTab);
+        assert_eq!((view.kinds, seqs(&view)), (Kinds::Layout, vec![5]));
+        press(&mut view, KeyCode::Tab);
         press(&mut view, KeyCode::Tab);
         assert_eq!(view.kinds, Kinds::All);
     }

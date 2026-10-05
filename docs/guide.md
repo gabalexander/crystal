@@ -78,6 +78,7 @@ An agent in a session runs these; you can too.
 | `crystal backlog add` | `crystal backlog add "flaky test in auth::refresh"` |
 | `crystal remember` | `crystal remember -k command "run the tests with --test-threads=4"` |
 | `crystal handoff` | `crystal handoff "the schema change is half done; see migrations/003"` |
+| `crystal open` | `crystal open docs/explain-hooks.md`, when you ask to see it |
 
 ## Where things live
 

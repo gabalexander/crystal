@@ -29,6 +29,7 @@ mod help;
 mod issues;
 pub(crate) mod keymap;
 pub(crate) mod launcher;
+pub(crate) mod layout_events;
 mod layout_link;
 pub(crate) mod layouts;
 mod listing;
@@ -36,10 +37,11 @@ mod memory_view;
 mod menu;
 pub(crate) mod mouse;
 mod needs_you;
+mod opened_view;
 pub(crate) mod page;
 pub(crate) mod pane;
 mod plugins_view;
-mod preview;
+pub(crate) mod preview;
 mod profiles;
 mod pull_requests;
 mod ram_view;
@@ -159,6 +161,13 @@ const RESOURCES_OPEN_EVERY: Duration = Duration::from_secs(1);
 /// How often the thread following the event log for the timeline looks up
 /// from waiting, to see whether the timeline is still open.
 const FOLLOW_CHECK: Duration = Duration::from_millis(250);
+
+/// How often the terminal is asked again for the mouse, pastes marked,
+/// focus and the keys told apart: a terminal can forget them, as iTerm2's
+/// Session ▸ Reset does, and a mouse it has forgotten can't say so. Asking
+/// again takes a few dozen bytes, so this is how long a dead mouse may stay
+/// dead.
+const ASK_MODES_EVERY: Duration = Duration::from_secs(2);
 
 pub enum Event {
     Key(KeyEvent),
@@ -466,6 +475,11 @@ pub fn run(socket: &Path) -> Result<()> {
         link_clicked: false,
         clicks: pane::Clicks::default(),
         edge: None,
+        button_held: false,
+        modes_due: Instant::now() + ASK_MODES_EVERY,
+        layout_told: layout_events::Look::default(),
+        layout_seen: layout_events::Look::default(),
+        layout_changed: None,
         kept_tabs: tabs::Tabs::default(),
         kept_sidebar: app::Shape::default(),
         kept_folded: BTreeSet::new(),
@@ -562,6 +576,31 @@ impl TerminalModes {
     }
 }
 
+/// What asks the terminal for the modes [`TerminalModes`] turned on again,
+/// the mouse only when `mouse`: each is a mode turned on, which a terminal
+/// that has it already takes as nothing. The Kitty keyboard flags are set
+/// in place (`CSI = 5 ; 1 u`), never pushed again, which would leave an
+/// entry on the terminal's stack past the one pop as the TUI ends, and the
+/// user's shell taking keys the Kitty way. The terminal's title isn't saved
+/// again, nor the alternate screen gone to: see [`after_resize`].
+fn modes_again(mouse: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    if mouse {
+        out.extend_from_slice(MOUSE_ON);
+    }
+    out.extend_from_slice(b"\x1b[?2004h\x1b[=5;1u\x1b[?1004h");
+    out
+}
+
+/// What a resize writes, before the TUI is drawn whole at its new size:
+/// the alternate screen gone to again, for a terminal that has left it as
+/// it forgot the modes, then the modes. It's 1047, not 1049, which would
+/// save the cursor again, for the end to put the user's shell's cursor
+/// where the TUI's was.
+fn after_resize(mouse: bool) -> Vec<u8> {
+    [b"\x1b[?1047h".as_slice(), &modes_again(mouse)].concat()
+}
+
 impl Drop for TerminalModes {
     fn drop(&mut self) {
         modes_off();
@@ -588,6 +627,13 @@ fn capture_mouse(on: bool) {
     let mut out = std::io::stdout();
     let _ = out.write_all(if on { MOUSE_ON } else { MOUSE_OFF });
     let _ = out.flush();
+}
+
+/// What the event loop woke for: an event, or a time it waited for, which
+/// it draws again for, or not, as asking the terminal for its modes again.
+enum Woke {
+    Event(Box<Event>),
+    Time { draw: bool },
 }
 
 /// A drag selecting in the pane at `slot`, held `past` rows beyond the top
@@ -684,6 +730,19 @@ struct Tui {
     /// A drag selecting in a pane, held past the top or bottom of its
     /// screen, which scrolls its history on until it comes back or lets go.
     edge: Option<Edge>,
+    /// A mouse button is down: the terminal isn't asked for its modes again
+    /// meanwhile, as one that takes that for a new start lets go of it, and
+    /// a drag stops halfway.
+    button_held: bool,
+    /// When to ask the terminal for its modes again: see [`ASK_MODES_EVERY`].
+    modes_due: Instant,
+    /// The tabs and the user's focus as the daemon was last told them,
+    /// and as they were last looked at: see [`layout_events`].
+    layout_told: layout_events::Look,
+    layout_seen: layout_events::Look,
+    /// When the tabs or the focus last changed, while that's still to be
+    /// told: once they've held still for [`layout_events::SETTLE`].
+    layout_changed: Option<Instant>,
     quitting: bool,
     /// The number the timeline follows the event log under, which goes up
     /// each time it starts or stops following: a thread following under an
@@ -717,6 +776,9 @@ impl Tui {
 
     fn run(&mut self, terminal: &mut DefaultTerminal, events: Receiver<Event>) -> Result<()> {
         let mut changed = true;
+        // What the layout comes to as the TUI opens is nothing new.
+        self.layout_told = self.app.look();
+        self.layout_seen = self.layout_told.clone();
         self.wake_landed();
         while !self.quitting {
             if changed {
@@ -726,8 +788,8 @@ impl Tui {
             // Wait for something to happen, then take whatever else has
             // happened meanwhile, so a burst of output is drawn once.
             changed = match self.next_event(&events)? {
-                Some(event) => self.take(event),
-                None => true,
+                Woke::Event(event) => self.take(*event),
+                Woke::Time { draw } => draw,
             };
             while let Ok(event) = events.try_recv() {
                 changed |= self.take(event);
@@ -735,7 +797,9 @@ impl Tui {
             changed |= self.scroll_at_edge();
             self.read_topic();
             self.keep_tabs();
+            self.tell_layout();
             self.count_worktrees();
+            self.ask_modes_when_due();
             changed |= self.wake_landed();
             self.keep_warm();
         }
@@ -877,6 +941,14 @@ impl Tui {
     /// Takes in `event`, and says whether that may have changed what's
     /// drawn: the mouse just moving mostly doesn't.
     fn take(&mut self, event: Event) -> bool {
+        if let Event::Mouse(mouse) = &event {
+            // A move with no button down says any held has let go, a
+            // release the terminal never sent included.
+            self.button_held = matches!(
+                mouse.kind,
+                MouseEventKind::Down(_) | MouseEventKind::Drag(_)
+            );
+        }
         if let Event::Mouse(mouse) = &event
             && mouse.kind == MouseEventKind::Moved
         {
@@ -1213,33 +1285,77 @@ impl Tui {
     /// The next event. While an agent works, the wait is cut short in time
     /// to turn its mark, while a drag is held past the edge of a pane, to
     /// scroll it again, and while a key shows at the footer, to take it off,
-    /// and there's no event: only a frame to draw.
-    fn next_event(&self, events: &Receiver<Event>) -> Result<Option<Event>> {
+    /// and there's no event: only a frame to draw. It's cut short too to
+    /// ask the terminal for its modes again, and to tell what changed in
+    /// the layout once it has held still, which draw nothing.
+    fn next_event(&self, events: &Receiver<Event>) -> Result<Woke> {
+        let now = Instant::now();
         let spin = self.app.anything_working().then_some(SPIN_EVERY);
         let edge = self
             .edge
-            .map(|edge| edge.next.saturating_duration_since(Instant::now()));
+            .map(|edge| edge.next.saturating_duration_since(now));
         // A key shown at the footer goes when its time is up.
         let shown_key = self
             .app
             .shown_key_goes()
-            .map(|goes| goes.saturating_duration_since(Instant::now()));
+            .map(|goes| goes.saturating_duration_since(now));
+        let draw = spin.into_iter().chain(edge).chain(shown_key).min();
+        // The times that draw nothing.
+        let modes = (!self.button_held).then(|| self.modes_due.saturating_duration_since(now));
+        let layout = self
+            .layout_changed
+            .map(|changed| (changed + layout_events::SETTLE).saturating_duration_since(now));
         // A session crystal stopped idle starts again once the selection
-        // has rested on it.
-        let wake = (self.app.wake_due()).map(|due| due.saturating_duration_since(Instant::now()));
-        // The agent kept warm is asked for once where it would be has held.
-        let warm = (self.warming.due()).map(|due| due.saturating_duration_since(Instant::now()));
-        let waits = (spin.into_iter().chain(edge).chain(shown_key))
-            .chain(wake)
-            .chain(warm);
-        let Some(wait) = waits.min() else {
-            return Ok(Some(events.recv()?));
+        // has rested on it, and the agent kept warm is asked for once where
+        // it would be has held: what they change is drawn as they do.
+        let wake = (self.app.wake_due()).map(|due| due.saturating_duration_since(now));
+        let warm = (self.warming.due()).map(|due| due.saturating_duration_since(now));
+        let quiet = modes.into_iter().chain(layout).chain(wake).chain(warm);
+        let Some(wait) = draw.into_iter().chain(quiet).min() else {
+            return Ok(Woke::Event(Box::new(events.recv()?)));
         };
         match events.recv_timeout(wait) {
-            Ok(event) => Ok(Some(event)),
-            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Ok(event) => Ok(Woke::Event(Box::new(event))),
+            Err(RecvTimeoutError::Timeout) => Ok(Woke::Time {
+                draw: draw.is_some_and(|draw| draw <= wait),
+            }),
             Err(RecvTimeoutError::Disconnected) => bail!("the TUI's events stopped"),
         }
+    }
+
+    /// Tells the daemon what changed in the tabs and panes, and where the
+    /// user is, once they've held still for [`layout_events::SETTLE`].
+    fn tell_layout(&mut self) {
+        let look = self.app.look();
+        let now = Instant::now();
+        if look != self.layout_seen {
+            self.layout_seen = look;
+            self.layout_changed = Some(now);
+        }
+        let Some(changed) = self.layout_changed else {
+            return;
+        };
+        if now < changed + layout_events::SETTLE {
+            return;
+        }
+        self.layout_changed = None;
+        let seen = self.layout_seen.clone();
+        let (events, told) = layout_events::told(&self.layout_told, seen, self.app.sessions());
+        self.layout_told = told;
+        if !events.is_empty() {
+            self.layout.tell(events);
+        }
+    }
+
+    /// Asks the terminal for its modes again once it's time, unless a
+    /// mouse button is down: see [`ASK_MODES_EVERY`].
+    fn ask_modes_when_due(&mut self) {
+        let now = Instant::now();
+        if self.button_held || now < self.modes_due {
+            return;
+        }
+        self.write_out(&modes_again(self.config.mouse.capture));
+        self.modes_due = now + ASK_MODES_EVERY;
     }
 
     fn handle(&mut self, event: Event) {
@@ -1265,7 +1381,13 @@ impl Tui {
                 self.layout.answer(relayed.id, answer);
             }
             Event::CodexModels(models) => self.app.set_codex_models(models),
-            Event::Resize => {}
+            // A terminal that forgot the modes may have left the
+            // alternate screen too: a resize, which draws everything again,
+            // is the moment to go back to it.
+            Event::Resize => {
+                self.write_out(&after_resize(self.config.mouse.capture));
+                self.modes_due = Instant::now() + ASK_MODES_EVERY;
+            }
             // A list asked for before the one the TUI has may lack a session
             // started since, which would leave the sidebar as it came.
             Event::Sessions { asked, .. } if asked < self.sessions_asked => {}
@@ -1776,6 +1898,11 @@ impl Tui {
                 purpose,
             } => {
                 let cwd = self.start_dir(place)?;
+                // The TUI follows a session's renames: its agent may name it.
+                let purpose = client::Purpose {
+                    agent_names: true,
+                    ..purpose
+                };
                 let name = client::new_session_for(&self.socket, None, cwd, command, purpose)?.name;
                 // It may have taken the agent kept warm over.
                 self.warming.taken();
@@ -1835,6 +1962,8 @@ impl Tui {
                 drive::interrupt(&self.socket, &name)?;
                 self.refresh_sessions()?;
             }
+            // The pane comes to it with the output it shows.
+            Action::ClearPane(name) => drive::clear(&self.socket, Some(name))?,
             Action::Reply { name, text } => {
                 // Typing into a terminal takes a moment, off the loop. From
                 // the user, it goes as typed: no session is said to send it,
@@ -2802,6 +2931,7 @@ impl Tui {
             task: None,
             backlog: None,
             brief: Default::default(),
+            agent_names: false,
         });
         let Some(Response::Created { name, .. }) = client::ask(&self.socket, &request, true)?
         else {
@@ -2913,6 +3043,7 @@ impl Tui {
             task: None,
             backlog: None,
             brief: Default::default(),
+            agent_names: false,
         });
         let Some(Response::Created { name, .. }) = client::ask(&self.socket, &request, true)?
         else {
@@ -4002,6 +4133,27 @@ mod tests {
             at(&["code", "--wait"], Some(12)),
             ["code", "--wait", "--goto", "src/a.rs:12"]
         );
+    }
+
+    #[test]
+    fn the_terminal_is_asked_for_every_mode_again_and_the_kitty_flags_set_in_place() {
+        let again = String::from_utf8(modes_again(true)).unwrap();
+        for mode in ["?1000h", "?1002h", "?1003h", "?1006h", "?2004h", "?1004h"] {
+            assert!(again.contains(mode), "{mode} isn't in {again:?}");
+        }
+        assert!(again.contains("\x1b[=5;1u"), "{again:?}");
+        // A push would leave the user's shell with the flags after the one
+        // pop as the TUI ends.
+        assert!(!again.contains("\x1b[>"), "{again:?}");
+        // Going to the alternate screen again waits for a resize, which
+        // draws everything again.
+        assert!(!again.contains("?1047h") && !again.contains("?1049h"));
+        assert!(!again.contains("\x1b[22;"), "the title isn't saved again");
+        let kept = String::from_utf8(modes_again(false)).unwrap();
+        assert!(!kept.contains("?1000h"), "the mouse left to the terminal");
+        let resized = String::from_utf8(after_resize(true)).unwrap();
+        assert!(resized.starts_with("\x1b[?1047h"), "{resized:?}");
+        assert!(resized.ends_with(&again));
     }
 
     #[test]

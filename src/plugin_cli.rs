@@ -415,6 +415,7 @@ pub fn open_pane(
         task: None,
         backlog: None,
         brief: Default::default(),
+        agent_names: false,
     });
     let Some(Response::Created { name, .. }) = client::ask(socket, &request, true)? else {
         bail!("the daemon didn't start {}'s pane", plugin.label());

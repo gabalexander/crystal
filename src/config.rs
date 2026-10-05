@@ -34,6 +34,10 @@ pub struct Config {
     /// Name a session crystal would name after its program from the first
     /// thing it's asked instead: see [`crate::names::from_prompt`].
     pub name_from_prompt: bool,
+    /// Have Claude Code name a session crystal would name itself, in a few
+    /// words of its own, as it's sent its first prompt: see
+    /// [`crate::names::ASK_AGENT`].
+    pub name_by_agent: bool,
     /// After a restart, start an agent that said how to resume it, with
     /// `crystal report`, with that command: see [`crate::report`]. And one
     /// typed into a shell, whose installed hooks named its conversation,
@@ -972,6 +976,7 @@ impl Default for Config {
             notify_command: None,
             new_session: "claude".to_string(),
             name_from_prompt: true,
+            name_by_agent: true,
             resume_reported_agents: true,
             confirm_quit: true,
             theme: ThemeName::DARK,
@@ -2111,6 +2116,7 @@ back_to = "build"
             notify_command: Some("say \"$CRYSTAL_NOTICE\"".into()),
             new_session: "codex --model o3".into(),
             name_from_prompt: false,
+            name_by_agent: false,
             resume_reported_agents: false,
             confirm_quit: false,
             theme: ThemeName::find("nord").unwrap(),

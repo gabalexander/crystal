@@ -1,13 +1,13 @@
 //! The TUI's end of `crystal tab` and `crystal pane`: a connection to the
 //! daemon that brings in the layout orders the TUI is given, and takes back
 //! its answers and, whenever the user does something in it, that it was
-//! used, so orders go to the TUI used last, and when its terminal gains and
-//! loses the focus. A handover or a restart cuts it, and the TUI offers
+//! used, so orders go to the TUI used last, when its terminal gains and
+//! loses the focus, and what changed in its tabs and panes, as events. A handover or a restart cuts it, and the TUI offers
 //! again at once, saying when it was last used, and whether its terminal
 //! has the focus. See [`crate::layout_relay`].
 
 use super::Event;
-use crate::events::now_ms;
+use crate::events::{self, now_ms};
 use crate::layout::{Layout, Relayed, Report};
 use crate::protocol::{self, Request, Response};
 use anyhow::{Result, bail};
@@ -64,6 +64,12 @@ impl Link {
     pub fn focus(&self, focused: bool) {
         *self.focused.lock().unwrap() = Some(focused);
         self.report(&Report::Focus { focused });
+    }
+
+    /// Tells the daemon what changed in the tabs and panes, as `events`,
+    /// for its event log and whoever listens.
+    pub fn tell(&self, events: Vec<events::Event>) {
+        self.report(&Report::Events { events });
     }
 
     /// Answers order `id` with the layout it came to, or why it couldn't

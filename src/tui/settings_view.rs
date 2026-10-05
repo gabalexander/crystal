@@ -83,6 +83,7 @@ pub enum Setting {
     MermaidAscii,
     NewSession,
     NameFromPrompt,
+    NameByAgent,
     StopIdle,
     StopIdleTerminals,
     WarmAgent,
@@ -142,6 +143,7 @@ impl Setting {
             Setting::MermaidAscii => &["mermaid_ascii"],
             Setting::NewSession => &["new_session"],
             Setting::NameFromPrompt => &["name_from_prompt"],
+            Setting::NameByAgent => &["name_by_agent"],
             Setting::StopIdle => &["sessions", "stop_idle_after"],
             Setting::StopIdleTerminals => &["sessions", "stop_idle_terminals"],
             Setting::WarmAgent => &["sessions", "warm_agent"],
@@ -201,6 +203,7 @@ impl Setting {
             Setting::MermaidAscii => "diagrams in ASCII",
             Setting::NewSession => "new session runs",
             Setting::NameFromPrompt => "name from the prompt",
+            Setting::NameByAgent => "named by Claude",
             Setting::StopIdle => "stop idle agents",
             Setting::StopIdleTerminals => "  terminals too",
             Setting::WarmAgent => "keep one warm",
@@ -497,6 +500,7 @@ const TABS: [Tab; 8] = [
                 &[
                     S::NewSession,
                     S::NameFromPrompt,
+                    S::NameByAgent,
                     S::StopIdle,
                     S::StopIdleTerminals,
                     S::WarmAgent,
@@ -1138,6 +1142,7 @@ impl SettingsView {
             S::ShowKeys => on(!config.show_keys),
             S::MermaidAscii => on(!config.mermaid_ascii),
             S::NameFromPrompt => on(!config.name_from_prompt),
+            S::NameByAgent => on(!config.name_by_agent),
             S::StopIdle => {
                 let now = &config.sessions.stop_idle_after;
                 Change::set(setting, next_named(&SessionSettings::CHOICES, now, forward))
@@ -1840,6 +1845,10 @@ fn shown(setting: Setting, config: &Config) -> Shown {
             config.name_from_prompt,
             "a session you didn't name, for what it's asked",
         ),
+        S::NameByAgent => switch(
+            config.name_by_agent,
+            "then Claude Code names it in a few words of its own",
+        ),
         S::StopIdle => {
             let limit = config.sessions.idle_limit();
             Shown {
@@ -2419,6 +2428,7 @@ mod tests {
             (S::ShowKeys, true),
             (S::MermaidAscii, true),
             (S::NameFromPrompt, false),
+            (S::NameByAgent, false),
             (S::ResumeReported, false),
             (S::StopIdleTerminals, true),
             (S::WarmAgent, true),
@@ -2612,7 +2622,7 @@ mod tests {
             }
         }
         let settings: usize = (0..KEYS_TAB).map(|tab| rows(tab, &[]).len()).sum();
-        assert_eq!(settings, 53);
+        assert_eq!(settings, 54);
     }
 
     /// Writes `change` to a config file made of `text`, and reads it back.
