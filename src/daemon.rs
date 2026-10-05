@@ -3622,6 +3622,7 @@ fn distill_about(report: &Result<distill::Report>) -> DistillAbout {
             again: report.again.len(),
             made_lessons: report.made_lessons.len(),
             rejected: report.rejected.len(),
+            rechecked: report.kept.len() + report.reworded.len() + report.forgot.len(),
             cost_usd: report.cost_usd,
             failed: None,
         },
@@ -3633,8 +3634,13 @@ fn distill_about(report: &Result<distill::Report>) -> DistillAbout {
 }
 
 /// Tells of the entries the distiller added to the memory of `job`'s
-/// project, and the notes it made lessons, as `report` says.
+/// project, and the notes it made lessons, by their ids, and of the stale
+/// ones it forgot.
 fn tell_distilled(events: &Bus, job: &Job, report: &distill::Report) {
+    for entry in &report.forgot_entries {
+        let forgot = Event::memory(Kind::MemoryForgotten, job.project.clone(), entry.clone());
+        events.emit(forgot);
+    }
     let Ok(mut store) = memory::Store::open(&job.socket) else {
         return;
     };

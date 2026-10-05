@@ -486,6 +486,12 @@
           "format": "uint",
           "minimum": 0
         },
+        "rechecked": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
         "cost_usd": {
           "type": "number",
           "format": "double"
@@ -503,7 +509,7 @@
         "rejected",
         "cost_usd"
       ],
-      "description": "A pass of the distiller over what a session did: how many entries it added to the project's memory, found there already and turned down, and what it cost; or why it failed."
+      "description": "A pass of the distiller over what a session did: how many entries it added to the project's memory, found there already and turned down, how many of those gone stale it kept, reworded or forgot, and what it cost; or why it failed."
     },
     "DistillReport": {
       "type": "object",
@@ -531,6 +537,36 @@
           "format": "uint",
           "minimum": 0,
           "description": "How many it found that the user had forgotten."
+        },
+        "kept": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "description": "The ids of the stale entries it said still hold, anchored again.",
+          "default": []
+        },
+        "reworded": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "description": "The ids of the stale entries it reworded.",
+          "default": []
+        },
+        "forgot": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "description": "The ids of the stale entries it said no longer hold, forgotten.",
+          "default": []
         },
         "rejected": {
           "type": "array",
@@ -986,7 +1022,7 @@
         },
         {
           "const": "memory.stale",
-          "description": "every file an entry is about has changed since it was said"
+          "description": "all an entry names is gone from the code, or naming nothing to look for, every file it's about"
         },
         {
           "const": "memory.promoted",
@@ -1417,20 +1453,20 @@
         {
           "type": "string",
           "const": "fresh",
-          "description": "None of its files has changed since it was said, or it names none."
+          "description": "Everything it names is in the code still; or naming nothing to look for, none of its files has changed since it was said, or it has none."
         },
         {
           "type": "string",
           "const": "drifting",
-          "description": "Some of its files have changed since: it may hold only in part."
+          "description": "Some of what it names is gone from the code; or naming nothing to look for, some of its files have changed since: it may hold only in part."
         },
         {
           "type": "string",
           "const": "stale",
-          "description": "Every one of its files has changed since, or gone: it may no longer hold at all."
+          "description": "Everything it names is gone from the code; or naming nothing to look for, every one of its files is gone: it may no longer hold at all."
         }
       ],
-      "description": "Whether an entry still holds, by the files it's about. The fresher sorts first."
+      "description": "Whether an entry still holds, by what it names, or with nothing to look for, the files it's about. The fresher sorts first."
     },
     "Front": {
       "oneOf": [
@@ -2449,6 +2485,14 @@
           "description": "The worktree its files were hashed in; the project's main worktree when it's `None`.",
           "default": null
         },
+        "names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "What its text names that was in the code when it was last said: the identifiers, paths, commands and flags in it, to tell whether they're still there.",
+          "default": []
+        },
         "used": {
           "type": [
             "integer",
@@ -2507,6 +2551,13 @@
         },
         "freshness": {
           "$ref": "#/$defs/Freshness"
+        },
+        "gone": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "What it names that's gone from the code since it was said; or, naming nothing to look for, the files it's about that are gone."
         }
       },
       "required": [
@@ -4098,7 +4149,7 @@
             },
             "fresh": {
               "type": "boolean",
-              "description": "Leave the stale out."
+              "description": "Leave the stale out, rather than give them after the rest."
             },
             "expired": {
               "type": "boolean",

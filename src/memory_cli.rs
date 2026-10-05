@@ -10,7 +10,7 @@ use crate::env;
 use crate::events::{self, Event};
 use crate::git::Checkout;
 use crate::memory::{
-    self, Added, Entry, Forgotten, Freshness, Kind, Listed, Memory, New, Source, Store, Wanted,
+    self, Added, Entry, Forgotten, Kind, Listed, Memory, New, Source, Store, Wanted,
 };
 use crate::output::{err, errln, out, outln};
 use crate::printable;
@@ -125,8 +125,8 @@ pub fn show(socket: &Path, dir: Option<PathBuf>, id: u64) -> Result<()> {
     let Some(entry) = entry else {
         bail!("there's no entry {id}");
     };
-    let freshness = memory::freshness(&entry, &project);
-    outln!("{}", in_full(&entry, freshness, now()))?;
+    let item = memory::checked(entry, &project);
+    outln!("{}", in_full(&item, now()))?;
     Ok(())
 }
 
@@ -147,14 +147,16 @@ pub struct SearchArgs {
     pub kind: Option<Kind>,
     /// Files or directories, as given from the current directory.
     pub files: Vec<String>,
-    /// Stale and expired entries too.
+    /// Leave the stale out.
+    pub fresh: bool,
+    /// The expired too.
     pub all: bool,
     pub limit: Option<usize>,
 }
 
 /// Prints the entries that have to do with `words`, the best first, as
-/// `args` says: those that are stale or expired left out, unless it says
-/// all.
+/// `args` says: those that hold before the stale, or with `fresh`, the
+/// stale left out; the expired left out unless it says all.
 pub fn search(
     socket: &Path,
     dir: Option<PathBuf>,
@@ -179,7 +181,7 @@ pub fn search(
             .iter()
             .map(|file| from_top(file, &dir, &top))
             .collect(),
-        fresh: !args.all,
+        fresh: args.fresh,
         expired: args.all,
         limit: args.limit.unwrap_or(memory::SEARCH_LIMIT).max(1),
     };
@@ -316,7 +318,9 @@ pub fn kind(socket: &Path, dir: Option<PathBuf>, kinding: Kinding) -> Result<()>
         if !kinding.yes {
             for &(id, kind) in &read.lessons {
                 let note = notes.iter().find(|note| note.id == id);
-                let title = note.map(|note| memory::title(&note.text)).unwrap_or_default();
+                let title = note
+                    .map(|note| memory::title(&note.text))
+                    .unwrap_or_default();
                 let line = format!("{id:>4}  note → {:<8}  {title}", kind.to_string());
                 outln!("{}", printable::line(&line))?;
             }
@@ -515,15 +519,15 @@ fn forgotten_line(entry: &Forgotten, now: u64) -> String {
 }
 
 /// An entry in full, as `crystal memory show` and the `memory_show` tool
-/// give it: its id and kind, how it holds when it's drifting or stale,
-/// whether it's expired, its text, its files, where it came from, how often
-/// and how lately it was said, and when an agent last read it in full.
-pub fn in_full(entry: &Entry, freshness: Freshness, now: u64) -> String {
+/// give it: its id and kind, how it holds when it's drifting or stale, and
+/// what's gone, whether it's expired, its text, its files, where it came
+/// from, how often and how lately it was said, and when an agent last read
+/// it in full.
+pub fn in_full(item: &Listed, now: u64) -> String {
+    let entry = &item.entry;
     let mut text = format!("{} · {}", entry.id, entry.kind);
-    match freshness {
-        Freshness::Fresh => {}
-        Freshness::Drifting => text.push_str(" · drifting: some of its files have changed since"),
-        Freshness::Stale => text.push_str(" · stale: the files it's about have changed since"),
+    if let Some(holds) = item.how_it_holds() {
+        text.push_str(&format!(" · {holds}"));
     }
     if entry.expired(now) {
         text.push_str(" · expired: nobody has found it again, so searches leave it out");

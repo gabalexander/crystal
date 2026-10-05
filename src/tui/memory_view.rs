@@ -156,7 +156,9 @@ impl MemoryView {
         // Asked for a kind, its key picks it.
         if let Some(ask) = self.asking.take() {
             if let Ask::Kind(id) = ask {
-                let picked = KINDS.iter().find(|(key_of, _)| key.code == KeyCode::Char(*key_of));
+                let picked = KINDS
+                    .iter()
+                    .find(|(key_of, _)| key.code == KeyCode::Char(*key_of));
                 return match picked {
                     Some(&(_, kind)) => Outcome::Do(Action::SetMemoryKind {
                         dir: self.dir.clone(),
@@ -312,7 +314,9 @@ pub fn hints(view: &MemoryView) -> Vec<(String, String)> {
     if let Some(question) = view.question() {
         let mut hints = vec![(question, String::new())];
         if matches!(view.asking, Some(Ask::Kind(_))) {
-            let kinds = KINDS.iter().map(|(key, kind)| (key.to_string(), kind.to_string()));
+            let kinds = KINDS
+                .iter()
+                .map(|(key, kind)| (key.to_string(), kind.to_string()));
             hints.extend(kinds);
         } else {
             hints.push(("y".into(), "yes".into()));
@@ -515,16 +519,10 @@ fn draw_entry(frame: &mut Frame, view: &MemoryView, look: &Look, area: Rect) {
             Style::new().fg(theme.branch),
         ));
     }
-    let holds = match item.freshness {
-        Freshness::Fresh => None,
-        Freshness::Drifting => Some(
-            " drifting: some of the files it's about have changed since, so it may hold only in \
-             part",
-        ),
-        Freshness::Stale => {
-            Some(" stale: the files it's about have changed since, so it may no longer hold")
-        }
-    };
+    let holds = item.how_it_holds().map(|holds| match item.freshness {
+        Freshness::Stale => format!(" {holds}, so it may no longer hold"),
+        _ => format!(" {holds}, so it may hold only in part"),
+    });
     if let Some(holds) = holds {
         lines.push(Line::styled(holds, Style::new().fg(theme.waiting)));
     }
@@ -562,10 +560,12 @@ mod tests {
                 last_seen: 1_000,
                 anchors: Default::default(),
                 checkout: None,
+                names: Vec::new(),
                 used: None,
                 counted_from: None,
             },
             freshness: Freshness::Fresh,
+            gone: Vec::new(),
         }
     }
 

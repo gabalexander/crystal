@@ -2516,7 +2516,7 @@ crystal remember -k command "make e2e runs the browser tests; they take about 4 
 crystal memory add -k decision --title "Refunds go through the ledger" "Never call the processor directly: ..."
 crystal memory                       # the list, newest first; `memory list -k gotcha` keeps to a kind
 crystal memory search ledger tests   # the entries that have most to do with those words
-crystal memory search db -k command -f src/ledger --all -n 5   # of a kind, about those files, stale too
+crystal memory search db -k command -f src/ledger --fresh -n 5   # of a kind, about those files, none stale
 crystal memory show 3                # one in full: its files, where it came from, how often it was said
 crystal memory export > MEMORY.md    # the whole list as markdown
 crystal memory rm 3                  # forget one, or `rm 3 5 8` several
@@ -2559,30 +2559,37 @@ crystal memory embed                 # download the model that searches by meani
   repository. A project's list from before, a JSON file there, is brought in the first time it's read.
 - `search` uses SQLite's full-text index (FTS5), ranked by bm25: any of the words matches, and so does a word
   they start or stem from (`deploying` finds "Deploys go out on Tuesdays"); the entries with more of the words,
-  and rarer ones, come first, drifting ones marked where they rank. Stale ones are left out; `--all` (`-a`)
-  brings them back, marked. `-k` keeps to a kind, `-f` to the entries about a file, or about any file in a
-  directory, named from where you are (give it more than once for more), and `-n` says how many at most (50
-  unless it's told). With [search by meaning](#search-by-meaning), on unless you turn it off, entries that mean
-  the same count too, whatever their words, and what doesn't answer the search is left out. Expired entries are
-  left out too, and `--all` brings them back with the stale.
+  and rarer ones, come first, drifting ones marked where they rank, and of those it finds, the stale come
+  after the rest, marked. `--fresh` leaves the stale out. `-k` keeps to a kind, `-f` to the entries about a
+  file, or about any file in a directory, named from where you are (give it more than once for more), and `-n`
+  says how many at most (50 unless it's told). With [search by meaning](#search-by-meaning), on unless you turn
+  it off, entries that mean the same count too, whatever their words, and what doesn't answer the search is
+  left out. Expired entries are left out too, and `--all` (`-a`) brings them back, marked.
 - The same thing remembered again (the same words, whatever the case or punctuation) is the one entry, seen
   again: `remembered 3 already`. Credentials in an entry, like `API_KEY=…` or a token, are taken out as it's
   kept.
+- Whether an entry still holds goes by what it names: the identifiers, paths, commands and flags in its text,
+  in backticks or shaped like code (`local_origin`, `TaskRecord`, `Request::Shutdown` as `Shutdown`,
+  `src/agent_rules.rs`, `agents/`, `--test-threads`), that are in the worktree's code as it's remembered:
+  every word of every file git lists there, tracked or new and not ignored. While they're all still there, it
+  holds, however much its files change. Once some are gone, it's marked drifting: it may hold only in part.
+  Once all of them are, it's stale: agents starting aren't shown it, and a search gives it after the rest.
+  What it names that isn't in the code as it's remembered, like something just removed, isn't looked for.
 - `-f` names a file an entry is about, and can be given more than once. crystal keeps a hash of each file as it
-  is then (a file that isn't there isn't counted). Once some of them change, the entry is marked drifting: it
-  may hold only in part. Once all of them have changed, or gone, it's stale: a search leaves it out unless
-  `--all`, and agents starting aren't shown it. `crystal memory rm` it, or remember it again, which takes its
-  files as they are now.
-  The files are looked at in the worktree the entry was remembered in while that's there, and in the main
+  is then (a file that isn't there isn't counted). An entry that names nothing to look for goes by its files
+  instead: drifting once some have changed, and stale once every one of them is gone. `crystal memory show`
+  says what's gone. `crystal memory rm` an entry that no longer holds, or remember it again, which takes what
+  it names and its files as they are now.
+  The code is looked at in the worktree the entry was remembered in while that's there, and in the main
   worktree after.
 - `promote` asks first at a terminal; `--yes` doesn't. It writes to CLAUDE.md, or to AGENTS.md when that's the
   only one the project has.
 - `rm` forgets an entry: it leaves the list, and the distiller never adds it back. `memory list --forgotten`
   (or `--wrong`) lists what was forgotten, as it was; remembering it again brings it back.
 - `m` in the sidebar opens the selected session's project's list, drifting, stale and expired entries marked:
-  the entry the bar is on is shown in full beside it, `/` filters, `Enter` opens its file in your `$EDITOR`
-  (in the worktree it was remembered in while that's there, as a session of its own), and `x` forgets an entry
-  and `p` promotes it, each after a `y`.
+  the entry the bar is on is shown in full beside it, with what's gone, `/` filters, `Enter` opens its file in
+  your `$EDITOR` (in the worktree it was remembered in while that's there, as a session of its own), and `x`
+  forgets an entry and `p` promotes it, each after a `y`.
 
 When an agent starts, crystal shows it the entries that have most to do with its launch: first those about files
 its worktree has changed since its branch left the default one (`origin`'s, or `main` or `master`), committed
@@ -2602,8 +2609,8 @@ line on how to read the rest and add more:
 
 Every Claude Code session crystal starts, in a terminal or as a task in the background (`claude -p`), gets
 crystal's own MCP server, `crystal mcp`, with its two tools allowed: `memory_search`, which searches the
-project's memory the way `crystal memory search --all` does but for the expired, and `memory_show`, which reads
-one entry in full, and finds it again, so it doesn't expire. These
+project's memory the way `crystal memory search` does, and `memory_show`, which reads one entry in full, and
+finds it again, so it doesn't expire. These
 are how it reads the rest of what was learned without a shell command, which a task has nobody to say yes to
 and a session in a terminal would stop to ask about.
 
@@ -2671,6 +2678,12 @@ task closed done or failed and it was read then. It's one `claude -p` run on Hai
 - What passes is kept like anything else, `from the distiller, after task <name>`: what's there already is
   seen again rather than added twice, and what you forgot with `rm` it never adds back (you can, by
   remembering it yourself).
+- It's also shown up to 4 of the stale entries about the files the work touched (those its branch changed
+  since it left the default one, and those it edited), with what each names that's gone, and says of each the
+  record settles whether it still holds (it's anchored again, to the code as it is), holds once reworded (its
+  text is replaced, under the same id), or no longer holds (it's forgotten, as `rm` forgets). A verdict on an
+  entry it wasn't shown is refused, and so is one that keeps an entry, or rewords it, naming only what isn't
+  in the checkout.
 - How it went is a line in the daemon's log, `default.log` beside the socket. `crystal memory distill <session>`
   runs it now and says what came of it; it works on any Claude Code session or task, closed or not.
 
@@ -3280,10 +3293,11 @@ runs the action its handlers give a link, to try them.
 | `worktree.hook_failed` | a [worktree hook](#usage) failed, or ran too long |
 | `handoff.added` | a note goes in a worktree's handoff file: `crystal handoff`, or a task closing there |
 | `memory.added` | an entry is added to a project's memory: remembered, or by the distiller |
-| `memory.forgotten` | an entry is forgotten |
-| `memory.stale` | every file an entry is about has changed since it was said, as the daemon finds hourly and as each task closes |
+| `memory.forgotten` | an entry is forgotten: by you, or by the distiller, once one gone stale no longer holds |
+| `memory.stale` | all an entry names is gone from the code, or naming nothing to look for, every file it's about, as the daemon finds hourly and as each task closes |
 | `memory.promoted` | an entry is written into the project's CLAUDE.md or AGENTS.md, which its `file` names |
-| `memory.distilled` | the [distiller](#memory) has read what a session did: its `distill` says how many entries it `added`, found `again` and `rejected`, and what it cost |
+| `memory.changed` | an entry's kind is changed, by `crystal memory kind`, `c` in the memory view or the distiller |
+| `memory.distilled` | the [distiller](#memory) has read what a session did: its `distill` says how many entries it `added`, found `again`, `rechecked` of those gone stale and `rejected`, and what it cost |
 | `memory.distill_failed` | the distiller couldn't: its `distill`'s `failed` says why |
 | `backlog.added` | an item goes on a project's backlog |
 | `backlog.closed` | an item is marked done |

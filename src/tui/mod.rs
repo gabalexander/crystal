@@ -2178,11 +2178,8 @@ impl Tui {
                         .and_then(|mut store| store.set_kind(&project, id, kind));
                     match set {
                         Ok(entry) => {
-                            let changed = events::Event::memory(
-                                events::Kind::MemoryChanged,
-                                project,
-                                entry,
-                            );
+                            let changed =
+                                events::Event::memory(events::Kind::MemoryChanged, project, entry);
                             // The entry has changed either way.
                             let _ = client::tell(&socket, changed);
                             Event::MemoryRead {
