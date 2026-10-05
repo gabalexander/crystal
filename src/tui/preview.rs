@@ -23,7 +23,7 @@ const MOST_BYTES: u64 = 1 << 20;
 const MOST_LINES: usize = 10_000;
 
 /// git's test for a binary file: a zero byte in its first 8 KiB.
-const BINARY_TEST_BYTES: usize = 8 * 1024;
+pub const BINARY_TEST_BYTES: usize = 8 * 1024;
 
 /// How many lines a notch of the mouse wheel scrolls.
 const WHEEL_LINES: usize = 3;
@@ -67,7 +67,7 @@ pub fn read(dir: &Path, path: &str) -> Result<Content, String> {
     file.take(MOST_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|err| err.to_string())?;
-    if bytes.iter().take(BINARY_TEST_BYTES).any(|byte| *byte == 0) {
+    if is_binary(&bytes) {
         return Err("a binary file".to_string());
     }
     let mut cut_short = bytes.len() as u64 > MOST_BYTES;
@@ -90,6 +90,12 @@ pub fn read(dir: &Path, path: &str) -> Result<Content, String> {
         markdown,
         cut_short,
     })
+}
+
+/// Whether a file starting with `bytes` is binary, by git's test: a zero
+/// byte in its first [`BINARY_TEST_BYTES`].
+pub fn is_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(BINARY_TEST_BYTES).any(|byte| *byte == 0)
 }
 
 /// `text`'s lines highlighted as the file at `path` would be, tabs as

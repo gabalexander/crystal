@@ -3637,7 +3637,7 @@ fn start_as(
         tasks::forge_notes(&brief, &cwd, task.is_some()),
     ]);
     let parallel = (agents::program_name(&command) == Some("claude"))
-        .then(|| agents::PARALLEL_WORK.to_string());
+        .then(|| format!("{} {}", agents::PARALLEL_WORK, agents::SHOWING_FILES));
     let remembered = remembered(socket, &cwd, &command);
     let said = [
         task.as_deref(),
@@ -3822,8 +3822,9 @@ fn claude_tools(
 
 /// Claude Code's permission rules for crystal's own commands, so that an
 /// agent doing what its notes and crystal's skill teach (starting and
-/// driving sessions of its own, reading them, closing its task, noting
-/// something for later) doesn't stop for the user at every step: a task in
+/// driving sessions of its own, reading them, showing the user a file,
+/// closing its task, noting something for later) doesn't stop for the user
+/// at every step: a task in
 /// the background that did would sit there with its work done, and one
 /// driving workers would wait on each. A plugin's commands only while it's
 /// on. What removes or cancels what's there (`crystal kill`, `worktree rm`,
@@ -3837,7 +3838,8 @@ fn claude_tools(
 /// only as whole words: `crystal send:*` isn't `crystal send-keys`, and
 /// `crystal task:*` isn't `crystal tasks cancel`.
 fn crystal_commands(config: &Config) -> Vec<&'static str> {
-    // Sessions: starting, driving and reading them, and what's on screen.
+    // Sessions: starting, driving and reading them, and what's on screen,
+    // files shown there among it.
     let mut rules = vec![
         "Bash(crystal ls:*)",
         "Bash(crystal new:*)",
@@ -3855,6 +3857,7 @@ fn crystal_commands(config: &Config) -> Vec<&'static str> {
         "Bash(crystal layout export:*)",
         "Bash(crystal pane split:*)",
         "Bash(crystal pane close:*)",
+        "Bash(crystal open:*)",
     ];
     if tasks::enabled(config) {
         rules.extend([
@@ -4480,6 +4483,7 @@ mod tests {
             "Bash(crystal send:*)",
             "Bash(crystal wait:*)",
             "Bash(crystal read:*)",
+            "Bash(crystal open:*)",
             "Bash(crystal task:*)",
             "Bash(crystal flow run:*)",
             "Bash(crystal backlog done:*)",
