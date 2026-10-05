@@ -12,7 +12,7 @@
 use crate::artifacts;
 use crate::flow_run::{FlowRun, StepState};
 use crate::layout::{TabLayout, Tile};
-use crate::memory::{self, Entry};
+use crate::memory::{self, Added, Entry, Superseded};
 use crate::messages::{self, Sender};
 use crate::plugin_manifest;
 use crate::project;
@@ -79,6 +79,8 @@ pub enum Kind {
     MemoryDistilled,
     MemoryDistillFailed,
     MemoryMerged,
+    MemorySuperseded,
+    MemoryRestored,
     BacklogAdded,
     BacklogClosed,
     PluginPaused,
@@ -98,7 +100,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 65] = [
+    pub const ALL: [Kind; 67] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -148,6 +150,8 @@ impl Kind {
         Kind::MemoryDistilled,
         Kind::MemoryDistillFailed,
         Kind::MemoryMerged,
+        Kind::MemorySuperseded,
+        Kind::MemoryRestored,
         Kind::BacklogAdded,
         Kind::BacklogClosed,
         Kind::PluginPaused,
@@ -218,6 +222,8 @@ impl Kind {
             Kind::MemoryDistilled => "memory.distilled",
             Kind::MemoryDistillFailed => "memory.distill_failed",
             Kind::MemoryMerged => "memory.merged",
+            Kind::MemorySuperseded => "memory.superseded",
+            Kind::MemoryRestored => "memory.restored",
             Kind::BacklogAdded => "backlog.added",
             Kind::BacklogClosed => "backlog.closed",
             Kind::PluginPaused => "plugin.paused",
@@ -298,6 +304,10 @@ impl Kind {
             Kind::MemoryMerged => {
                 "entries that say the same thing are merged into one, by `crystal memory dedupe`"
             }
+            Kind::MemorySuperseded => {
+                "an entry stops holding, another said in its place: updated, or retired"
+            }
+            Kind::MemoryRestored => "an entry that stopped holding is put back as it was",
             Kind::BacklogAdded => "an item goes on a project's backlog",
             Kind::BacklogClosed => "an item is marked done",
             Kind::PluginPaused => "a plugin is paused for failing",
@@ -399,6 +409,10 @@ pub struct Event {
     pub worktree: Option<WorktreeAbout>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<Entry>,
+    /// An entry of memory that stopped holding, as it was, with what holds
+    /// in its place and why: `memory` is that, as it is now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded: Option<Superseded>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backlog: Option<BacklogItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -593,6 +607,10 @@ pub struct DistillAbout {
     pub rejected: usize,
     #[serde(default)]
     pub rechecked: usize,
+    /// How many of the entries it was shown it updated or retired, as what
+    /// it kept replaced them.
+    #[serde(default)]
+    pub superseded: usize,
     pub cost_usd: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed: Option<String>,
@@ -614,6 +632,9 @@ impl DistillAbout {
         }
         if self.rechecked > 0 {
             line.push_str(&format!(", {} stale rechecked", self.rechecked));
+        }
+        if self.superseded > 0 {
+            line.push_str(&format!(", {} superseded", self.superseded));
         }
         if self.rejected > 0 {
             line.push_str(&format!(", {} rejected", self.rejected));
@@ -638,6 +659,7 @@ impl Event {
             flow: None,
             worktree: None,
             memory: None,
+            superseded: None,
             backlog: None,
             plugin: None,
             artifact: None,
@@ -974,6 +996,16 @@ impl Event {
         }
     }
 
+    /// An entry of `project`'s memory stopped holding, `superseded`, as it
+    /// was: `holder`, as it is now, holds in its place, another entry, or
+    /// itself rewritten.
+    pub fn superseded(project: PathBuf, holder: Entry, superseded: Superseded) -> Event {
+        Event {
+            superseded: Some(superseded),
+            ..Event::memory(Kind::MemorySuperseded, project, holder)
+        }
+    }
+
     /// The distiller read what `session` did: `distill` says what came of
     /// it, and with its `failed`, why it couldn't.
     pub fn distilled(session: &SessionInfo, distill: DistillAbout) -> Event {
@@ -1291,7 +1323,8 @@ impl Event {
             | Kind::MemoryForgotten
             | Kind::MemoryStale
             | Kind::MemoryPromoted
-            | Kind::MemoryChanged => self.memory.as_ref().map_or(String::new(), |entry| {
+            | Kind::MemoryChanged
+            | Kind::MemoryRestored => self.memory.as_ref().map_or(String::new(), |entry| {
                 let into = self
                     .file
                     .as_ref()
@@ -1311,6 +1344,19 @@ impl Event {
                     entry.id,
                     entry.kind,
                     memory::title(&entry.text)
+                )
+            }),
+            Kind::MemorySuperseded => self.superseded.as_ref().map_or(String::new(), |was| {
+                let how = match was.updated() {
+                    true => "updated".to_string(),
+                    false => format!("→ {}", was.by),
+                };
+                format!(
+                    "{} ({}) {} {how}: {}",
+                    was.entry.id,
+                    was.entry.kind,
+                    memory::title(&was.entry.text),
+                    was.why
                 )
             }),
             Kind::MemoryDistilled | Kind::MemoryDistillFailed => self
@@ -1414,6 +1460,22 @@ impl SessionAbout {
             reporter: session.reporter.clone(),
         }
     }
+}
+
+/// What adding an entry to `project`'s memory is told as: a new entry
+/// added, and the entry it replaced, `retired`, superseded by the one it
+/// came to.
+pub fn remembered(project: &Path, added: &Added, retired: Option<&Superseded>) -> Vec<Event> {
+    let mut told = Vec::new();
+    if let Added::New(entry) | Added::Near { entry, .. } = added {
+        let event = Event::memory(Kind::MemoryAdded, project.to_path_buf(), entry.clone());
+        told.push(event);
+    }
+    if let (Some(retired), Some(holder)) = (retired, added.entry()) {
+        let event = Event::superseded(project.to_path_buf(), holder.clone(), retired.clone());
+        told.push(event);
+    }
+    told
 }
 
 /// A made-up event of `kind`, with all that kind carries filled in, about
@@ -1641,10 +1703,26 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             let why = "the worktree create hook exited with exit status: 1";
             Event::worktree_hook_failed(&worktree, why)
         }
-        Kind::MemoryAdded | Kind::MemoryForgotten | Kind::MemoryStale | Kind::MemoryChanged => {
-            Event::memory(kind, project::of(dir).path, entry)
-        }
+        Kind::MemoryAdded
+        | Kind::MemoryForgotten
+        | Kind::MemoryStale
+        | Kind::MemoryChanged
+        | Kind::MemoryRestored => Event::memory(kind, project::of(dir).path, entry),
         Kind::MemoryMerged => Event::merged(project::of(dir).path, entry, &[4, 7]),
+        Kind::MemorySuperseded => {
+            let holder = Entry {
+                id: 9,
+                text: "The ledger tests start the database themselves now".into(),
+                ..entry.clone()
+            };
+            let was = Superseded {
+                entry,
+                by: 9,
+                why: "the tests start it since the ledger moved to testcontainers".into(),
+                superseded: now,
+            };
+            Event::superseded(project::of(dir).path, holder, was)
+        }
         Kind::MemoryPromoted => {
             let project = project::of(dir).path;
             Event::promoted(project.clone(), entry, project.join("CLAUDE.md"))
@@ -1658,6 +1736,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
                 made_lessons: 0,
                 rejected: 0,
                 rechecked: 1,
+                superseded: 1,
                 cost_usd: 0.0012,
                 failed,
             };
@@ -2106,7 +2185,7 @@ mod tests {
         let distilled = example(Kind::MemoryDistilled, Some(&session()), dir);
         assert_eq!(
             distilled.line(),
-            "claude: 2 added, 1 seen again, 1 stale rechecked ($0.0012)"
+            "claude: 2 added, 1 seen again, 1 stale rechecked, 1 superseded ($0.0012)"
         );
         let archived = Event::about_session(Kind::SessionArchived, &session());
         assert_eq!(archived.line(), "claude: session.archived");

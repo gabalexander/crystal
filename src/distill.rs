@@ -8,6 +8,13 @@
 //! still holds as it is, holds reworded, or no longer holds: the entry is
 //! anchored again, reworded or forgotten.
 //!
+//! What it keeps may correct an entry it was shown the memory has: then it
+//! says which, and why, and whether what it keeps is that entry corrected,
+//! put in its place under its id, or a new entry the old one is retired
+//! for. And with no record to read, it looks through groups of entries near
+//! one another in meaning for those another in the group shows no longer
+//! hold, for `crystal memory reconcile` ([`superseded_among`]).
+//!
 //! It reads the end of what the task's session did: for a task in the
 //! background, Claude's runs as crystal read them; for Claude Code in a
 //! terminal, the transcript its hooks named. Codex leaves nothing it can
@@ -20,7 +27,9 @@
 //! before anything is kept: kinds it may use, texts short enough, files
 //! that are in the checkout, at most [`MAX_DISTILLED`] entries, and only
 //! the stale entries it was shown, one kept or reworded naming something
-//! that's in the checkout when it names anything. What passes
+//! that's in the checkout when it names anything; only entries it was shown
+//! replaced, each once, with why, by an entry naming something that's in the
+//! checkout when it names anything. What passes
 //! goes into the memory the way everything does, so what's known already is
 //! seen again rather than added twice, and what the user forgot stays
 //! forgotten.
@@ -31,7 +40,7 @@
 use crate::config::MemorySettings;
 use crate::embed;
 use crate::handover::HELPERS;
-use crate::memory::{self, Added, Entry, Kind, Listed, New, Source, Store};
+use crate::memory::{self, Added, Entry, Kind, Listed, New, Source, Store, Superseded};
 use crate::output::errln;
 use crate::protocol::TaskRecord;
 use crate::secrets;
@@ -91,6 +100,24 @@ const NOTES_AT_ONCE: usize = 40;
 /// How many of the last things the session said the entries the model is
 /// shown are found nearest to: where the conclusions it would keep are.
 const SAID_LOOKED_AT: usize = 16;
+
+/// The longest the reason an entry no longer holds may be, in characters:
+/// a sentence.
+const MAX_WHY: usize = 300;
+
+/// How many entries one pass over groups of entries near one another reads,
+/// at most: their groups whole. The model thinks each through, and passes
+/// of 40 took two to three minutes on crystal's own memory.
+const NEAR_AT_ONCE: usize = 24;
+
+/// How many passes over groups of entries near one another run at once.
+const NEAR_PASSES_AT_ONCE: usize = 4;
+
+/// How long one pass over groups of entries near one another may take:
+/// longer than the distiller's [`TIMEOUT`], as it weighs each entry against
+/// the others of its group. Without thinking it's quick, but takes nearly
+/// every older entry for one the newer replaces.
+const NEAR_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The kinds the distiller may give an entry: how a task turned out is the
 /// task's own to say.
@@ -154,6 +181,16 @@ each by its id and kind: never give any of that again, even in other words, and 
 only when it adds something new. When one of those that is a note is in fact a lesson, give its \
 id in kinds with the kind it should have (decision, gotcha or command), and leave out every \
 other.\n\n\
+When the record shows that one of those no longer holds as it says, because an entry you keep \
+corrects or replaces it (a default or a behaviour that changed, a decision reversed, a command, a \
+file or a name renamed, a limit changed, a workaround a fix made unnecessary), say so in that \
+entry's replaces: the id of the one that no longer holds; how, update when yours is that entry \
+corrected (yours is put in its place, under its id) or retire when yours is a new statement that \
+makes it obsolete (it is retired, and yours is added); and why, one sentence on what in the \
+record shows it no longer holds. This is the only way to say that one of the memory's entries no \
+longer holds: keep the entry that says what holds now, with replaces naming the old one. replaces \
+is null for every other entry: never replace one that still holds, one that says what yours does \
+(leave yours out instead), or one the record says nothing about.\n\n\
 Each entry has: a kind (decision, gotcha or command for a lesson; note only for a lasting \
 fact that is none of those, and notes nobody finds again expire); a text, one self-contained \
 statement of at most 300 characters that states the claim itself, with why when that matters; \
@@ -165,7 +202,8 @@ longer hold, each by its id, with what it names that is gone from the code. For 
 record settles, give a verdict in rechecked: keep when it still holds as it says, with an empty \
 text; reword when it holds once corrected, with the corrected statement as its text, under the \
 same rules as an entry's; forget when it no longer holds, with an empty text. Leave out every \
-one the record does not settle: never guess.\n\nYou have no tools; do not try to read files or \
+one the record does not settle: never guess. rechecked is for those listed as possibly no longer \
+holding alone, and is empty when none is listed.\n\nYou have no tools; do not try to read files or \
 run commands: everything you may use is in the message. Answer only through the structured \
 output.";
 
@@ -190,6 +228,34 @@ anything only true when it was written.\n\n\
 Say which notes are lessons, each by its id with the kind it should have. When unsure, leave \
 it out: a note left a note loses nothing. You have no tools; do not try to read files or run \
 commands: everything you may use is in the message. Answer only through the structured output.";
+
+/// What the model is told as it looks through groups of entries near one
+/// another for those that no longer hold: see [`superseded_among`]. Most
+/// near one another all hold, so it's told what doesn't make one stop
+/// holding, and to leave out what it's unsure of.
+pub const RECONCILE_PROMPT: &str = "You are crystal's memory distiller. You are given groups of \
+entries from a software project's memory; the entries in a group are near one another in \
+meaning. Each is given by its id, its kind, how long ago it was last said and, when some of what \
+it names is gone from the code, what is gone. Ids count up as entries are added, so a higher id \
+was first said later.\n\n\
+Most entries near one another all still hold: they say different things about the same subject, \
+or the same thing in other words, which is not for you. Find only those that no longer hold \
+because another entry in their group shows it: a default or a behaviour that changed, a decision \
+reversed, a command, a file or a name renamed, a limit or a count that changed, a workaround that \
+a later fix made unnecessary. The later entry usually holds; what is gone from the code tells \
+too.\n\n\
+For each, give its id, and how:\n\
+- retire, with by: the id of the entry in the same group that holds in its place, and an empty \
+text, when that one says what holds now and all of this one that still holds;\n\
+- update, with by null and text: the entry corrected, one self-contained statement of at most \
+300 characters, when some of it still holds that no other entry of its group says: keep that, \
+and correct the rest; use only what the group's entries say;\n\
+and why: one sentence on what in the group shows it no longer holds.\n\n\
+Never retire an entry because another says the same thing, says more about the same subject, or \
+is newer: only when what it says is no longer true. When unsure, leave it out: an entry left as \
+it is loses nothing, one retired wrongly is hidden from every later session. Return an empty list \
+when every entry holds. You have no tools; do not try to read files or run commands: everything \
+you may use is in the message. Answer only through the structured output.";
 
 /// The kinds a note that's a lesson may be given.
 const LESSONS: [Kind; 3] = [Kind::Decision, Kind::Gotcha, Kind::Command];
@@ -233,9 +299,24 @@ pub fn schema() -> Value {
                             "type": "array",
                             "items": { "type": "string" },
                             "maxItems": MAX_FILES
+                        },
+                        "replaces": {
+                            "anyOf": [
+                                { "type": "null" },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": { "type": "integer" },
+                                        "how": { "type": "string", "enum": ["update", "retire"] },
+                                        "why": { "type": "string", "maxLength": MAX_WHY }
+                                    },
+                                    "required": ["id", "how", "why"],
+                                    "additionalProperties": false
+                                }
+                            ]
                         }
                     },
-                    "required": ["kind", "text", "files"],
+                    "required": ["kind", "text", "files", "replaces"],
                     "additionalProperties": false
                 }
             },
@@ -255,6 +336,35 @@ pub fn schema() -> Value {
             }
         },
         "required": ["entries", "kinds", "rechecked"],
+        "additionalProperties": false
+    })
+}
+
+/// The shape of the answer of a pass over groups of entries near one
+/// another: the entries that no longer hold, each retired for another of
+/// its group or updated, and why.
+pub fn reconcile_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "superseded": {
+                "type": "array",
+                "maxItems": NEAR_AT_ONCE,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer" },
+                        "how": { "type": "string", "enum": ["retire", "update"] },
+                        "by": { "anyOf": [{ "type": "null" }, { "type": "integer" }] },
+                        "text": { "type": "string", "maxLength": MAX_TEXT },
+                        "why": { "type": "string", "maxLength": MAX_WHY }
+                    },
+                    "required": ["id", "how", "by", "text", "why"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["superseded"],
         "additionalProperties": false
     })
 }
@@ -549,6 +659,19 @@ pub struct Report {
     #[serde(skip)]
     #[cfg_attr(test, schemars(skip))]
     pub forgot_entries: Vec<Entry>,
+    /// The ids of the entries it was shown that what it kept corrected,
+    /// each put in its place under its id.
+    #[serde(default)]
+    pub updated: Vec<u64>,
+    /// The ids of the entries it was shown that what it kept replaced, each
+    /// retired.
+    #[serde(default)]
+    pub retired: Vec<u64>,
+    /// Each entry updated, retired or reworded, as it was, with the entry
+    /// that holds in its place as it is now, for the daemon to tell of.
+    #[serde(skip)]
+    #[cfg_attr(test, schemars(skip))]
+    pub superseded: Vec<(Superseded, Entry)>,
     /// The entries the model gave that didn't pass, each with why.
     pub rejected: Vec<String>,
     /// What the pass cost, in US dollars, as Claude counts it.
@@ -576,6 +699,12 @@ impl Report {
             1 => line.push_str(", 1 note made a lesson"),
             n => line.push_str(&format!(", {n} notes made lessons")),
         }
+        if !self.updated.is_empty() {
+            line.push_str(&format!(", {} updated", self.updated.len()));
+        }
+        if !self.retired.is_empty() {
+            line.push_str(&format!(", {} retired", self.retired.len()));
+        }
         let rechecked = [
             (self.kept.len(), "kept"),
             (self.reworded.len(), "reworded"),
@@ -597,9 +726,10 @@ impl Report {
 }
 
 /// Runs a pass, start to end: reads what was done, asks Claude, checks its
-/// answer and keeps what passes, does as it says with the stale entries it
-/// was shown, and gives the notes it was shown that it says are lessons
-/// their kinds.
+/// answer and keeps what passes, each that corrects an entry it was shown
+/// in that one's place, does as it says with the stale entries it was
+/// shown, and gives the notes it was shown that it says are lessons their
+/// kinds.
 pub fn run(job: &Job) -> Result<Report> {
     let record = job.material.read(&job.env)?;
     if record.is_empty() {
@@ -615,6 +745,11 @@ pub fn run(job: &Job) -> Result<Report> {
         .filter(|entry| entry.kind == Kind::Note && !memory::reads_as_status(&entry.text))
         .map(|entry| entry.id)
         .collect();
+    // How a task turned out is history, and nothing replaces it.
+    let replaceable: Vec<u64> = (known.iter())
+        .filter(|entry| entry.kind != Kind::Outcome)
+        .map(|entry| entry.id)
+        .collect();
     let known: Vec<String> = known
         .iter()
         .map(|entry| {
@@ -626,21 +761,29 @@ pub fn run(job: &Job) -> Result<Report> {
     let stale = store.stale_about(&job.project, &touched, RECHECKED)?;
     let message = message(&job.header, &known, &stale, &record.text());
     let (answer, cost_usd) = ask_claude(job, &message)?;
-    let checked = check(&answer, &job.checkout, &stale, &notes)?;
+    let checked = check(&answer, &job.checkout, &stale, &notes, &replaceable)?;
     let mut report = Report {
         rejected: checked.rejected,
         cost_usd,
         ..Report::default()
     };
+    // Before the rest, which could be taken for one of those it replaces
+    // said again.
+    for replacement in checked.replacements {
+        let id = replacement.id;
+        if let Err(err) = replace(&mut store, job, replacement, embedder, &mut report) {
+            report.rejected.push(format!("entry {id}: {err:#}"));
+        }
+    }
     for entry in checked.entries {
         let new = New {
             source: Source::Distilled(job.session.clone()),
             ..entry
         };
         match store.add_with(&job.project, new, embedder)? {
-            Added::New(entry) => report.added.push(entry.id),
+            Added::New(entry) | Added::Near { entry, .. } => report.added.push(entry.id),
             Added::Again(entry) | Added::Alike(entry) => report.again.push(entry.id),
-            Added::Refused => report.forgotten += 1,
+            Added::Outdated(_) | Added::Refused => report.forgotten += 1,
         }
     }
     for Recheck { id, verdict } in checked.rechecks {
@@ -648,8 +791,12 @@ pub fn run(job: &Job) -> Result<Report> {
             Verdict::Keep => {
                 (store.reanchor(&job.project, id, &job.checkout)).map(|_| report.kept.push(id))
             }
-            Verdict::Reword(text) => (store.reword(&job.project, id, &text, &job.checkout))
-                .map(|_| report.reworded.push(id)),
+            Verdict::Reword(text) => {
+                (store.reword(&job.project, id, &text, &job.checkout)).map(|reworded| {
+                    report.reworded.push(id);
+                    report.superseded.push(reworded);
+                })
+            }
             Verdict::Forget => store.remove(&job.project, id).map(|entry| {
                 report.forgot.push(id);
                 report.forgot_entries.push(entry);
@@ -670,6 +817,52 @@ pub fn run(job: &Job) -> Result<Report> {
         }
     }
     Ok(report)
+}
+
+/// Keeps what `replacement` says in place of the entry it replaces, as the
+/// distiller of `job` said it: that entry corrected, under its id, or a new
+/// entry (or one said before, seen again), the one it replaces retired.
+fn replace(
+    store: &mut Store,
+    job: &Job,
+    replacement: Replacement,
+    embedder: Option<&dyn embed::Embed>,
+    report: &mut Report,
+) -> Result<()> {
+    let Replacement {
+        id,
+        how,
+        why,
+        entry,
+    } = replacement;
+    let new = New {
+        source: Source::Distilled(job.session.clone()),
+        ..entry
+    };
+    let project = &job.project;
+    match how {
+        How::Update => {
+            let checkout = &job.checkout;
+            let kind = Some(new.kind);
+            let (was, now) =
+                store.update(project, id, &new.text, kind, &new.files, checkout, &why)?;
+            report.updated.push(id);
+            report.superseded.push((was, now));
+        }
+        How::Retire => {
+            let (added, retired) = store.replace(project, new, id, &why, embedder)?;
+            let (Some(retired), Some(holder)) = (retired, added.entry().cloned()) else {
+                bail!("what replaces it was forgotten, so it stays");
+            };
+            match added {
+                Added::New(_) | Added::Near { .. } => report.added.push(holder.id),
+                _ => report.again.push(holder.id),
+            }
+            report.retired.push(id);
+            report.superseded.push((retired, holder));
+        }
+    }
+    Ok(())
 }
 
 /// The files the work touched, from the top of `checkout`: those its
@@ -768,13 +961,24 @@ fn ask_claude(job: &Job, message: &str) -> Result<(Value, f64)> {
     ask(&args(&job.settings), &job.checkout, &job.env, message)
 }
 
-/// Runs Claude with `args` in `cwd`, with `env`, on `message`, and gives
-/// back its answer and what it cost.
+/// [`ask_within`] [`TIMEOUT`].
 fn ask(
     args: &[String],
     cwd: &Path,
     env: &BTreeMap<String, String>,
     message: &str,
+) -> Result<(Value, f64)> {
+    ask_within(args, cwd, env, message, TIMEOUT)
+}
+
+/// Runs Claude with `args` in `cwd`, with `env`, on `message`, and gives
+/// back its answer and what it cost.
+fn ask_within(
+    args: &[String],
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    message: &str,
+    timeout: Duration,
 ) -> Result<(Value, f64)> {
     let mut env = env.clone();
     // It isn't a session, and its hooks are off anyway.
@@ -813,7 +1017,7 @@ fn ask(
     };
     let stdout = read_all(child.stdout.take().map(|pipe| Box::new(pipe) as _));
     let stderr = read_all(child.stderr.take().map(|pipe| Box::new(pipe) as _));
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         if child.try_wait()?.is_some() {
             break;
@@ -823,7 +1027,7 @@ fn ask(
             let _ = child.wait();
             bail!(
                 "it took longer than {}s, and was stopped",
-                TIMEOUT.as_secs()
+                timeout.as_secs()
             );
         }
         thread::sleep(Duration::from_millis(100));
@@ -863,15 +1067,36 @@ fn answer_of(out: &str) -> Result<(Value, f64)> {
     Ok((answer, cost))
 }
 
-/// The model's entries that passed, what it said of the stale entries
-/// that passed, the notes it was shown that it says are lessons, with their
-/// kinds, and why each that didn't pass, didn't.
+/// The model's entries that passed, those of them that replace an entry
+/// it was shown apart, what it said of the stale entries that passed, the
+/// notes it was shown that it says are lessons, with their kinds, and why
+/// each that didn't pass, didn't.
 #[derive(Debug, Default, PartialEq)]
 pub struct Checked {
     pub entries: Vec<New>,
+    pub replacements: Vec<Replacement>,
     pub rechecks: Vec<Recheck>,
     pub lessons: Vec<(u64, Kind)>,
     pub rejected: Vec<String>,
+}
+
+/// An entry the model keeps in place of one it was shown, which no longer
+/// holds: `id`, replaced as `how` says, for `why`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Replacement {
+    pub id: u64,
+    pub how: How,
+    pub why: String,
+    pub entry: New,
+}
+
+/// How an entry that no longer holds is replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum How {
+    /// What replaces it is it corrected: put in its place, under its id.
+    Update,
+    /// What replaces it is another entry: it's retired.
+    Retire,
 }
 
 /// What the model said of a stale entry it was shown.
@@ -894,13 +1119,21 @@ pub enum Verdict {
 /// Checks the model's answer against the checkout: an array of entries,
 /// bare or as `entries`, at most [`MAX_DISTILLED`]; each of a kind the
 /// distiller may give, with a text that isn't empty or too long, naming
-/// files that are in `checkout`. An entry that fails any of it is dropped
-/// whole, with why. Then its verdicts on the stale entries, `rechecked`:
-/// each on one of `stale`, once, and one kept or reworded naming something
-/// that's in `checkout`, when it names anything. Its `kinds` are kept for
-/// those of `notes`, the notes it was shown, alone, as [`lessons_in`] keeps
-/// them.
-pub fn check(answer: &Value, checkout: &Path, stale: &[Listed], notes: &[u64]) -> Result<Checked> {
+/// files that are in `checkout`; and one that replaces an entry, one of
+/// `replaceable`, those it was shown, each once, saying why, and naming
+/// something that's in `checkout`, when it names anything. An entry that
+/// fails any of it is dropped whole, with why. Then its verdicts on the
+/// stale entries, `rechecked`: each on one of `stale`, once, none replaced,
+/// and one kept or reworded naming something that's in `checkout`, when it
+/// names anything. Its `kinds` are kept for those of `notes`, the notes it
+/// was shown, alone, as [`lessons_in`] keeps them.
+pub fn check(
+    answer: &Value,
+    checkout: &Path,
+    stale: &[Listed],
+    notes: &[u64],
+    replaceable: &[u64],
+) -> Result<Checked> {
     let items = match answer {
         Value::Array(items) => items,
         Value::Object(object) => match object.get("entries") {
@@ -918,8 +1151,20 @@ pub fn check(answer: &Value, checkout: &Path, stale: &[Listed], notes: &[u64]) -
                 .push(format!("entry {number}: past the first {MAX_DISTILLED}"));
             continue;
         }
-        match entry(item, checkout) {
-            Ok(entry) => checked.entries.push(entry),
+        let parsed = entry(item, checkout).and_then(|entry| {
+            let replacement = replacement(&item["replaces"], &entry, checkout, replaceable)?;
+            Ok((entry, replacement))
+        });
+        let replaced = |id: u64| checked.replacements.iter().any(|done| done.id == id);
+        match parsed {
+            Ok((_, Some(replacement))) if replaced(replacement.id) => {
+                checked.rejected.push(format!(
+                    "entry {number}: it replaces {}, as another does",
+                    replacement.id
+                ))
+            }
+            Ok((_, Some(replacement))) => checked.replacements.push(replacement),
+            Ok((entry, None)) => checked.entries.push(entry),
             Err(why) => checked.rejected.push(format!("entry {number}: {why}")),
         }
     }
@@ -939,12 +1184,67 @@ pub fn check(answer: &Value, checkout: &Path, stale: &[Listed], notes: &[u64]) -
                     .rejected
                     .push(format!("{}: a second verdict", said()));
             }
+            Ok(recheck) if checked.replacements.iter().any(|r| r.id == recheck.id) => {
+                checked
+                    .rejected
+                    .push(format!("{}: an entry replaces it", said()));
+            }
             Ok(recheck) => checked.rechecks.push(recheck),
             Err(why) => checked.rejected.push(format!("{}: {why}", said())),
         }
     }
     checked.lessons = lessons_in(&answer["kinds"], notes, &mut checked.rejected);
     Ok(checked)
+}
+
+/// What `replaces`, as the model gave it with `entry`, says `entry`
+/// replaces, checked: nothing, when it's null or isn't there; or one of
+/// `replaceable`, how, and why, with `entry` naming something that's in
+/// `checkout` when it names anything.
+fn replacement(
+    replaces: &Value,
+    entry: &New,
+    checkout: &Path,
+    replaceable: &[u64],
+) -> Result<Option<Replacement>, String> {
+    if replaces.is_null() {
+        return Ok(None);
+    }
+    let id = replaces["id"].as_u64().ok_or("it replaces no entry")?;
+    if !replaceable.contains(&id) {
+        return Err(format!("it replaces {id}, which it wasn't shown"));
+    }
+    let how = match replaces["how"].as_str().unwrap_or_default() {
+        "update" => How::Update,
+        "retire" => How::Retire,
+        how => return Err(format!("{how:?} isn't how an entry is replaced")),
+    };
+    let why = replaces["why"].as_str().unwrap_or_default().trim();
+    if why.is_empty() {
+        return Err(format!("it doesn't say why {id} no longer holds"));
+    }
+    if why.chars().count() > MAX_WHY {
+        return Err(format!(
+            "why {id} no longer holds is longer than {MAX_WHY} characters"
+        ));
+    }
+    names_what_is_there(&entry.text, &entry.files, checkout)?;
+    Ok(Some(Replacement {
+        id,
+        how,
+        why: why.to_string(),
+        entry: entry.clone(),
+    }))
+}
+
+/// Whether `text`, about `files`, names something that's in `checkout`,
+/// when it names anything: what it says holds now, so it has to.
+fn names_what_is_there(text: &str, files: &[String], checkout: &Path) -> Result<(), String> {
+    let named = !memory::names_beside(text, files).is_empty();
+    if named && memory::found_in(checkout, text, files).is_empty() {
+        return Err("nothing it names is in the checkout".to_string());
+    }
+    Ok(())
 }
 
 /// A verdict on one of the `stale` entries, checked.
@@ -968,11 +1268,7 @@ fn recheck(item: &Value, checkout: &Path, stale: &[Listed]) -> Result<Recheck, S
         Verdict::Reword(text) => text,
         Verdict::Forget => return Ok(Recheck { id, verdict }),
     };
-    let files = &asked.entry.files;
-    let named = !memory::names_beside(said, files).is_empty();
-    if named && memory::found_in(checkout, said, files).is_empty() {
-        return Err("nothing it names is in the checkout".to_string());
-    }
+    names_what_is_there(said, &asked.entry.files, checkout)?;
     Ok(Recheck { id, verdict })
 }
 
@@ -1058,6 +1354,246 @@ pub fn notes_message(notes: &[Entry]) -> String {
     }
     message.push_str("\nReturn the notes that are lessons, each with its kind.");
     message
+}
+
+/// An entry the model says no longer holds, as `crystal memory reconcile`
+/// proposes it: `id`, which said `was` as it was read, changed as `change`
+/// says, for `why`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Proposal {
+    pub id: u64,
+    pub was: String,
+    pub change: Change,
+    pub why: String,
+}
+
+/// What becomes of an entry that no longer holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Change {
+    /// It's retired: entry `by` of its group holds in its place.
+    Retire { by: u64 },
+    /// It's corrected: `text` is put in its place, under its id.
+    Update { text: String },
+}
+
+/// What a pass over groups of entries near one another came to: the
+/// entries it says no longer hold, why each it gave that didn't pass
+/// didn't, and what it cost.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Proposals {
+    pub proposals: Vec<Proposal>,
+    pub rejected: Vec<String>,
+    pub cost_usd: f64,
+}
+
+/// Which of `groups`, entries near one another in meaning, each with
+/// whether it holds, no longer hold because another of their group shows
+/// it, as the distiller's model reads them: groups whole, as many as fit in
+/// [`NEAR_AT_ONCE`] entries at a time, one locked-down `claude -p` each, as
+/// a pass is, [`NEAR_PASSES_AT_ONCE`] at once, run in `cwd` with `env`; what
+/// it gives checked against them and `cwd`, as [`proposals_in`] checks it.
+/// A pass that fails says so among what's rejected, unless every one does.
+/// It changes nothing: what's done with the answer is the caller's.
+pub fn superseded_among(
+    groups: &[Vec<Listed>],
+    settings: &MemorySettings,
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<Proposals> {
+    let args = pass_args(settings, RECONCILE_PROMPT, &reconcile_schema());
+    let now = memory::seconds_since_epoch(std::time::SystemTime::now());
+    let batches = batches(groups, NEAR_AT_ONCE);
+    let mut answers = Vec::new();
+    for run in batches.chunks(NEAR_PASSES_AT_ONCE) {
+        answers.extend(thread::scope(|scope| {
+            let passes: Vec<_> = (run.iter())
+                .map(|batch| {
+                    let message = near_message(batch, now);
+                    let args = &args;
+                    scope.spawn(move || ask_within(args, cwd, env, &message, NEAR_TIMEOUT))
+                })
+                .collect();
+            let answers = passes.into_iter().map(|pass| pass.join());
+            answers
+                .map(|answer| answer.unwrap_or_else(|_| bail!("its pass panicked")))
+                .collect::<Vec<_>>()
+        }));
+    }
+    let mut found = Proposals::default();
+    let mut failed = Vec::new();
+    for (batch, answer) in batches.iter().zip(answers) {
+        match answer {
+            Ok((answer, cost)) => {
+                found.cost_usd += cost;
+                let (proposals, rejected) = proposals_in(&answer, batch, cwd);
+                found.proposals.extend(proposals);
+                found.rejected.extend(rejected);
+            }
+            Err(err) => failed.push(err),
+        }
+    }
+    if !batches.is_empty() && failed.len() == batches.len() {
+        return Err(failed.remove(0));
+    }
+    for err in failed {
+        found.rejected.push(format!("a pass: {err:#}"));
+    }
+    settle(&mut found.proposals, &mut found.rejected);
+    Ok(found)
+}
+
+/// `groups` in runs of whole groups, each run as many as fit in `most`
+/// entries, or one group alone that doesn't.
+fn batches<T>(groups: &[Vec<T>], most: usize) -> Vec<&[Vec<T>]> {
+    let mut batches = Vec::new();
+    let (mut start, mut entries) = (0, 0);
+    for (at, group) in groups.iter().enumerate() {
+        if at > start && entries + group.len() > most {
+            batches.push(&groups[start..at]);
+            (start, entries) = (at, 0);
+        }
+        entries += group.len();
+    }
+    if start < groups.len() {
+        batches.push(&groups[start..]);
+    }
+    batches
+}
+
+/// The message a pass over groups of entries near one another sends: each
+/// group under its number, each entry on a line after its id, with its
+/// kind, how long ago it was last said at `now`, what of it is gone from
+/// the code and the files it's about. Credentials are taken out first.
+pub fn near_message(groups: &[Vec<Listed>], now: u64) -> String {
+    let mut message = String::from(
+        "Groups of entries near one another in meaning, each entry after its id (a higher id was \
+         first said later):\n",
+    );
+    for (at, group) in groups.iter().enumerate() {
+        message.push_str(&format!("\nGroup {}:\n", at + 1));
+        for item in group {
+            let entry = &item.entry;
+            let ago = crate::tui::sidebar::ago(entry.last_seen, now);
+            let mut about = format!("{}, said {ago} ago", entry.kind);
+            if let Some(holds) = item.how_it_holds() {
+                about.push_str(&format!("; {holds}"));
+            }
+            let text = memory::one_line(&entry.text);
+            message.push_str(&format!(
+                "- {} ({about}) {}",
+                entry.id,
+                secrets::redact(&text)
+            ));
+            if !entry.files.is_empty() {
+                message.push_str(&format!(" [{}]", entry.files.join(", ")));
+            }
+            message.push('\n');
+        }
+    }
+    message.push_str("\nReturn the entries that no longer hold, each with how and why.");
+    message
+}
+
+/// The entries `answer` says no longer hold that pass, each as a
+/// [`Proposal`], and why each that doesn't, doesn't: one of `groups`' each
+/// once, saying why; retired for another of its group, `by`, which isn't
+/// retired itself; or updated, with a text fit for an entry, naming
+/// something that's in `checkout` when it names anything.
+fn proposals_in(
+    answer: &Value,
+    groups: &[Vec<Listed>],
+    checkout: &Path,
+) -> (Vec<Proposal>, Vec<String>) {
+    let given = answer["superseded"].as_array().map(Vec::as_slice);
+    let mut proposals: Vec<Proposal> = Vec::new();
+    let mut rejected = Vec::new();
+    let group_of =
+        |id: u64| (groups.iter()).find(|group| group.iter().any(|item| item.entry.id == id));
+    for item in given.unwrap_or_default() {
+        let Some(id) = item["id"].as_u64() else {
+            rejected.push(format!("one that says of no entry: {item}"));
+            continue;
+        };
+        let proposal = (|| -> Result<Proposal, String> {
+            let group = group_of(id).ok_or("it wasn't one of those asked about")?;
+            if proposals.iter().any(|done| done.id == id) {
+                return Err("a second time".to_string());
+            }
+            let entry = &(group.iter().find(|item| item.entry.id == id))
+                .expect("its group has it")
+                .entry;
+            let why = item["why"].as_str().unwrap_or_default().trim();
+            if why.is_empty() {
+                return Err("it doesn't say why it no longer holds".to_string());
+            }
+            if why.chars().count() > MAX_WHY {
+                return Err(format!("why is longer than {MAX_WHY} characters"));
+            }
+            let change = match item["how"].as_str().unwrap_or_default() {
+                "retire" => {
+                    let by = item["by"].as_u64().ok_or("it's retired for no entry")?;
+                    if by == id || !group.iter().any(|item| item.entry.id == by) {
+                        return Err(format!("{by} isn't another entry of its group"));
+                    }
+                    Change::Retire { by }
+                }
+                "update" => {
+                    let text = item["text"].as_str().unwrap_or_default().trim();
+                    text_of(text)?;
+                    if memory::one_line(text) == memory::one_line(&entry.text) {
+                        return Err("its update says what it says".to_string());
+                    }
+                    names_what_is_there(text, &entry.files, checkout)?;
+                    Change::Update {
+                        text: text.to_string(),
+                    }
+                }
+                how => return Err(format!("{how:?} isn't how an entry is replaced")),
+            };
+            Ok(Proposal {
+                id,
+                was: entry.text.clone(),
+                change,
+                why: why.to_string(),
+            })
+        })();
+        match proposal {
+            Ok(proposal) => proposals.push(proposal),
+            Err(why) => rejected.push(format!("entry {id}: {why}")),
+        }
+    }
+    settle(&mut proposals, &mut rejected);
+    (proposals, rejected)
+}
+
+/// Leaves of `proposals` the first for each entry, and those retired for
+/// one that isn't retired itself, as what holds in another's place has to
+/// hold; why each other goes goes into `rejected`. An entry in two groups
+/// may be proposed in two passes.
+fn settle(proposals: &mut Vec<Proposal>, rejected: &mut Vec<String>) {
+    let mut seen = Vec::new();
+    proposals.retain(|proposal| {
+        let first = !seen.contains(&proposal.id);
+        if first {
+            seen.push(proposal.id);
+        } else {
+            rejected.push(format!("entry {}: a second time", proposal.id));
+        }
+        first
+    });
+    let retired: Vec<u64> = (proposals.iter())
+        .filter(|proposal| matches!(proposal.change, Change::Retire { .. }))
+        .map(|proposal| proposal.id)
+        .collect();
+    proposals.retain(|proposal| match proposal.change {
+        Change::Retire { by } if retired.contains(&by) => {
+            let id = proposal.id;
+            rejected.push(format!("entry {id}: {by}, in its place, is retired too"));
+            false
+        }
+        _ => true,
+    });
 }
 
 fn entry(item: &Value, checkout: &Path) -> Result<New, String> {
@@ -1355,7 +1891,7 @@ mod tests {
             {"id": 8, "verdict": "doubt", "text": ""},
             {"verdict": "forget", "text": ""},
         ]});
-        let checked = check(&answer, dir.path(), &asked, &[]).unwrap();
+        let checked = check(&answer, dir.path(), &asked, &[], &[]).unwrap();
         assert_eq!(
             checked.rechecks,
             [
@@ -1384,7 +1920,7 @@ mod tests {
             {"id": 8, "verdict": "reword", "text": " "},
             {"id": 9, "verdict": "forget", "text": ""},
         ]});
-        let checked = check(&reworded, dir.path(), &asked, &[]).unwrap();
+        let checked = check(&reworded, dir.path(), &asked, &[], &[]).unwrap();
         assert_eq!(
             checked.rechecks,
             [Recheck {
@@ -1402,7 +1938,7 @@ mod tests {
         // An answer from before has none.
         let before = json!({"entries": []});
         assert!(
-            check(&before, dir.path(), &asked, &[])
+            check(&before, dir.path(), &asked, &[], &[])
                 .unwrap()
                 .rechecks
                 .is_empty()
@@ -1462,7 +1998,7 @@ mod tests {
             {"kind": "command", "text": "make ci runs it all",
              "files": [dir.path().join("src/ledger.rs").to_str().unwrap()]},
         ]});
-        let checked = check(&answer, dir.path(), &[], &[]).unwrap();
+        let checked = check(&answer, dir.path(), &[], &[], &[]).unwrap();
         let texts: Vec<&str> = checked.entries.iter().map(|e| e.text.as_str()).collect();
         assert_eq!(
             texts,
@@ -1482,10 +2018,10 @@ mod tests {
         let entries: Vec<Value> = (0..10)
             .map(|at| json!({"kind": "note", "text": format!("note {at}"), "files": []}))
             .collect();
-        let checked = check(&Value::Array(entries), dir.path(), &[], &[]).unwrap();
+        let checked = check(&Value::Array(entries), dir.path(), &[], &[], &[]).unwrap();
         assert_eq!(checked.entries.len(), MAX_DISTILLED);
         assert_eq!(checked.rejected.len(), 2);
-        assert!(check(&json!("nothing"), dir.path(), &[], &[]).is_err());
+        assert!(check(&json!("nothing"), dir.path(), &[], &[], &[]).is_err());
     }
 
     #[test]
@@ -1565,7 +2101,7 @@ mod tests {
             {"id": 3, "kind": "command"},
             {"kind": "gotcha"},
         ]});
-        let checked = check(&answer, dir.path(), &[], &[3, 5]).unwrap();
+        let checked = check(&answer, dir.path(), &[], &[3, 5], &[]).unwrap();
         assert_eq!(
             checked.lessons,
             [(3, Kind::Gotcha)],
@@ -1638,5 +2174,251 @@ mod tests {
         let args = pass_args(&MemorySettings::default(), NOTES_PROMPT, &schema);
         assert!(args.contains(&"--no-session-persistence".to_string()));
         assert!(args.contains(&NOTES_PROMPT.to_string()));
+    }
+
+    #[test]
+    fn what_replaces_an_entry_is_checked_against_what_it_was_shown_and_the_checkout() {
+        let dir = checkout();
+        std::fs::write(
+            dir.path().join("src/ledger.rs"),
+            "fn ledger_retry_twice() {}",
+        )
+        .unwrap();
+        let replaces = |id: u64, how: &str, why: &str| json!({"id": id, "how": how, "why": why});
+        let entry = |text: &str, replaces: Value| {
+            let files: [&str; 0] = [];
+            json!({"kind": "gotcha", "text": text, "files": files, "replaces": replaces})
+        };
+        let answer = json!({"entries": [
+            entry("Retry with `ledger_retry_twice`", replaces(3, "update", "it was renamed")),
+            entry("Ledger calls are fast", replaces(4, "retire", "  ")),
+            entry("Ledger calls time out", replaces(3, "retire", "it changed")),
+            entry("Call `ledger_sync` first", replaces(4, "retire", "it changed")),
+            entry("Ledger calls block", replaces(4, "merge", "it changed")),
+            entry("Ledger calls are cached", Value::Null),
+            json!({"kind": "note", "text": "Before replaces was asked for", "files": []}),
+            entry("Ledger calls are queued", replaces(4, "retire", "the queue replaced them")),
+        ], "rechecked": [
+            {"id": 3, "verdict": "forget", "text": ""},
+        ]});
+        let stale = [stale(3, "Retry with `ledger_retry`", &["ledger_retry"])];
+        let checked = check(&answer, dir.path(), &stale, &[], &[3, 4]).unwrap();
+        let replaced: Vec<(u64, How, &str, &str)> = (checked.replacements.iter())
+            .map(|r| (r.id, r.how, r.why.as_str(), r.entry.text.as_str()))
+            .collect();
+        assert_eq!(
+            replaced,
+            [
+                (
+                    3,
+                    How::Update,
+                    "it was renamed",
+                    "Retry with `ledger_retry_twice`"
+                ),
+                (
+                    4,
+                    How::Retire,
+                    "the queue replaced them",
+                    "Ledger calls are queued"
+                ),
+            ]
+        );
+        let texts: Vec<&str> = checked.entries.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["Ledger calls are cached", "Before replaces was asked for"]
+        );
+        assert_eq!(
+            checked.rejected,
+            [
+                "entry 2: it doesn't say why 4 no longer holds",
+                "entry 3: it replaces 3, as another does",
+                "entry 4: nothing it names is in the checkout",
+                "entry 5: \"merge\" isn't how an entry is replaced",
+                "entry 3: an entry replaces it",
+            ]
+        );
+        assert!(checked.rechecks.is_empty());
+        let unshown = json!({"entries": [entry("Calls are slow", replaces(9, "retire", "why"))]});
+        let checked = check(&unshown, dir.path(), &[], &[], &[3, 4]).unwrap();
+        assert_eq!(
+            checked.rejected,
+            ["entry 1: it replaces 9, which it wasn't shown"]
+        );
+        assert!(checked.entries.is_empty() && checked.replacements.is_empty());
+    }
+
+    #[test]
+    fn the_pass_is_told_how_to_replace_what_no_longer_holds() {
+        let schema = schema();
+        let entry = &schema["properties"]["entries"]["items"];
+        assert!(
+            entry["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("replaces"))
+        );
+        let replaces = &entry["properties"]["replaces"]["anyOf"];
+        assert_eq!(replaces[0], json!({"type": "null"}));
+        assert_eq!(
+            replaces[1]["properties"]["how"]["enum"],
+            json!(["update", "retire"])
+        );
+        assert_eq!(replaces[1]["required"], json!(["id", "how", "why"]));
+        for rule in [
+            "say so in that entry's replaces",
+            "update when yours is that entry corrected",
+            "retire when yours is a new statement",
+            "never replace one that still holds",
+        ] {
+            assert!(SYSTEM_PROMPT.contains(rule), "{rule}");
+        }
+    }
+
+    /// `entries`, each `(id, text)`, as a group of entries near one another,
+    /// each said `ago` seconds before `NOW`, and the last drifting.
+    fn group(entries: &[(u64, &str)]) -> Vec<Listed> {
+        let last = entries.len() - 1;
+        (entries.iter().enumerate())
+            .map(|(at, &(id, text))| {
+                let mut item = stale(id, text, &[]);
+                item.entry.kind = Kind::Decision;
+                item.entry.last_seen = NOW - 3600 * (entries.len() - at) as u64;
+                item.freshness = if at == last {
+                    memory::Freshness::Drifting
+                } else {
+                    memory::Freshness::Fresh
+                };
+                item.entry.names = vec!["ledger_retry".into()];
+                item.gone = (at == last)
+                    .then(|| "ledger_retry".to_string())
+                    .into_iter()
+                    .collect();
+                item
+            })
+            .collect()
+    }
+
+    const NOW: u64 = 1_000_000;
+
+    #[test]
+    fn groups_near_one_another_are_shown_by_their_ids_with_what_is_gone() {
+        let groups = [
+            group(&[
+                (2, "Idle stop is off\nby default"),
+                (7, "Idle stop is on by default"),
+            ]),
+            group(&[(5, "API_KEY=sk-abcdef123456 runs the ledger")]),
+        ];
+        let message = near_message(&groups, NOW);
+        assert!(
+            message.contains(
+                "Group 1:\n\
+                 - 2 (decision, said 2h ago) Idle stop is off by default [src/ledger.rs]\n\
+                 - 7 (decision, said 1h ago; drifting: some of what it names is gone from the \
+                 code: ledger_retry) Idle stop is on by default [src/ledger.rs]\n"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("Group 2:\n- 5 "), "{message}");
+        assert!(!message.contains("sk-abcdef123456"), "{message}");
+        assert!(RECONCILE_PROMPT.contains("When unsure, leave it out"));
+        let schema = reconcile_schema();
+        assert_eq!(
+            schema["properties"]["superseded"]["items"]["required"],
+            json!(["id", "how", "by", "text", "why"])
+        );
+        // Whole groups, as many as fit.
+        let sizes = |groups: &[Vec<u8>], most| -> Vec<usize> {
+            batches(groups, most)
+                .iter()
+                .map(|batch| batch.len())
+                .collect()
+        };
+        let groups = [vec![0; 3], vec![0; 2], vec![0; 4], vec![0; 9], vec![0; 1]];
+        assert_eq!(sizes(&groups, 5), [2, 1, 1, 1]);
+        assert_eq!(sizes(&groups, 40), [5]);
+        assert!(sizes(&[], 5).is_empty());
+    }
+
+    #[test]
+    fn what_no_longer_holds_is_checked_against_its_group_and_the_checkout() {
+        let dir = checkout();
+        std::fs::write(
+            dir.path().join("src/ledger.rs"),
+            "fn ledger_retry_twice() {}",
+        )
+        .unwrap();
+        let groups = [
+            group(&[
+                (2, "Idle stop is off"),
+                (7, "Idle stop is on"),
+                (8, "Idle stop spares"),
+            ]),
+            group(&[(4, "Use `ledger_retry`"), (9, "Calls are slow")]),
+        ];
+        let retire = |id: u64, by: Value, why: &str| {
+            let text = "";
+            json!({"id": id, "how": "retire", "by": by, "text": text, "why": why})
+        };
+        let update = |id: u64, text: &str| {
+            let why = "renamed";
+            json!({"id": id, "how": "update", "by": null, "text": text, "why": why})
+        };
+        let answer = json!({"superseded": [
+            retire(2, json!(7), "the default flipped"),
+            retire(9, json!(2), "another group's"),
+            retire(4, json!(4), "itself"),
+            retire(8, Value::Null, "none"),
+            update(4, "Use `ledger_retry_twice`"),
+            update(9, "Calls go through `ledger_sync`"),
+            update(9, "Calls are slow"),
+            retire(2, json!(8), "a second time"),
+            retire(3, json!(2), "not asked"),
+            retire(7, json!(8), "  "),
+            {"how": "retire"},
+        ]});
+        let (proposals, rejected) = proposals_in(&answer, &groups, dir.path());
+        assert_eq!(
+            proposals,
+            [
+                Proposal {
+                    id: 2,
+                    was: "Idle stop is off".into(),
+                    change: Change::Retire { by: 7 },
+                    why: "the default flipped".into(),
+                },
+                Proposal {
+                    id: 4,
+                    was: "Use `ledger_retry`".into(),
+                    change: Change::Update {
+                        text: "Use `ledger_retry_twice`".into()
+                    },
+                    why: "renamed".into(),
+                },
+            ]
+        );
+        assert_eq!(
+            rejected,
+            [
+                "entry 9: 2 isn't another entry of its group",
+                "entry 4: 4 isn't another entry of its group",
+                "entry 8: it's retired for no entry",
+                "entry 9: nothing it names is in the checkout",
+                "entry 9: its update says what it says",
+                "entry 2: a second time",
+                "entry 3: it wasn't one of those asked about",
+                "entry 7: it doesn't say why it no longer holds",
+                "one that says of no entry: {\"how\":\"retire\"}",
+            ]
+        );
+        // What holds in another's place has to hold itself.
+        let chained = json!({"superseded": [
+            retire(2, json!(7), "flipped"),
+            retire(7, json!(8), "flipped again"),
+        ]});
+        let (proposals, rejected) = proposals_in(&chained, &groups, dir.path());
+        assert_eq!(proposals.iter().map(|p| p.id).collect::<Vec<_>>(), [7]);
+        assert_eq!(rejected, ["entry 2: 7, in its place, is retired too"]);
     }
 }

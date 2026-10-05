@@ -11,7 +11,7 @@
 //! `ping`, `tools/list` and `tools/call`. It reads the memory's database
 //! itself, so it needs no daemon.
 
-use crate::memory::{self, Kind, Listed, Store, Wanted};
+use crate::memory::{self, Kind, Listed, Wanted};
 use crate::memory_cli;
 use crate::output;
 use crate::tui::sidebar::ago;
@@ -170,11 +170,7 @@ impl Server {
             })
             .context("say which entry, by its id")?;
         // Read in full, it's used, which keeps it from expiring.
-        let entry = Store::open(&self.socket)?
-            .used(&self.project, id)?
-            .with_context(|| memory_cli::no_entry(&self.socket, &self.project, id))?;
-        let item = memory::checked(entry, &self.project);
-        Ok(memory_cli::in_full(&item, now()))
+        memory_cli::shown(&self.socket, &self.project, id, true)
     }
 }
 
@@ -207,7 +203,8 @@ fn tools() -> Value {
                             [drifting] when some of what it names is gone from the code, or some \
                             of its files have changed since, and [stale] when all of what it \
                             names is gone, or every file it's about; the stale come after the \
-                            rest.",
+                            rest. Entries that stopped holding, another said in their place, \
+                            are never given.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -222,8 +219,10 @@ fn tools() -> Value {
         {
             "name": "memory_show",
             "description": "Read one entry of this project's memory in full, by the id \
-                            memory_search gives it: its text, files, where it came from, and \
-                            how often and how lately it was said.",
+                            memory_search gives it: its text, files, where it came from, how \
+                            often and how lately it was said, and what it said before it was \
+                            last updated. One that stopped holding is given as it was, with why \
+                            and the entry that holds in its place.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -266,7 +265,7 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{New, Source};
+    use crate::memory::{New, Source, Store};
 
     fn server() -> (tempfile::TempDir, Server) {
         let dir = tempfile::tempdir().unwrap();
@@ -400,6 +399,58 @@ mod tests {
         let result = call(&server, "memory_show", json!({"id": 9}));
         assert_eq!(result["isError"], true);
         assert_eq!(text(&result), "there's no entry 9");
+    }
+
+    #[test]
+    fn memory_show_gives_one_that_stopped_holding_as_it_was_and_search_never_does() {
+        let (_dir, server) = server();
+        let mut store = Store::open(&server.socket).unwrap();
+        let project = &server.project;
+        let new = New {
+            kind: Kind::Gotcha,
+            text: "The ledger tests start redis themselves".into(),
+            files: Vec::new(),
+            source: Source::User,
+            checkout: None,
+        };
+        store
+            .replace(project, new, 1, "they start it now", None)
+            .unwrap();
+        let shown = call(&server, "memory_show", json!({"id": 1}));
+        assert_eq!(shown["isError"], Value::Null);
+        let shown = text(&shown);
+        assert!(
+            shown.starts_with(
+                "1 · gotcha · retired just now: they start it now\n\
+                 3 holds in its place: The ledger tests start redis themselves\n\n\
+                 The ledger tests need redis up\n"
+            ),
+            "{shown}"
+        );
+        let found = call(&server, "memory_search", json!({"query": "ledger redis"}));
+        assert!(!text(&found).contains("need redis up"), "{}", text(&found));
+
+        let checkout = project.clone();
+        let reason = "cents are kept as integers";
+        let update = store.update(
+            project,
+            2,
+            "Fees are integers of cents",
+            None,
+            &[],
+            &checkout,
+            reason,
+        );
+        update.unwrap();
+        let shown = call(&server, "memory_show", json!({"id": 2}));
+        assert!(
+            text(&shown).ends_with(
+                "\nupdated just now: cents are kept as integers; it said before: Fees are kept in \
+                 cents"
+            ),
+            "{}",
+            text(&shown)
+        );
     }
 
     #[test]

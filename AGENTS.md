@@ -693,7 +693,13 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   as it said again, their words in a column of the index of their own (`merged_words`), and their vectors and
   the forgotten's (`apart_vectors`), so what was merged finds the one kept by its words and meaning and the
   reranker reads it with them, vectors that aren't numbers never kept and made again, the entries nearest in
-  meaning to what a session said, for the distiller,
+  meaning to what a session said, for the distiller, an entry that stopped holding as a
+  later one corrected it (`Superseded`): updated under its id (`update`) or retired for another
+  (`replace`, `retire`), kept apart as it was with why and when (the `superseded` table), out of everything
+  that reads the list but its words and vector, which find the one in its place as what's merged does, its words said again told it no longer holds (`Added::Outdated`), put back
+  (`restore`), and the entry holding in its place followed through retirements and merges (`holding`); a new
+  entry near one said before but not the same (`Added::Near`), and the entries near one another in groups
+  (`near`), for `crystal memory reconcile`,
   bringing in a project's JSON file from before, anchors (what an entry's text names that looks like code and
   was in its worktree's code when it was said, `names_in`, and each file's SHA-256 then) and whether an entry
   holds, fresh, drifting or stale, by what it names, looked up among the words of a worktree's files
@@ -724,10 +730,14 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   meaning to the last things the session said, merged with those about its task), to keep lessons alone and
   never progress, status or what's only true today, with entries of each, and asked about the entries gone
   stale that are about the files the work touched, to keep, reword or forget, and which of the notes it's shown
-  are lessons, to make them so; its answer checked against the checkout before it's kept, and what's there already in other
-  words seen again; and a pass over a
-  project's notes alone for the lessons among them (`lessons_among`), for `crystal memory kind --notes`
-- `src/mcp.rs`: `crystal mcp`: an MCP server over stdio with `memory_search` and `memory_show`, which every
+  are lessons, to make them so, and which of the entries it's shown what it keeps replaces, updated in its
+  place or retired, and why; its answer checked against the checkout before it's kept, and what's there already in other
+  words seen again; a pass over a
+  project's notes alone for the lessons among them (`lessons_among`), for `crystal memory kind --notes`; and
+  passes over groups of entries near one another for those another of the group shows no longer hold, each
+  to retire for it or to update (`superseded_among`), for `crystal memory reconcile`
+- `src/mcp.rs`: `crystal mcp`: an MCP server over stdio with `memory_search` and `memory_show` (an entry that
+  stopped holding as it was), which every
   Claude Code session crystal starts, in a terminal or a task in the background, is given with `--mcp-config`
   and its tools allowed
 - `src/embed.rs`: search by meaning: jina-embeddings-v5-text-small (its retrieval LoRA adapter folded into
@@ -757,9 +767,12 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   and how many), `show` (an agent's in a session finding it again, or where an entry merged went), `rm`
   (several ids, or what reads as status, listed until `--yes`), `kind` (entries' kinds by their ids, or the
   notes the distiller's model reads as lessons, listed until `--yes`), `export`, `distill` and `dedupe` (each
-  group under the one kept, merged with `--apply`) included, adding and deduping through the daemon, which
-  keeps the models loaded, and listing and exporting through it, which keeps each worktree's words, or here
-  without one, and an entry in full as `show` and the `memory_show` tool print it, with what's gone
+  group under the one kept, merged with `--apply`) included, `remember --replaces` and what's near what's
+  remembered, `retire`, `restore` and `list --superseded`, and `reconcile` (what the distiller's model
+  proposes no longer holds, kept beside the memory until `--apply` makes it so), adding, deduping and grouping
+  what's near through the daemon, which keeps the models loaded, and listing and exporting through it, which
+  keeps each worktree's words, or here without one, and an entry in full as `show` and the `memory_show`
+  tool print it, with what's gone, or one that stopped holding as it was, with what holds in its place
 - `src/profile.rs`: agent profiles: what one runs, its prompt and postfix around the task or alone with no
   task (`skip_task`), how it's meant to start (`launch`: a session, a task or a background task), checking it,
   and saving or removing one in the config file with `toml_edit`, so the user's comments and layout stay;
