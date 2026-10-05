@@ -654,12 +654,40 @@ pub struct MemorySettings {
     pub distill_model: String,
     /// The most it may spend on one task, in US dollars.
     pub distill_budget_usd: f64,
-    /// Search by what entries mean as well as by their words, with models
-    /// run on this machine: see [`crate::embed`].
+    /// Search by what entries mean as well as by their words: see
+    /// [`crate::embed`].
     pub embeddings: bool,
     /// Have the reranker read the best of a search again, putting what
     /// answers it first and leaving out what doesn't.
     pub rerank: bool,
+    /// Show Claude Code the entries about a file as it reads or edits it,
+    /// a few once per file: see [`crate::recall`].
+    pub recall_on_read: bool,
+    /// What turns entries and searches into vectors: the model run on this
+    /// machine, or Google's Gemini API, which entries' text goes to.
+    pub embedder: Embedder,
+    /// The Gemini API's model, as it names it.
+    pub gemini_model: String,
+    /// How many numbers each of its vectors has: one of
+    /// [`crate::gemini::DIMENSIONS`].
+    pub gemini_dimensions: u32,
+    /// The file its key is read from: see [`MemorySettings::gemini_key_file`].
+    /// Never the key itself, which this file, bundled by `crystal config
+    /// export`, mustn't hold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gemini_key_file: Option<PathBuf>,
+}
+
+/// What turns memory's entries and searches into vectors.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Embedder {
+    /// jina-embeddings-v5-text-small, run on this machine: see
+    /// [`crate::embed`].
+    #[default]
+    Local,
+    /// Google's Gemini API: see [`crate::gemini`].
+    Gemini,
 }
 
 impl Default for MemorySettings {
@@ -670,7 +698,51 @@ impl Default for MemorySettings {
             distill_budget_usd: 0.25,
             embeddings: true,
             rerank: true,
+            recall_on_read: true,
+            embedder: Embedder::Local,
+            gemini_model: crate::gemini::MODEL.to_string(),
+            gemini_dimensions: crate::gemini::DEFAULT_DIMENSIONS,
+            gemini_key_file: None,
         }
+    }
+}
+
+impl MemorySettings {
+    /// The file the Gemini API's key is read from: the one given, `~` its
+    /// home, or `gemini.key` beside the config file.
+    pub fn gemini_key_file(&self) -> PathBuf {
+        match &self.gemini_key_file {
+            Some(file) => crate::shell::expand_home(file),
+            None => path().with_file_name("gemini.key"),
+        }
+    }
+
+    /// Refuses a size of vector its thresholds weren't measured at, and a
+    /// key where the name of its file goes.
+    fn check(&self) -> Result<()> {
+        let sizes = crate::gemini::DIMENSIONS;
+        if !sizes.contains(&self.gemini_dimensions) {
+            bail!(
+                "[memory] gemini_dimensions is {}: it's one of {sizes:?}",
+                self.gemini_dimensions
+            );
+        }
+        if self.gemini_model.trim().is_empty() {
+            bail!(
+                "[memory] gemini_model is empty: leave it out for {}",
+                crate::gemini::MODEL
+            );
+        }
+        if let Some(file) = &self.gemini_key_file {
+            let file = file.to_string_lossy();
+            if crate::secrets::redact(&file) != file {
+                bail!(
+                    "[memory] gemini_key_file names a file, not the key: put the key in that \
+                     file, never here"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1393,6 +1465,7 @@ pub fn from_text(text: &str) -> Result<Config> {
     duration(&config.sessions.stop_idle_after).context("in [sessions], stop_idle_after")?;
     config.tasks.check()?;
     config.worktrees.check()?;
+    config.memory.check()?;
     Keymap::new(&config.keys).map_err(anyhow::Error::msg)?;
     if !SIDEBAR_WIDTHS.contains(&config.sidebar.width) {
         bail!(
@@ -1848,6 +1921,29 @@ back_to = "build"
     }
 
     #[test]
+    fn memory_embeds_here_unless_told_gemini_at_a_size_it_was_measured_at() {
+        let memory = parse("").unwrap().memory;
+        assert_eq!(memory.embedder, Embedder::Local);
+        assert_eq!(memory.gemini_model, "gemini-embedding-2");
+        assert_eq!(memory.gemini_dimensions, 768);
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let config = "[memory]\nembedder = \"gemini\"\ngemini_dimensions = 3072\n\
+                      gemini_key_file = \"~/keys/gemini\"\n";
+        let memory = parse(config).unwrap().memory;
+        assert_eq!(memory.embedder, Embedder::Gemini);
+        assert_eq!(memory.gemini_dimensions, 3072);
+        assert_eq!(memory.gemini_key_file(), home.join("keys/gemini"));
+        let err = parse("[memory]\ngemini_dimensions = 1024\n").unwrap_err();
+        assert!(format!("{err:#}").contains("[768, 1536, 3072]"), "{err:#}");
+        assert!(parse("[memory]\nembedder = \"openai\"\n").is_err());
+        // The key where its file's name goes is refused, and not repeated.
+        let fake = "AIzaSyFakeTestKey0123456789abcdefghijk";
+        let err = parse(&format!("[memory]\ngemini_key_file = \"{fake}\"\n")).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("never here") && !err.contains(fake), "{err}");
+    }
+
+    #[test]
     fn background_tasks_have_a_budget_each_and_none_a_day_unless_given() {
         let config = parse("").unwrap();
         assert_eq!(config.tasks.max_budget_usd, 5.0);
@@ -2206,6 +2302,11 @@ back_to = "build"
                 distill_budget_usd: 0.5,
                 embeddings: true,
                 rerank: false,
+                recall_on_read: false,
+                embedder: Embedder::Gemini,
+                gemini_model: "gemini-embedding-2".into(),
+                gemini_dimensions: 3072,
+                gemini_key_file: Some(PathBuf::from("~/keys/gemini.key")),
             },
             tasks: TaskSettings {
                 max_budget_usd: 2.5,

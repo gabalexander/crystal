@@ -23,8 +23,9 @@ made, `t1`, `t2`…, and stays open until it's closed, done or failed, with a li
   "<why>"`. crystal tells Claude Code how, on top of its system prompt, Codex in its developer instructions,
   and other agents at the top of their first prompt, opening with a line on where that comes from, so the
   agent doesn't take it for a stranger's instructions. Agents don't always remember to, Haiku least of all, so
-  the first time Claude Code ends a turn with its task still open, its Stop hook reminds it and it carries on:
-  to close the task, or, if it isn't through, to leave it open and end its turn. `-n <session>` closes another
+  the first time Claude Code ends a turn with its task still open, saying nothing that makes clear why, its Stop
+  hook reminds it and it carries on: to close the task if it's done, to ask you its question plainly if it needs
+  you, or to say what work of its own it waits on, which wakes it, and end its turn. `-n <session>` closes another
   session's task. A task isn't done while its worktree is in the middle of a rebase or a merge, stopped on
   conflicts say: `crystal done` refuses then and says so, until the agent finishes or aborts it; `--failed`
   closes it anyway.
@@ -36,15 +37,33 @@ made, `t1`, `t2`…, and stays open until it's closed, done or failed, with a li
 | State | Meaning |
 |---|---|
 | `pending` | made with `--no-launch`: nothing works on it yet |
-| `running` | its session is working on it |
-| `waiting` | its agent's turn ended with the task still open: it's asking you something |
+| `running` | its session is working on it, or its agent left it open waiting on something other than you |
+| `waiting` | its agent's turn ended with the task still open, asking you something |
 | `done` | closed done |
 | `failed` | closed failed, or its session ended while it was open, leaving nobody who could close it |
 | `cancelled` | you cancelled it, or killed its session while it was open |
 
-A turn that ends with the task still open, once the agent has been reminded, is a question for you: the session
-waits on you (`▲`, and `u` finds it) until its agent works again, and its task line says so. So does a
-background task you interrupted. A program that exits with its task open fails it, saying how it ended; `crystal
+Whether a turn that ends with the task still open needs you goes by what the agent said last, which Claude
+Code's Stop hook gives, read with no model:
+
+- A question, or a request: a choice, a decision, an approval, a file, access, or a command for you to run. The
+  session waits on you (`▲`, pinned, `u` finds it, and you're told) until its agent works again, and its task
+  line says so. It isn't reminded first: it asked.
+- A plain statement that it waits on something else: "waiting on CI, not on you", "I'll pick up when the tests
+  finish". The task stays open and the session sits idle, marked `◇`: not pinned, not told of, not found by
+  `u` or `U`. With work of its own still running that wakes it, the turn is held as working instead (see
+  [what an agent is doing](agents.md#what-an-agent-is-doing)).
+- Anything else, like a summary that doesn't close the task, is unclear: it's reminded once, and if its next turn
+  ends as unclear, it waits on you. So does a turn whose end its hooks didn't give, from another agent or an
+  older Claude Code.
+
+Of the 27 turns crystal's own log had marked as waiting on the user, none asked anything: 25 waited on their
+tests, CI, a helper or a subagent, and two were one finished report the agent didn't close. The rule reads 24 of
+them as waiting on something else, and 25 had work of their own running that holds them; together they leave
+out 25, and the finished report still tells you. Over the 472 turn ends a person answered next, it took none
+that asked for one that didn't.
+
+A background task you interrupted waits on you too. A program that exits with its task open fails it, saying how it ended; `crystal
 respawn` opens it again, under the same number.
 
 The sidebar shows a task under its session: what it was asked to do while it's open, `▲` when it waits on you,

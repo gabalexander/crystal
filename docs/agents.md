@@ -42,6 +42,15 @@ end of it; with none within a minute, the turn is over. Subagents that show no s
 none starting or stopping, no tool finishing, no permission asked for, are taken for gone, and the turn is over
 too.
 
+So with the rest of the work Claude Code wakes the agent for, as its Stop hook lists it (`background_tasks` and
+`session_crons`): a command it runs in the background, like a test suite, a Monitor watching CI, a wakeup it
+scheduled (`ScheduleWakeup`, `CronCreate`, `/loop`), or another task Claude Code keeps for it. A turn that ends
+with any of it to come reads as working, its row says on what (`in the background: cargo test`, `watching: CI
+checks`), and it tells you nothing, until a turn of the agent's own starts as that work wakes it; that turn's
+end is held again if some is still to come. If the agent never wakes, the turn is over once the longest the work
+can take has passed, and a minute more: two hours for a command, an hour for a Monitor or a wakeup. A turn whose
+last message asks you something is never held: you're told at once, whatever runs.
+
 ## Agents you start yourself
 
 A Claude Code or Codex you start yourself, typed into a session's shell, has no hooks of crystal's: crystal

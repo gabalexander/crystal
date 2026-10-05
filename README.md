@@ -110,14 +110,14 @@ what to start, the keys that matter most and what agents call.
 | [Installing crystal](docs/install.md) | the install script, Homebrew and Nix, building from source, updating, shell completions |
 | [The TUI](docs/tui.md) | the sidebar and what each row says, `/`, splits and floats, tabs, layouts, copy mode, the mouse and links |
 | [Keys and commands](docs/keys.md) | every key, in the sidebar, a pane, a view and a text box; `[keys]`, keys of your own and the command list |
-| [Sessions](docs/sessions.md) | the new-session panel, restarts, archiving and idle agents, notifications and sounds, RAM |
+| [Sessions](docs/sessions.md) | the new-session panel, restarts, archiving and idle agents, notifications and sounds, resources |
 | [Projects and worktrees](docs/worktrees.md) | making, moving into and removing worktrees, their hooks, projects' commands, the branch switcher |
 | [Diffs, files and pull requests](docs/code.md) | the diff, pull requests and issues on GitHub and GitLab, the file finder, find in files, `crystal open` |
 | [Agents](docs/agents.md) | hooks and screen reading, `crystal integration`, Codex, agent rules, and `crystal report` for any agent |
 | [Agents driving agents](docs/driving.md) | `send`, `wait`, `read`, streams, `ls --json`, laying out the TUI, and the skill for Claude Code |
 | [Tasks and the backlog](docs/tasks.md) | tasks and `crystal done`, handoff notes and kept files, background tasks, the backlog |
 | [Flows](docs/flows.md) | chains of tasks on one goal, with gates where you look before it goes on |
-| [Memory](docs/memory.md) | what a project's sessions learned, search by meaning, and the distiller |
+| [Memory](docs/memory.md) | what a project's sessions learned, what an agent is shown, search by meaning (here or with Gemini), the distiller |
 | [Events and the timeline](docs/events.md) | the event log, `crystal events`, listening on the socket, and the timeline |
 | [Plugins](docs/plugins.md) | crystal's own and yours: actions, panes, hooks on events, link handlers, and the list of events |
 | [Settings](docs/configuration.md) | every setting, backups, themes, the tab bar and the window, the settings view, profiles |

@@ -200,7 +200,7 @@ impl Crystal {
         command.arg(&self.socket);
         command.args(args);
         command.cwd(self.dir.path());
-        for variable in crystal_variables() {
+        for variable in crystal_variables().into_iter().chain(gemini_keys()) {
             command.env_remove(variable);
         }
         // A notification's click brings the TUI's terminal to the front by
@@ -497,11 +497,18 @@ fn crystal_variables() -> Vec<std::ffi::OsString> {
         .collect()
 }
 
-/// A command for `program`, without [`crystal_variables`]: how every test
-/// runs anything.
+/// The variables crystal reads Gemini's key from: a test that searches
+/// memory through Gemini gives its fake one in a file, so the developer's
+/// own never reaches a test's daemon, nor a server.
+fn gemini_keys() -> Vec<std::ffi::OsString> {
+    vec!["GEMINI_API_KEY".into(), "GOOGLE_API_KEY".into()]
+}
+
+/// A command for `program`, without [`crystal_variables`] or
+/// [`gemini_keys`]: how every test runs anything.
 fn outside_crystal(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
-    for variable in crystal_variables() {
+    for variable in crystal_variables().into_iter().chain(gemini_keys()) {
         command.env_remove(variable);
     }
     command
@@ -1903,7 +1910,7 @@ fn q_asks_before_it_quits_unless_the_settings_say_not_to() {
 }
 
 #[test]
-fn hash_shows_the_memory_each_session_takes() {
+fn hash_shows_the_memory_and_cpu_each_session_takes() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "stays", "sleep", "30"]);
     crystal.ok(&["new", "-n", "other", "sleep", "30"]);
@@ -1911,11 +1918,19 @@ fn hash_shows_the_memory_each_session_takes() {
     let mut tui = crystal.tui();
     tui.shows("❯ stays");
     tui.type_keys("#");
-    tui.shows(" RAM · ");
+    tui.shows(" Resources · RAM ");
+    tui.shows(" of a core");
+    tui.shows("RAM↓");
     tui.shows("1 process");
     tui.shows("crystal itself");
     tui.shows("the daemon");
     tui.shows("this TUI");
+    // `s` puts the busiest first, and back.
+    tui.type_keys("s");
+    tui.shows("CPU↓");
+    tui.shows("s by RAM");
+    tui.type_keys("s");
+    tui.shows("RAM↓");
     // Enter goes to the session the bar is on.
     tui.type_keys("j\r");
     tui.hides("crystal itself");
@@ -8696,6 +8711,54 @@ fn ls_json_lists_every_session_with_its_status() {
 }
 
 #[test]
+fn usage_counts_each_session_s_memory_and_cpu_and_crystal_s_own() {
+    let crystal = Crystal::new();
+    let said = crystal.fails(&["usage"]);
+    assert!(said.contains("no daemon is running"), "{said}");
+
+    crystal.ok(&["new", "-n", "busy", "sh", "-c", "while :; do :; done"]);
+    crystal.ok(&["new", "-n", "idle", "sleep", "30"]);
+    // The daemon hasn't looked before: it looks twice, half a second apart.
+    let json = crystal.ok(&["usage", "--json"]);
+    let usage: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(usage["cpu_over_ms"].as_u64().unwrap() >= 500, "{json}");
+    let session = |name: &str| {
+        let sessions = usage["sessions"].as_array().unwrap();
+        let found = sessions.iter().find(|session| session["name"] == name);
+        found.unwrap()["usage"].clone()
+    };
+    let (busy, idle) = (session("busy"), session("idle"));
+    assert_eq!(busy["pid"], crystal.pid("busy"));
+    assert_eq!(idle["pid"], crystal.pid("idle"));
+    assert!(busy["bytes"].as_u64().unwrap() > 0, "{json}");
+    assert!(busy["processes"].as_u64().unwrap() >= 1, "{json}");
+    // A shell spinning keeps a core busy, as much of it as the machine
+    // gives it; `sleep` keeps none.
+    assert!(busy["cpu"].as_f64().unwrap() > 10.0, "{json}");
+    assert!(idle["cpu"].as_f64().unwrap() < busy["cpu"].as_f64().unwrap());
+    assert!(usage["daemon"]["bytes"].as_u64().unwrap() > 0, "{json}");
+    assert!(usage["machine"]["cores"].as_u64().unwrap() > 0, "{json}");
+    assert!(usage["machine"]["bytes"].as_u64().unwrap() > 0, "{json}");
+    let (own, all) = (&usage["crystal"], &usage["all"]);
+    assert!(all["bytes"].as_u64() > own["bytes"].as_u64(), "{json}");
+    assert!(all["processes"].as_u64().unwrap() >= 3, "{json}");
+
+    // The table, the busiest first.
+    let table = crystal.ok(&["usage", "--sort", "cpu"]);
+    let lines: Vec<Vec<&str>> = table
+        .lines()
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert_eq!(lines[0], ["NAME", "KIND", "PID", "PROCESSES", "RAM", "CPU"]);
+    assert_eq!(lines[1][..2], ["busy", "session"], "{table}");
+    assert!(
+        lines.iter().any(|line| line[..2] == ["crystal", "daemon"]),
+        "{table}"
+    );
+    assert_eq!(lines.last().unwrap()[..2], ["all", "total"], "{table}");
+}
+
+#[test]
 fn skill_install_writes_the_skill_and_keeps_a_changed_one() {
     let crystal = Crystal::new();
     let install = |args: &[&str]| crystal.run(args);
@@ -9089,6 +9152,197 @@ fn what_its_worktree_changed_comes_first_in_what_an_agent_is_shown() {
         ),
         "{args}"
     );
+}
+
+/// Google's Gemini API, as memory asks it for vectors, on a web server of
+/// the test's own: each text's vector is 768 numbers, all naught but the
+/// one for what it's about, the database, deploys, or anything else; or,
+/// once it's told to, a 429. It keeps each request's head and body.
+struct FakeGemini {
+    url: String,
+    asked: Arc<Mutex<Vec<(String, String)>>>,
+    out_of_quota: Arc<Mutex<bool>>,
+}
+
+impl FakeGemini {
+    fn new() -> FakeGemini {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1beta", listener.local_addr().unwrap());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let out_of_quota = Arc::new(Mutex::new(false));
+        let (kept, quota) = (asked.clone(), out_of_quota.clone());
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let (head, body) = read_request(&stream);
+                kept.lock().unwrap().push((head, body.clone()));
+                let (code, reply) = match *quota.lock().unwrap() {
+                    true => (
+                        429,
+                        r#"{"error": {"code": 429, "message": "Quota exceeded.",
+                            "status": "RESOURCE_EXHAUSTED"}}"#
+                            .to_string(),
+                    ),
+                    false => (200, fake_vectors(&body)),
+                };
+                let mut stream = stream;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        FakeGemini {
+            url,
+            asked,
+            out_of_quota,
+        }
+    }
+
+    fn asked(&self) -> Vec<(String, String)> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+/// An HTTP request's head and body.
+fn read_request(stream: &std::net::TcpStream) -> (String, String) {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+    let (mut head, mut length) = (String::new(), 0);
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+            length = value.trim().parse().unwrap();
+        }
+        head.push_str(&line);
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+    (head, String::from_utf8(body).unwrap())
+}
+
+/// What the fake Gemini answers a `batchEmbedContents` with.
+fn fake_vectors(body: &str) -> String {
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    let requests = body["requests"].as_array().unwrap();
+    let embeddings: Vec<serde_json::Value> = requests
+        .iter()
+        .map(|request| {
+            let text = request["content"]["parts"][0]["text"].as_str().unwrap();
+            let text = text.to_lowercase();
+            let about = if text.contains("database") || text.contains("postgres") {
+                0
+            } else if text.contains("deploy") || text.contains("release") {
+                1
+            } else {
+                2
+            };
+            let mut values = vec![0.0; 768];
+            values[about] = 1.0;
+            serde_json::json!({ "values": values })
+        })
+        .collect();
+    serde_json::json!({
+        "embeddings": embeddings,
+        "usageMetadata": {"promptTokenCount": requests.len() * 10},
+    })
+    .to_string()
+}
+
+#[test]
+fn memory_searches_by_meaning_through_gemini_with_the_key_from_its_file_alone() {
+    let gemini = FakeGemini::new();
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    let key_file = crystal.dir.path().join("gemini.key");
+    std::fs::write(&key_file, "AQ.fake-key-for-the-e2e-test\n").unwrap();
+    crystal.configure(&format!(
+        "notify = false\nname_by_agent = false\n\n[memory]\ndistill = false\n\
+         embedder = \"gemini\"\ngemini_key_file = \"{}\"\n",
+        key_file.display()
+    ));
+    let run = |args: &[&str]| {
+        let out = crystal
+            .command(args)
+            .env("CRYSTAL_GEMINI_URL", &gemini.url)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "crystal {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    // A daemon to ask, which keeps how Gemini last answered.
+    run(&["new", "-d", "-n", "here", "sleep", "30"]);
+    run(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "Postgres has to be up for the ledger tests",
+    ]);
+    run(&["remember", "-C", repo_dir, "Deploys go out on Tuesdays"]);
+    // Not a word in common: found by what it means, Gemini says.
+    let found = run(&["memory", "-C", repo_dir, "search", "start the database"]);
+    assert!(found.contains("Postgres has to be up"), "{found}");
+    assert!(!found.contains("Deploys"), "{found}");
+    let asked = gemini.asked();
+    assert!(!asked.is_empty());
+    for (head, body) in &asked {
+        let request_line = head.lines().next().unwrap();
+        assert_eq!(
+            request_line,
+            "POST /v1beta/models/gemini-embedding-2:batchEmbedContents HTTP/1.1"
+        );
+        assert!(
+            head.contains("x-goog-api-key: AQ.fake-key-for-the-e2e-test\r\n"),
+            "{head}"
+        );
+        assert!(body.contains("\"outputDimensionality\":768"), "{body}");
+    }
+    let bodies: String = asked.iter().map(|(_, body)| body.as_str()).collect();
+    assert!(bodies.contains("title: none | text: Postgres has to be up"));
+    assert!(bodies.contains("| query: start the database"));
+    let status = run(&["memory", "status"]);
+    assert!(
+        status.contains("by gemini-embedding-2@768 through Google's Gemini API"),
+        "{status}"
+    );
+    assert!(
+        status.contains("entries' text and searches go to Google"),
+        "{status}"
+    );
+    assert!(
+        status.contains(&format!("key               {}", key_file.display())),
+        "{status}"
+    );
+    assert!(
+        status.contains("2 of 2 have their vector from gemini-embedding-2@768"),
+        "{status}"
+    );
+    let config = std::fs::read_to_string(crystal.config_file()).unwrap();
+    assert!(!config.contains("AQ.fake"), "the key stays in its file");
+
+    // Out of quota: a search goes by its words, and a remember still
+    // keeps its entry; the status says why.
+    *gemini.out_of_quota.lock().unwrap() = true;
+    let found = run(&["memory", "-C", repo_dir, "search", "ledger outage"]);
+    assert!(found.contains("Postgres has to be up"), "{found}");
+    let remembered = run(&["remember", "-C", repo_dir, "Releases are tagged by hand"]);
+    assert!(remembered.starts_with("remembered 3"), "{remembered}");
+    let status = run(&["memory", "status"]);
+    assert!(
+        status.contains("Quota exceeded. (RESOURCE_EXHAUSTED); searches go by words meanwhile"),
+        "{status}"
+    );
+    let tried = gemini.asked().len();
+    run(&["memory", "-C", repo_dir, "search", "another outage"]);
+    assert_eq!(gemini.asked().len(), tried, "it rests after a 429");
 }
 
 #[test]
@@ -12434,6 +12688,80 @@ fn an_agent_that_ends_its_turn_with_its_task_open_is_reminded_once() {
 }
 
 #[test]
+fn an_agent_waiting_on_its_own_work_works_on_and_only_a_question_waits_on_the_user() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let out = crystal
+        .command(&["new", "-d", "-n", "agent", "claude", "fix the tests"])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let hook = format!("{CRYSTAL} hook claude");
+    let session = [("CRYSTAL_SESSION", "agent")];
+    let says = |event: &serde_json::Value| hook_says(&crystal, &session, &hook, &event.to_string());
+    let status = || crystal.row("agent").unwrap()[1].clone();
+    let prompt = serde_json::json!({"hook_event_name": "UserPromptSubmit"});
+    let stop = |said: &str, tasks: serde_json::Value| {
+        serde_json::json!({
+            "hook_event_name": "Stop",
+            "last_assistant_message": said,
+            "background_tasks": tasks,
+            "session_crons": [],
+        })
+    };
+    let waits_on_user = || {
+        let events = crystal.ok(&["events", "-k", "task.waiting"]);
+        !events.trim().is_empty()
+    };
+    assert_eq!(says(&prompt), "");
+
+    // Its turn ends with its tests running in the background: it's still at
+    // work on them, not reminded of its task, which doesn't wait on the
+    // user, and its row says what runs.
+    let tests = serde_json::json!([{"id": "b1", "type": "shell", "status": "running",
+                                    "description": "Run the full test suite",
+                                    "command": "cargo test"}]);
+    let waiting = "The tests run in the background; I'll pick up when they finish.";
+    assert_eq!(says(&stop(waiting, tests)), "", "not reminded");
+    assert_eq!(status(), "working");
+    let row = listed(&crystal, "agent");
+    assert_eq!(row["task"]["waiting"], false);
+    assert_eq!(row["line"], "in the background: Run the full test suite");
+    let idle = serde_json::json!({"hook_event_name": "Notification",
+                                  "notification_type": "idle_prompt"});
+    assert_eq!(says(&idle), "");
+    assert_eq!(status(), "working", "its prompt back says nothing");
+
+    // Woken as they end, it opens the PR and ends saying it waits on CI,
+    // nothing of its own running: its task stays open, the session idle,
+    // needing nobody.
+    assert_eq!(says(&prompt), "");
+    let ci = "PR #7 is open. I'm waiting on CI, not on you.";
+    assert_eq!(says(&stop(ci, serde_json::json!([]))), "", "not reminded");
+    assert_eq!(status(), "idle");
+    let row = listed(&crystal, "agent");
+    assert_eq!(
+        (&row["task"]["waiting"], &row["line"]),
+        (&false.into(), &serde_json::Value::Null)
+    );
+    assert!(crystal.ok(&["tasks"]).starts_with("t1    running    agent"));
+    assert!(!waits_on_user());
+
+    // Then it asks something: it waits on the user, and isn't reminded first.
+    assert_eq!(says(&prompt), "");
+    let question = "CI is green. Should I merge it?";
+    assert_eq!(
+        says(&stop(question, serde_json::json!([]))),
+        "",
+        "not reminded"
+    );
+    assert_eq!(status(), "waiting");
+    assert_eq!(listed(&crystal, "agent")["task"]["waiting"], true);
+    assert!(waits_on_user());
+}
+
+#[test]
 fn an_agent_whose_subagents_still_run_as_its_turn_ends_works_on() {
     let crystal = Crystal::new();
     let bin = fake_claude(crystal.dir.path());
@@ -13824,7 +14152,8 @@ const ALLOWED_WITH_MEMORY: &str = concat!(
     backlog_and_handoff_rules!(),
     ",Bash(crystal remember:*),Bash(crystal memory),Bash(crystal memory add:*),\
      Bash(crystal memory list:*),Bash(crystal memory search:*),\
-     Bash(crystal memory show:*),mcp__crystal__memory_search,mcp__crystal__memory_show"
+     Bash(crystal memory show:*),Bash(crystal memory retire:*),mcp__crystal__memory_search,\
+     mcp__crystal__memory_show"
 );
 
 #[test]
@@ -14072,6 +14401,170 @@ fn the_distiller_makes_the_notes_it_was_shown_that_are_lessons_lessons() {
     );
 }
 
+#[test]
+fn the_distiller_puts_what_it_keeps_in_place_of_what_no_longer_holds() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    let memory = |args: &[&str]| crystal.ok(&[&["memory", "-C", repo_dir], args].concat());
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "gotcha",
+        "The ledger tests need redis started by hand",
+    ]);
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "command",
+        "make ledger runs the ledger tests",
+    ]);
+    let bin = distilling_claude_answering(
+        crystal.dir.path(),
+        r#"{"entries":[{"kind":"gotcha","text":"The ledger tests start redis themselves","files":[],"replaces":{"id":1,"how":"retire","why":"the tests start redis now"}},{"kind":"command","text":"make test-ledger runs the ledger tests","files":[],"replaces":{"id":2,"how":"update","why":"the target was renamed"}}],"rechecked":[],"kinds":[]}"#,
+    );
+    start_fixer(&crystal, &repo, &bin);
+
+    eventually("the pass is told of", || {
+        crystal
+            .ok(&["events", "-k", "memory.distilled"])
+            .contains("1 added, 2 superseded")
+    });
+    // It was shown them by their ids, to say which it replaces.
+    let message = std::fs::read_to_string(repo.join("distill-message")).unwrap();
+    assert!(
+        message.contains("- 1 (gotcha) The ledger tests need redis started by hand\n"),
+        "{message}"
+    );
+    let listed = memory(&[]);
+    assert!(
+        listed.contains("The ledger tests start redis themselves"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains("make test-ledger runs the ledger tests"),
+        "{listed}"
+    );
+    assert!(!listed.contains("by hand"), "{listed}");
+    let superseded = memory(&["list", "--superseded"]);
+    assert!(
+        superseded.contains("redis started by hand  [→ 3: the tests start redis now]"),
+        "{superseded}"
+    );
+    assert!(
+        superseded.contains("make ledger runs the ledger tests  [updated: the target was renamed]"),
+        "{superseded}"
+    );
+    let told = crystal.ok(&["events", "-k", "memory.superseded"]);
+    assert!(
+        told.contains("1 (gotcha) The ledger tests need redis started by hand → 3"),
+        "{told}"
+    );
+    assert!(
+        told.contains("2 (command) make ledger runs the ledger tests updated"),
+        "{told}"
+    );
+    let shown = memory(&["show", "2"]);
+    assert!(
+        shown.ends_with(
+            "updated just now: the target was renamed; it said before: make ledger runs the \
+             ledger tests\n"
+        ),
+        "{shown}"
+    );
+}
+
+#[test]
+fn an_entry_remembered_in_place_of_another_retires_it_until_it_s_put_back() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    let memory = |args: &[&str]| crystal.ok(&[&["memory", "-C", repo_dir], args].concat());
+    // A daemon to tell what changes, for its log.
+    crystal.ok(&["new", "-d", "-n", "here", "sleep", "30"]);
+    let remember = |args: &[&str]| crystal.ok(&[&["remember", "-C", repo_dir], args].concat());
+    remember(&["-k", "decision", "Idle stop is off by default"]);
+    remember(&["Sessions keep their names"]);
+    assert_eq!(
+        remember(&[
+            "-k",
+            "decision",
+            "--replaces",
+            "1",
+            "--why",
+            "the default flipped",
+            "Idle stop is on by default",
+        ]),
+        "remembered 3, in place of 1\n"
+    );
+    let listed = memory(&[]);
+    assert_eq!(listed.lines().count(), 2, "{listed}");
+    assert!(!listed.contains("off by default"), "{listed}");
+    let superseded = memory(&["list", "--superseded"]);
+    assert!(
+        superseded.contains("Idle stop is off by default  [→ 3: the default flipped]"),
+        "{superseded}"
+    );
+    let shown = memory(&["show", "1"]);
+    assert!(
+        shown.starts_with(
+            "1 · decision · retired just now: the default flipped\n\
+             3 holds in its place: Idle stop is on by default\n"
+        ),
+        "{shown}"
+    );
+    let found = memory(&["search", "idle", "stop"]);
+    assert!(!found.contains("off by default"), "{found}");
+
+    // Said again, it isn't remembered, and says what holds now.
+    let again = crystal.fails(&["remember", "-C", repo_dir, "idle stop is OFF by default"]);
+    assert!(
+        again.contains("entry 1 said that, and it stopped holding just now: the default flipped"),
+        "{again}"
+    );
+    assert!(
+        again.contains("3 holds in its place: Idle stop is on by default"),
+        "{again}"
+    );
+    assert!(again.contains("`crystal memory restore 1`"), "{again}");
+    let told = crystal.ok(&["events", "-k", "memory.superseded"]);
+    assert!(
+        told.contains("1 (decision) Idle stop is off by default → 3: the default flipped"),
+        "{told}"
+    );
+
+    // Retired for one there already, by hand.
+    assert_eq!(
+        memory(&["retire", "2", "--by", "3", "--why", "wrong"]),
+        "retired 2: Sessions keep their names\n3 holds in its place: Idle stop is on by default\n"
+    );
+    let refused = crystal.fails(&["memory", "-C", repo_dir, "retire", "3", "--by", "1"]);
+    assert!(
+        refused.contains("no entry 1 to hold in its place"),
+        "{refused}"
+    );
+
+    // Put back, as it was.
+    assert_eq!(
+        memory(&["restore", "1"]),
+        "put 1 back: Idle stop is off by default\n"
+    );
+    assert!(memory(&[]).contains("1  decision"), "{}", memory(&[]));
+    let restored = crystal.ok(&["events", "-k", "memory.restored"]);
+    assert!(
+        restored.contains("1 (decision) Idle stop is off by default"),
+        "{restored}"
+    );
+    let twice = crystal.fails(&["memory", "-C", repo_dir, "restore", "1"]);
+    assert!(twice.contains("never stopped holding"), "{twice}");
+
+    // Only the models tell which entries are near one another.
+    let refused = crystal.fails(&["memory", "-C", repo_dir, "reconcile"]);
+    assert!(refused.contains("`crystal memory embed`"), "{refused}");
+}
+
 /// A stand-in for Claude as it reads a project's notes for the lessons
 /// among them: it writes its message to `notes-message`, and says note 1
 /// is a gotcha and note 3, which it wasn't asked about, a decision.
@@ -14185,6 +14678,131 @@ fn a_session_with_nothing_to_read_can_t_be_distilled() {
     assert!(
         refused.contains("left nothing the distiller can read"),
         "{refused}"
+    );
+}
+
+/// What crystal's hook adds for Claude Code as it reads or edits `file`
+/// in the session called `session`, with `tool`: nothing, or what Claude
+/// reads beside what the tool gives it.
+fn told_about_file(
+    crystal: &Crystal,
+    session: &str,
+    hook: &str,
+    tool: &str,
+    file: &Path,
+) -> String {
+    let event = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "conv-1",
+        "tool_name": tool,
+        "tool_input": {"file_path": file},
+    });
+    let said = hook_says(
+        crystal,
+        &[("CRYSTAL_SESSION", session)],
+        hook,
+        &event.to_string(),
+    );
+    if said.is_empty() {
+        return said;
+    }
+    let said: serde_json::Value = serde_json::from_str(&said).unwrap();
+    assert_eq!(said["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    said["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn claude_is_shown_what_its_project_remembered_about_a_file_as_it_reads_it() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    std::fs::create_dir(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/ledger.rs"), "fn round_cents() {}").unwrap();
+    std::fs::write(repo.join("src/fees.rs"), "fn fee() {}").unwrap();
+    for (kind, file, text) in [
+        (
+            "gotcha",
+            "src/ledger.rs",
+            "The ledger tests need the database up",
+        ),
+        ("note", "src/ledger.rs", "Fees are rounded half up"),
+        ("gotcha", "", "Rounding goes through `round_cents`"),
+        ("decision", "src/fees.rs", "Fees are kept in cents"),
+    ] {
+        let mut args = vec!["remember", "-C", repo_dir, "-k", kind, text];
+        if !file.is_empty() {
+            args.extend(["-f", file]);
+        }
+        crystal.ok(&args);
+    }
+    let bin = fake_claude(crystal.dir.path());
+    let out = crystal
+        .command(&[
+            "new",
+            "-n",
+            "agent",
+            "-c",
+            repo_dir,
+            "claude",
+            "fix the database setup",
+        ])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let args = written(&repo.join("args"));
+    assert!(
+        args.contains("\n- 1 (gotcha) The ledger tests need the database up [src/ledger.rs]\n"),
+        "{args}"
+    );
+    let settings = claude_settings(&args);
+    let before = &settings["hooks"]["PreToolUse"][0];
+    assert_eq!(before["matcher"], "Read|Edit|Write|MultiEdit|NotebookEdit");
+    let hook = before["hooks"][0]["command"].as_str().unwrap();
+
+    // Reading the ledger, it's told what it wasn't as it started: the
+    // lesson naming what's in it first, then the note about it.
+    let ledger = repo.join("src/ledger.rs");
+    assert_eq!(
+        told_about_file(&crystal, "agent", hook, "Read", &ledger),
+        "What this project's earlier sessions learned about src/ledger.rs:\n\
+         - 3 (gotcha) Rounding goes through `round_cents`\n\
+         - 2 (note) Fees are rounded half up\n\
+         The memory_show tool reads one in full."
+    );
+    // Once a file.
+    assert_eq!(
+        told_about_file(&crystal, "agent", hook, "Edit", &ledger),
+        ""
+    );
+    // Nothing from outside the project, nor for another tool.
+    let outside = crystal.dir.path().join("notes.md");
+    assert_eq!(
+        told_about_file(&crystal, "agent", hook, "Write", &outside),
+        ""
+    );
+    let fees = repo.join("src/fees.rs");
+    assert_eq!(told_about_file(&crystal, "agent", hook, "Bash", &fees), "");
+
+    // Switched off, nothing; switched on again, it's told as before.
+    crystal
+        .configure("notify = false\nname_by_agent = false\n\n[memory]\nrecall_on_read = false\n");
+    assert_eq!(told_about_file(&crystal, "agent", hook, "Read", &fees), "");
+    crystal.configure("notify = false\nname_by_agent = false\n");
+    assert_eq!(
+        told_about_file(&crystal, "agent", hook, "Read", &fees),
+        "What this project's earlier sessions learned about src/fees.rs:\n\
+         - 4 (decision) Fees are kept in cents\n\
+         The memory_show tool reads one in full."
+    );
+
+    // What it was shown goes with it through a handover.
+    crystal.ok(&["restart-server"]);
+    assert_eq!(
+        told_about_file(&crystal, "agent", hook, "Read", &ledger),
+        ""
     );
 }
 

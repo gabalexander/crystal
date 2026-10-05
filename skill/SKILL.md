@@ -134,8 +134,10 @@ crystal done "Wrote the plan" --artifact docs/plan.md
   refuses the close and says why; the task stays open, so fix the call and run it again.
 - `crystal done` refuses while your worktree is in the middle of a rebase or a merge, stopped on conflicts
   say: the work isn't done then. Finish it or abort it, then close the task; `--failed` closes it anyway.
-- End a turn with your task still open and crystal reminds you, once. Close it then if you're through;
-  if you're waiting on the user, leave it open and end your turn.
+- End a turn with your task still open without saying why and crystal reminds you, once. Close it if you're
+  through. If you need the user, ask them your question plainly: only a question pins your session for them.
+  If you're waiting on work of your own, a command in the background, a Monitor (say on CI) or a subagent, say
+  what and end your turn: crystal shows you working until it wakes you, and doesn't remind you.
 - An agent you start with a prompt (`crystal new -d claude "…"`, or `-t "…"` for any command) is given a task.
   `crystal ls --json` shows it: `task.id`, `task.goal`, and once closed, `task.outcome` with `failed`,
   `cancelled` and `summary`.
@@ -324,7 +326,13 @@ crystal memory search ledger -k gotcha -f tests   # of a kind, about the files i
   expired entries; `--all` brings them back.
 - An entry's first line is what lists show of it; `--title` gives it one of its own, over the rest.
 - What the memory has already, in the same words or with search by meaning on in others, is that entry seen
-  again, not a new one: `remembered 12 already, in other words: <what 12 says>`. Nothing more to do.
+  again, not a new one: `remembered 12 already, in other words: <what 12 says>`. Nothing more to do, unless
+  yours corrects it rather than says it again: then add `--replaces 12`.
+- When what you learned corrects an entry (a default that changed, a decision reversed, a command renamed),
+  remember it in its place: `crystal remember --replaces 12 --why "<what changed>" "<what holds now>"`. The
+  old one is retired: kept out of searches and what sessions are shown, and `crystal memory show 12` says
+  what replaced it. One remembered near another says so (`near 12: <what 12 says>`); if yours replaces it,
+  `crystal memory retire 12 --by <yours>`. Never retire an entry that still holds.
 - In a Claude Code session crystal started, the `memory_search` and `memory_show` tools search the memory and
   read an entry by its id without a shell command; use them when you have them.
 - `crystal memory` lists every entry; `crystal memory show <id>` reads one in full; `crystal memory rm <id>`

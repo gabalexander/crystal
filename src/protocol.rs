@@ -71,6 +71,25 @@ pub enum Request {
         /// just did: it isn't idle meanwhile.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wakeup: Option<Wakeup>,
+        /// What the agent said last as its turn ended, when its hooks say:
+        /// whether it asks the user anything goes by it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        said: Option<String>,
+        /// The work of its own still to come as its turn ended, which wakes
+        /// it, when its hooks say: none when they say there's none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending: Option<Vec<Pending>>,
+    },
+    /// Claude Code in a session is about to read or edit `file`, by its
+    /// path as the agent gave it, its hook says: what its project's memory
+    /// has about it that the session hasn't been shown, if anything, comes
+    /// back as [`Response::Context`]. See [`crate::recall`].
+    Recall {
+        /// As [`Request::Report`]'s.
+        name: String,
+        #[serde(default)]
+        id: Option<String>,
+        file: PathBuf,
     },
     /// What an agent says about itself with `crystal report`. A program in
     /// a session says which by its `id`; from outside, it's the session's
@@ -209,8 +228,9 @@ pub enum Request {
     },
     /// What background tasks have spent today, and the daily budget.
     Spending,
-    /// The memory each running session's processes take, the daemon's
-    /// own, and the asking client's, whose process is `client`.
+    /// The memory and CPU each running session's processes take, the
+    /// daemon's own and its helpers', and the asking client's, whose
+    /// process is `client`.
     Resources {
         #[serde(default)]
         client: Option<u32>,
@@ -267,10 +287,20 @@ pub enum Request {
     },
     /// Add `entry` to the memory of `project`, a project's main worktree:
     /// the daemon, which keeps the models loaded, finds whether the project
-    /// has it already in other words.
+    /// has it already in other words. With `replaces`, in place of that
+    /// entry, which no longer holds, and is retired.
     Remember {
         project: PathBuf,
         entry: crate::memory::New,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replaces: Option<crate::memory::Replacing>,
+    },
+    /// The entries of the memory of the project `dir` is in near one
+    /// another in meaning, in groups, each with whether it still holds: for
+    /// `crystal memory reconcile` to ask a model whether any of them no
+    /// longer holds.
+    NearMemory {
+        dir: PathBuf,
     },
     /// Find the entries of the memory of the project `dir` is in that say
     /// what another does, by meaning, and with `apply`, merge each group
@@ -757,8 +787,9 @@ pub enum Response {
     Retitle {
         title: String,
     },
-    /// What the hook reporting a prompt the user sent adds to it for
-    /// Claude Code to read: crystal asking it to name its session.
+    /// What a hook adds for Claude Code to read: with a prompt the user
+    /// sent, crystal asking it to name its session; with a file it's about
+    /// to read or edit, what its project's memory has about it.
     Context {
         text: String,
     },
@@ -810,6 +841,17 @@ pub enum Response {
     },
     /// What adding an entry to a project's memory came to.
     Remembered(crate::memory::Added),
+    /// What adding an entry to a project's memory in place of another came
+    /// to, and the entry it replaced, as it was, retired; `None` when it
+    /// wasn't added, and the other is left as it was.
+    Replaced {
+        added: crate::memory::Added,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retired: Option<Box<crate::memory::Superseded>>,
+    },
+    /// The entries of a project's memory near one another in meaning, in
+    /// groups, and those left out as they say what another does.
+    Near(crate::memory::Near),
     /// The entries of a project's memory that say what another does, each
     /// group with the one it keeps: merged, or with `Request::DedupeMemory`
     /// not told to apply them, as they would be.
@@ -900,7 +942,8 @@ pub struct SessionInfo {
     #[serde(default)]
     pub model: Option<String>,
     /// The line an agent or a script put on its row with `crystal report
-    /// --line`, until it's taken off or its time is up.
+    /// --line`, until it's taken off or its time is up; or, held working
+    /// while work of its own runs, what that is.
     #[serde(default)]
     pub line: Option<String>,
     /// The rest of what `crystal report` put on its row: a title, the
@@ -1778,6 +1821,38 @@ pub enum Wakeup {
     After { secs: u64 },
     /// Again and again, for as long as it runs.
     Recurring,
+}
+
+/// Work of an agent's own still to come as its turn ended, which wakes it
+/// once it's done or due, as Claude Code's Stop hook lists it: a task in
+/// the background, or a wakeup it scheduled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct Pending {
+    pub kind: PendingKind,
+    /// What it is, in a few words: a command, a watch's or a subagent's
+    /// description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub what: Option<String>,
+}
+
+/// What sort of work is still to come.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PendingKind {
+    /// A command run in the background.
+    Shell,
+    /// A Monitor watch.
+    Monitor,
+    /// A subagent in the background.
+    Subagent,
+    /// A wakeup scheduled once.
+    Wakeup,
+    /// A wakeup that comes again and again.
+    Cron,
+    /// Any other task, like a workflow or a teammate.
+    Other,
 }
 
 /// What the agent in a session is doing.

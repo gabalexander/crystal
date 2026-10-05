@@ -15,7 +15,7 @@ use crate::agent_rules;
 use crate::catalog;
 use crate::codex;
 use crate::printable;
-use crate::protocol::{AgentEvent, Conversation, Subagent, Wakeup};
+use crate::protocol::{AgentEvent, Conversation, Pending, PendingKind, Subagent, Wakeup};
 use crate::shell;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -36,6 +36,11 @@ pub const CLAUDE_HOOK_EVENTS: &[&str] = &[
     "SubagentStart",
     "SubagentStop",
 ];
+
+/// The tools of Claude Code's that read or edit a file, which crystal's
+/// `PreToolUse` hook is matched to: as one is about to, the agent is shown
+/// what its project's memory has about the file (see [`crate::recall`]).
+pub const CLAUDE_FILE_TOOLS: &[&str] = &["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"];
 
 /// The Codex hook events crystal listens to; [`codex_event`] says what each
 /// one means. Codex has no `Notification`: the questions it asks while
@@ -435,6 +440,28 @@ pub fn subagent(input: &Value) -> Option<Subagent> {
     })
 }
 
+/// The file a Claude Code `PreToolUse` hook's input says its agent is
+/// about to read or edit with one of [`CLAUDE_FILE_TOOLS`], by its path
+/// from the top, as the tool takes it. Not one a subagent reads, which only
+/// what the subagent says of it reaches the agent with.
+pub fn claude_file(input: &Value) -> Option<PathBuf> {
+    if event_name(input)? != "PreToolUse" || in_subagent(input) {
+        return None;
+    }
+    if !CLAUDE_FILE_TOOLS.contains(&input["tool_name"].as_str()?) {
+        return None;
+    }
+    let tool_input = &input["tool_input"];
+    let path = (tool_input["file_path"].as_str())
+        .or_else(|| tool_input["notebook_path"].as_str())
+        .filter(|path| !path.is_empty())?;
+    let path = PathBuf::from(path);
+    match path.is_absolute() {
+        true => Some(path),
+        false => Some(hook_cwd(input)?.join(path)),
+    }
+}
+
 /// What a Codex hook's input means, or `None` if it's nothing that changes
 /// what the session is doing. Codex's hooks are Claude Code's, mostly, with
 /// `Interrupt` for a turn the user cut short, which is no turn ending the
@@ -506,6 +533,92 @@ pub fn hook_wakeup(input: &Value) -> Option<Wakeup> {
         "CronCreate" => Some(Wakeup::Recurring),
         _ => None,
     }
+}
+
+/// The most of what an agent said last that's passed on: the end of it, a
+/// long report's, where what it asks or waits on is.
+const SAID_BYTES: usize = 16 * 1024;
+
+/// The most of a pending task's description that's kept.
+const PENDING_WHAT: usize = 120;
+
+/// What a `Stop` hook's input says the agent said last as its turn ended:
+/// Claude Code's `last_assistant_message`, the end of it at most
+/// [`SAID_BYTES`].
+pub fn hook_said(input: &Value) -> Option<String> {
+    if event_name(input)? != "Stop" {
+        return None;
+    }
+    let said = input["last_assistant_message"].as_str()?;
+    let mut from = said.len().saturating_sub(SAID_BYTES);
+    while !said.is_char_boundary(from) {
+        from += 1;
+    }
+    Some(said[from..].to_string())
+}
+
+/// The work of the agent's own a `Stop` hook's input says is still to
+/// come, which wakes it: Claude Code's `background_tasks` that haven't
+/// ended, and its `session_crons`. `None` when the input has neither, as
+/// from a Claude Code from before it said.
+pub fn hook_pending(input: &Value) -> Option<Vec<Pending>> {
+    if event_name(input)? != "Stop" {
+        return None;
+    }
+    let (tasks, crons) = (&input["background_tasks"], &input["session_crons"]);
+    if !tasks.is_array() && !crons.is_array() {
+        return None;
+    }
+    let ended = |status: &str| {
+        [
+            "completed",
+            "failed",
+            "killed",
+            "stopped",
+            "cancelled",
+            "done",
+        ]
+        .contains(&status)
+    };
+    let mut pending = Vec::new();
+    for task in tasks.as_array().into_iter().flatten() {
+        if task["status"].as_str().is_some_and(ended) {
+            continue;
+        }
+        let kind = match task["type"].as_str().unwrap_or_default() {
+            "shell" => PendingKind::Shell,
+            "monitor" => PendingKind::Monitor,
+            "subagent" => PendingKind::Subagent,
+            _ => PendingKind::Other,
+        };
+        let what = (task["description"].as_str())
+            .filter(|what| !what.trim().is_empty())
+            .or_else(|| task["command"].as_str());
+        pending.push(Pending {
+            kind,
+            what: what.map(|what| cut(&printable::line(what), PENDING_WHAT)),
+        });
+    }
+    for cron in crons.as_array().into_iter().flatten() {
+        let kind = match cron["recurring"].as_bool() {
+            Some(true) => PendingKind::Cron,
+            _ => PendingKind::Wakeup,
+        };
+        pending.push(Pending { kind, what: None });
+    }
+    Some(pending)
+}
+
+/// `text`, trimmed, with no more than `most` characters, `…` marking what
+/// was cut.
+fn cut(text: &str, most: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= most {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(most).collect();
+    cut.push('…');
+    cut
 }
 
 /// The command that picks `agent`'s conversation `id` up again, typed into
@@ -640,13 +753,15 @@ pub fn claude_keep_going(reason: &str) -> String {
     json!({ "decision": "block", "reason": reason }).to_string()
 }
 
-/// What a Claude Code hook prints for the prompt the user just sent to
-/// come with `context`, which Claude reads before it: the
-/// `UserPromptSubmit` hook's `additionalContext`.
-pub fn claude_context(context: &str) -> String {
+/// What a Claude Code hook for `event` prints for Claude to read
+/// `context` with what set it off: its `additionalContext`. With the
+/// prompt the user just sent, `UserPromptSubmit`'s, Claude reads it before
+/// the prompt; with a tool it's about to use, `PreToolUse`'s, beside what
+/// the tool gives it.
+pub fn claude_context(event: &str, context: &str) -> String {
     json!({
         "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
+            "hookEventName": event,
             "additionalContext": context,
         }
     })
@@ -654,7 +769,8 @@ pub fn claude_context(context: &str) -> String {
 }
 
 /// Settings for Claude Code that add a hook, `crystal hook claude`, to
-/// each event in [`CLAUDE_HOOK_EVENTS`].
+/// each event in [`CLAUDE_HOOK_EVENTS`], and to `PreToolUse` for
+/// [`CLAUDE_FILE_TOOLS`].
 fn claude_settings(crystal: &Path) -> String {
     let command = hook_command(crystal, "claude", false);
     // Each event takes a list of matcher groups; with no matcher, a group
@@ -666,6 +782,13 @@ fn claude_settings(crystal: &Path) -> String {
     for event in CLAUDE_HOOK_EVENTS {
         hooks.insert(event.to_string(), groups.clone());
     }
+    // Claude waits on it before each read and edit, so it gives up on the
+    // daemon sooner than this.
+    let before_files = json!([{
+        "matcher": CLAUDE_FILE_TOOLS.join("|"),
+        "hooks": [{ "type": "command", "command": command, "timeout": 2 }]
+    }]);
+    hooks.insert("PreToolUse".to_string(), before_files);
     json!({ "hooks": hooks }).to_string()
 }
 
@@ -1297,6 +1420,50 @@ mod tests {
             let hook = &settings["hooks"][event][0]["hooks"][0];
             assert_eq!(hook["command"], "'/opt/my tools/crystal' hook claude");
         }
+        // And before the tools that read and edit files, for what the
+        // memory has about each.
+        let before = &settings["hooks"]["PreToolUse"][0];
+        assert_eq!(before["matcher"], "Read|Edit|Write|MultiEdit|NotebookEdit");
+        assert_eq!(
+            before["hooks"][0]["command"],
+            "'/opt/my tools/crystal' hook claude"
+        );
+    }
+
+    #[test]
+    fn a_file_claude_reads_or_edits_is_found_in_its_hook_s_input() {
+        let read = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/code/app/src/ledger.rs", "offset": 10},
+        });
+        assert_eq!(
+            claude_file(&read),
+            Some(PathBuf::from("/code/app/src/ledger.rs"))
+        );
+        let notebook = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "NotebookEdit",
+            "cwd": "/code/app",
+            "tool_input": {"notebook_path": "eda.ipynb"},
+        });
+        assert_eq!(
+            claude_file(&notebook),
+            Some(PathBuf::from("/code/app/eda.ipynb"))
+        );
+        let after = json!({"hook_event_name": "PostToolUse", "tool_name": "Read",
+                           "tool_input": {"file_path": "/code/app/a.rs"}});
+        assert_eq!(claude_file(&after), None);
+        let bash = json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                          "tool_input": {"command": "cat /code/app/a.rs"}});
+        assert_eq!(claude_file(&bash), None);
+        let mut subagent = read.clone();
+        subagent["agent_id"] = json!("a1");
+        assert_eq!(
+            claude_file(&subagent),
+            None,
+            "a subagent's reads aren't the agent's"
+        );
     }
 
     #[test]
@@ -1310,11 +1477,73 @@ mod tests {
 
     #[test]
     fn a_prompt_hook_adds_to_what_claude_reads_with_the_prompt() {
-        let output: Value = serde_json::from_str(&claude_context("Name it.")).unwrap();
+        let output = claude_context("UserPromptSubmit", "Name it.");
+        let output: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(
             output["hookSpecificOutput"],
             json!({"hookEventName": "UserPromptSubmit", "additionalContext": "Name it."})
         );
+    }
+
+    #[test]
+    fn a_stop_hook_says_what_the_agent_said_and_what_s_still_to_come() {
+        let stop = json!({
+            "hook_event_name": "Stop",
+            "last_assistant_message": "I'm waiting on the tests, not on you.",
+            "background_tasks": [
+                {"id": "b1", "type": "shell", "status": "running",
+                 "description": "", "command": "cargo test\n-- --test-threads=4"},
+                {"id": "m1", "type": "monitor", "status": "running", "description": "CI checks"},
+                {"id": "a1", "type": "subagent", "status": "running", "description": "Review"},
+                {"id": "w1", "type": "workflow", "status": "pending"},
+                {"id": "b0", "type": "shell", "status": "completed", "command": "ls"}
+            ],
+            "session_crons": [
+                {"id": "c1", "schedule": "*/5 * * * *", "recurring": true, "prompt": "check"},
+                {"id": "c2", "schedule": "30 14 6 10 *", "recurring": false, "prompt": "go"}
+            ]
+        });
+        assert_eq!(
+            hook_said(&stop).as_deref(),
+            Some("I'm waiting on the tests, not on you.")
+        );
+        let pending = hook_pending(&stop).unwrap();
+        let kinds: Vec<PendingKind> = pending.iter().map(|pending| pending.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                PendingKind::Shell,
+                PendingKind::Monitor,
+                PendingKind::Subagent,
+                PendingKind::Other,
+                PendingKind::Cron,
+                PendingKind::Wakeup
+            ]
+        );
+        // A command with no description is told by its command, on a line.
+        assert_eq!(
+            pending[0].what.as_deref(),
+            Some("cargo test -- --test-threads=4")
+        );
+        assert_eq!(pending[1].what.as_deref(), Some("CI checks"));
+
+        // Nothing in flight is none; a Claude Code that doesn't say, unknown.
+        let idle = json!({"hook_event_name": "Stop", "background_tasks": [], "session_crons": []});
+        assert_eq!(hook_pending(&idle), Some(Vec::new()));
+        let older = json!({"hook_event_name": "Stop"});
+        assert_eq!((hook_pending(&older), hook_said(&older)), (None, None));
+        // Only a turn's end says.
+        let prompt = json!({"hook_event_name": "UserPromptSubmit", "background_tasks": []});
+        assert_eq!(hook_pending(&prompt), None);
+    }
+
+    #[test]
+    fn what_a_long_turn_ended_saying_is_passed_on_from_its_end() {
+        let long = format!("{}Should I merge it?", "é".repeat(SAID_BYTES));
+        let stop = json!({"hook_event_name": "Stop", "last_assistant_message": long});
+        let said = hook_said(&stop).unwrap();
+        assert!(said.len() <= SAID_BYTES);
+        assert!(said.ends_with("Should I merge it?"));
     }
 
     #[test]

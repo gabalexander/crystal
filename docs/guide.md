@@ -28,13 +28,16 @@ with notes. Start one from the panel (`flow: <name>`) or with `crystal flow run 
 **The backlog** is the project's list of things to come back to: `b` opens it, and `Enter` on an item hands it
 to an agent as a task that ticks it when it's done. Agents add to it with `crystal backlog add`.
 
-**Memory** is what sessions learned about the project, shown to every agent started there when it matters. `m`
-reads it; agents write it with `crystal remember`.
+**Memory** is what sessions learned about the project, shown to every agent started there when it matters,
+and to Claude Code as it first reads or edits a file, the few lines about that file it hasn't seen (`[memory]
+recall_on_read` turns that off). `m` reads it; agents write it with `crystal remember`.
 
 ## When something needs you
 
 A session waiting on you wears `▲` and is pinned at the top of the sidebar, in whichever tab it's in. So is
-one a crash or a reboot couldn't start again, saying why: put that right and `Enter` starts it.
+one a crash or a reboot couldn't start again, saying why: put that right and `Enter` starts it. An agent that
+ends its turn with its task open asking you nothing, waiting on its tests or CI, wears `◇` and isn't pinned;
+one with work of its own still running, a command in the background or a Monitor, shows as working on it.
 
 - `u` goes to the next one that needs you, and `U` lists everything that does, the most urgent first.
 - `y`, `n` and `Y` answer a background task asking for a permission: yes, no, always.

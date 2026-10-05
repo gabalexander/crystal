@@ -44,6 +44,24 @@ pub fn ask(socket: &Path, request: &Request, start: bool) -> Result<Option<Respo
     }
 }
 
+/// [`ask`] the daemon running at `socket`, if one is, which has `wait` to
+/// take the request and to answer: one slower than that is an error.
+pub fn ask_within(socket: &Path, request: &Request, wait: Duration) -> Result<Option<Response>> {
+    let Ok(conn) = UnixStream::connect(socket) else {
+        return Ok(None);
+    };
+    conn.set_write_timeout(Some(wait))?;
+    conn.set_read_timeout(Some(wait))?;
+    protocol::send_request(&conn, request)?;
+    let response = protocol::recv(BufReader::new(&conn))?.ok_or_else(|| HungUp {
+        crystal: socket::crystal_for(socket),
+    })?;
+    match response {
+        Response::Error { message } => bail!(message),
+        response => Ok(Some(response)),
+    }
+}
+
 /// The daemon hung up without answering. A daemon from before requests
 /// carried their version can't say that it's another version: it hangs up
 /// on what it doesn't understand. A daemon handed over to a new crystal

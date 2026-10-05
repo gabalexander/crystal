@@ -3,7 +3,7 @@
 <sub>[← README](../README.md#documentation)</sub>
 
 Starting a session, what happens to it when crystal restarts, archiving it or letting it stop when it sits
-idle, how crystal tells you it needs you, and the memory each one takes.
+idle, how crystal tells you it needs you, and the memory and CPU each one takes.
 
 - [Starting a session](#starting-a-session)
 - [After a restart](#after-a-restart)
@@ -11,7 +11,7 @@ idle, how crystal tells you it needs you, and the memory each one takes.
 - [Archiving and idle agents](#archiving-and-idle-agents)
 - [Notifications](#notifications)
 - [Sounds and the bell](#sounds-and-the-bell)
-- [RAM](#ram)
+- [Resources](#resources)
 
 ## Starting a session
 
@@ -183,7 +183,7 @@ You can have crystal keep a Claude Code started and waiting, so that a new sessi
 `warm_agent = true` under `[sessions]`, the TUI has the daemon keep one where its selection rests, started as
 the new-session panel would start it there, crystal's notes and all, and a new session started the same way, in
 that directory with that command, takes it over, its task typed in as its first prompt. It takes what an idle
-Claude Code does, a few hundred MB, for as long as a TUI is open, the RAM view showing it beside crystal's own,
+Claude Code does, a few hundred MB, for as long as a TUI is open, the resources view showing it beside crystal's own,
 and it's started again every ten minutes while it waits, so that what it was told as it started, the worktree's
 handoff notes and the project's memory, stays fresh. It's let go once no TUI has asked for it in a quarter of
 an hour, once the setting goes off, and before a handover. What the project's memory tells it goes by its
@@ -254,14 +254,27 @@ beeps, flashes or marks its tab, the way you set it up to. A session out of sigh
 its time in the sidebar until you look at it, rings your terminal from the TUI too, and the event log gets a
 `session.bell`. A program ringing over and over rings yours at most twice a second.
 
-## RAM
+## Resources
 
-`#` shows the memory each session takes: its program and every process under it, since an agent runs node
-workers, shells and MCP servers of its own, the biggest first, with how many processes that is and its share of
-the whole. Under them is what crystal takes itself, the daemon and the TUI, then the agent [kept
-warm](#archiving-and-idle-agents) while there's one, and in the heading all of it, and
-its share of the machine's memory. `Enter` goes to the session the bar is on. The daemon looks at the
-processes, `ps` on a Mac and `/proc` on Linux, every second while the view is open, and every five seconds
-otherwise for the footer, which shows all of it beside `? keys` while the sidebar has the keyboard, like
-`1.2 GB`: a click on that opens the view.
-What's counted is each process's resident memory, so what processes share is counted in each.
+`#` shows the memory and CPU each session takes: its program and every process under it, since an agent runs node
+workers, shells and MCP servers of its own, the biggest first, with how many processes that is and a bar of its
+share of the whole; `s` puts the busiest first instead, and back. Under them is what crystal takes itself: the
+daemon, where memory's models run; each program it runs that isn't a session's, those of one name together,
+like the distiller's `claude -p`, git or a plugin's hook; and the TUI, with what it runs. Then comes the agent
+[kept warm](#archiving-and-idle-agents) while there's one. The heading says all of it, with its share of the
+machine's memory, and its CPU, with its share of the machine's cores. `Enter` goes to the session the bar is on.
+The footer shows all of it beside `? keys` while the sidebar has the keyboard, like `2.1G 35%`, in the room its
+keys leave, never in a key's place: its CPU goes first where there's less, then all of it. A click on that opens
+the view. `crystal usage` prints the same table for a script, and `--json` the daemon's look with its
+totals.
+
+A process's memory is what it has in RAM now. On a Mac that's its physical footprint, what Activity Monitor's
+Memory column shows, which counts what it has on the GPU, as the daemon has memory's models on Metal; on Linux
+it's its resident set, so what processes share is counted in each. Its CPU is a rate, in percent of one core,
+`100%` being one core busy and a machine of ten cores busy through and through `1000%`: the CPU time it had,
+user and system, since the daemon looked before, over the time between. That's not `ps`'s `%cpu`, which is an
+average over the process's whole life on Linux and a decaying one on a Mac. The daemon looks, with `/proc` on
+Linux and libproc on a Mac, where seven hundred processes take a millisecond, every second while the view is
+open and every five seconds otherwise; a look less than half a second after another counts from the one before
+that, and the first in ten seconds waits half a second to have something to count from. A process that started
+since the look counted from counts all its CPU time.

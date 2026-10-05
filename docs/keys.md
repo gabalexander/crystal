@@ -81,7 +81,7 @@ keys` lists them.
 | `P` | list your [profiles](configuration.md#profiles), and add, change, copy or remove one |
 | `X` | list the [plugins](plugins.md): switch them on and off, run their actions and open their panes |
 | `,` | open the [settings](configuration.md#the-settings-view): notifications, sounds, the theme, and how memory learns and searches, each changed as you go |
-| `#` | the memory each session's processes take, and crystal's own: [RAM](sessions.md#ram) |
+| `#` | the memory and CPU each session's processes take, and crystal's own: [resources](sessions.md#resources) |
 | `?` | show every key, in the sidebar, in a pane, in resize mode, in a view, in a question and with the mouse, your own included: a page at a time when they don't all fit, `→` and `←` (or `Space`, `PgDn` and `PgUp`) turning the pages; `Tab` goes to the [guide](guide.md), a page on what to start, the keys that matter most and what agents call, and back |
 | `q` | quit, once you've said `y`; the sessions keep running |
 
@@ -154,7 +154,7 @@ everywhere else. `[keys]` names them the same way:
 
 A view is any of the lists that take the keyboard: the diff, the file finder, the tree browser, find in files,
 the branch switcher, memory, the handoff notes, the files `crystal open` shows, the backlog, layouts, the
-archive, the plugins, the settings, what needs you, RAM, the timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
+archive, the plugins, the settings, what needs you, resources, the timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
 one of them for the key they all take for it, `↓`, `↑`, `PgDn`, `PgUp`, `Enter` or `Esc`, which go on working
 whatever you give; the defaults you leave it without do nothing. While a view is taking what you type, like
 the file finder's query or a filter, a letter is typed rather than standing for anything, so a key there is

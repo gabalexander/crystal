@@ -158,7 +158,7 @@ const WORKTREES_EVERY: Duration = Duration::from_secs(5);
 const STATS_EVERY: Duration = Duration::from_secs(10);
 
 /// How often the daemon is asked what crystal's processes take, for the
-/// footer's readout; and how often while the RAM view is open.
+/// footer's readout; and how often while the resources view is open.
 const RESOURCES_EVERY: Duration = Duration::from_secs(5);
 const RESOURCES_OPEN_EVERY: Duration = Duration::from_secs(1);
 
@@ -702,8 +702,8 @@ struct Tui {
     /// Whether the session poller reads the settings too: the settings
     /// view is open.
     poll_settings: Arc<AtomicBool>,
-    /// Whether the RAM view is open, which has the daemon asked what the
-    /// sessions take more often.
+    /// Whether the resources view is open, which has the daemon asked what
+    /// the sessions take more often.
     ram_open: Arc<AtomicBool>,
     /// The config as the TUI last took it in.
     config: Config,
@@ -3961,7 +3961,7 @@ fn spawn_stat_counter(
 
 /// Asks the daemon what crystal's processes take, on a thread of its own:
 /// every [`RESOURCES_EVERY`], and every [`RESOURCES_OPEN_EVERY`] while
-/// `open` says the RAM view is, straight away as it opens.
+/// `open` says the resources view is, straight away as it opens.
 fn spawn_resource_poller(socket: PathBuf, events: Sender<Event>, open: Arc<AtomicBool>) {
     thread::spawn(move || {
         let request = Request::Resources {

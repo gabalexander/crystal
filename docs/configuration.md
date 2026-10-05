@@ -36,7 +36,7 @@ that makes no sense is said there too, and the settings stay as they were until 
 | `mermaid_ascii` | `false` | draw [mermaid diagrams](code.md#the-file-finder-and-the-tree-browser) with ASCII rather than box drawing |
 | `scrollback_lines` | `10000` | how many rows that scrolled off a session's screen it keeps, up to 1,000,000, for scrolling back, copy mode, `e` and `crystal read --history`; a change counts for the sessions running too, which let their oldest rows go when it's fewer |
 | `[plugins]` | | which plugins are on and off: [plugins](plugins.md) |
-| `[memory]` | | how memory's [distiller](memory.md#the-distiller) runs, and whether it [searches by meaning](memory.md#search-by-meaning) |
+| `[memory]` | | how memory's [distiller](memory.md#the-distiller) runs, whether it [searches by meaning](memory.md#search-by-meaning), and with what: the model here or [Gemini](memory.md#gemini-instead-of-the-model-here); and whether Claude Code is shown the entries about each file it reads |
 | `[tasks]` | | what [background tasks](tasks.md#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none); and what they may do without asking: `permission_mode` (`"default"`), `allowed_tools` (none) and `allow_bypass` (`false`) |
 | `[events]` | | `keep_days`, how long the [event log](events.md) keeps what happened: 30 days, or `0` for ever |
 | `[handoff]` | | `in_git`, the projects, by their main worktree, whose [handoff notes](tasks.md#the-handoff-file) go in git |
@@ -263,7 +263,7 @@ bar.
 | Sessions | what the [new-session panel](sessions.md#starting-a-session) offers first, naming sessions for their prompt, how long an agent may sit [idle](sessions.md#archiving-and-idle-agents) and whether a terminal is stopped too, whether an agent is kept warm for the next session, how far apart agents start again after a [crash or a reboot](sessions.md#after-a-restart) and whether one resumes as it said; a new terminal's shell, whether it's a login shell and where it starts; how much each session's history keeps, the running ones' too, and whether a terminal shows it again after a crash or a reboot; and the branch new worktrees start from, where they go and whether one its last session is killed from is removed |
 | Mouse | [the mouse](tui.md#the-mouse), and whether programs' copies go on [your clipboard](tui.md#zoom-copy-mode-and-search) |
 | Tasks | the permission mode [background tasks](tasks.md#background-tasks) start in, and what a run and a day may spend |
-| Memory | how memory learns ([the distiller](memory.md#the-distiller), its model and what it may spend) and whether it searches [by meaning](memory.md#search-by-meaning) and reranks |
+| Memory | how memory learns ([the distiller](memory.md#the-distiller), its model and what it may spend), whether it searches [by meaning](memory.md#search-by-meaning), with the model here or [Gemini](memory.md#gemini-instead-of-the-model-here) and at how many dimensions, and reranks, and whether Claude Code is shown what's known about a file as it reads it |
 | Integrations | the agents installed here that crystal can [hook](agents.md#hooks-in-other-agents-own-settings): below |
 | Keys | every key `[keys]` gives, each given by pressing it: below |
 
@@ -297,7 +297,8 @@ the filter and gives the rows their keys back, and `esc` takes it away, the bar 
 
 While it's open, the view reads the file and asks the daemon again every half a second, so it follows a
 change made by hand in the file too, and shows how the models that search by meaning stand: downloading
-(`42 of 2449 MB`), loaded in the daemon or not, and how many entries have their vector. Turning search by
+(`42 of 2449 MB`), loaded in the daemon or not, and how many entries have their vector; with Gemini, where
+its key is and how many tokens it was sent, or why its last request failed and what searches go by meanwhile. Turning search by
 meaning on has the daemon get the models ready: it downloads them if they aren't here, loads them and gives
 every entry its vector, and `enter` on that row does it again. Turned off, the daemon lets the models go, and
 the memory they took with them.

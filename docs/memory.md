@@ -2,13 +2,15 @@
 
 <sub>[← README](../README.md#documentation)</sub>
 
-What a project's sessions learn, kept for the next ones: how you and agents add to it and search it, what an
-agent is shown as it starts, search by meaning, and the distiller that reads what a session did.
+What a project's sessions learn, kept for the next ones: how you and agents add to it, search it and replace
+what no longer holds, what an agent is shown as it starts and as it reads a file, search by meaning, with the
+model here or Gemini, and the distiller that reads what a session did.
 
 - [Remembering](#remembering)
 - [What an agent is shown](#what-an-agent-is-shown)
 - [Through MCP](#through-mcp)
 - [Search by meaning](#search-by-meaning)
+- [Gemini instead of the model here](#gemini-instead-of-the-model-here)
 - [The distiller](#the-distiller)
 
 ## Remembering
@@ -36,8 +38,14 @@ crystal memory kind gotcha 12 15     # make entries gotchas: what they say stays
 crystal memory kind --notes          # the notes a model reads as lessons, and their kinds; `--yes` makes them so
 crystal memory promote 2             # copy one into the project's CLAUDE.md, under "Notes"
 crystal memory distill fixer         # have a model read what a session did, now
-crystal memory embed                 # download the model that searches by meaning
+crystal memory embed                 # give every entry its vector, downloading the models first if needed
+crystal memory status                # how search by meaning stands: what makes the vectors, Gemini's key
 crystal memory dedupe                # entries that say what another does, by meaning; --apply merges them
+crystal remember --replaces 3 --why "it flipped" "Idle stop is on by default"   # in place of 3, which no longer holds
+crystal memory retire 3 --by 12      # 3 no longer holds: 12, there already, holds in its place
+crystal memory list --superseded     # what stopped holding, with what holds in its place and why
+crystal memory restore 3             # put one that stopped holding back as it was
+crystal memory reconcile             # what a model reads as no longer holding among entries near one another; --apply
 ```
 
 - `-k` is `decision`, `gotcha`, `command` or `note` (the default). Inside a session, an entry goes to the
@@ -94,10 +102,38 @@ crystal memory dedupe                # entries that say what another does, by me
   the distiller said, then the one most of the others say the same as, then the earliest. Nothing changes
   until `--apply`: then the one kept counts every time each of the others was said, so it doesn't expire,
   takes their files, and holds as well as the freshest of them (when one still holds, it's anchored to its
-  files and what it names as they are now, as though said again). The others leave the list (`show` says where one went), kept
-  apart so their words said again count as the one kept said again, and the distiller can't add them back.
-  Each one goes straight into the one kept, never through another, so two that only both look like a third
-  stay apart. It needs the models, and takes under a minute on a few hundred entries.
+  files and what it names as they are now, as though said again). The others leave the list (`show` says
+  where one went), kept apart so their words said again count as the one kept said again, and the distiller
+  can't add them back. What they said still finds the one kept: a search matches their words and what they
+  mean as its own, and the reranker reads them after its text. Each one goes straight into the one kept,
+  never through another, so two that only both look like a third stay apart. It needs the models, and takes
+  under a minute on a few hundred entries.
+- What's learned later can correct what was learned before: a default that changed, a decision reversed, a
+  command renamed. The entry that no longer holds is superseded: retired, another entry holding in its place,
+  or updated, its text rewritten under its id. Either way it's kept apart, as it was, with when it stopped
+  holding and why, and left out of every search, of what agents starting are shown and of what the
+  distiller is told the memory has. What a retired one said still finds the one in its place, by its words
+  and its meaning, as what's merged finds the one kept: a search for the old claim gives what holds now. `remember --replaces <id>` remembers an entry in place of another
+  (`--why` says why that one no longer holds), `memory retire <id> --by <id>` retires one for another there
+  already, and the [distiller](#the-distiller) says so of the entries it's shown. `list --superseded` lists
+  them, the latest first; `show <id>` gives a retired one as it was, with what holds in its place, and an
+  updated one with what it said before; `restore <id>` puts one back as it was. Said again, in the same
+  words, an entry that stopped holding isn't remembered: `crystal remember` says so, and what holds now.
+- With [search by meaning](#search-by-meaning), an entry remembered near one there already (as alike as 0.80),
+  about the same thing but not saying the same, says so: `near 12: <what 12 says>`, and `crystal memory
+  retire 12 --by 30` if the new one, 30, replaces it. One taken for another said again, `remembered 12 already, in other words`,
+  says `add --replaces 12` if it replaces it instead.
+- `reconcile` looks through what's there for what no longer holds: the entries near one another in meaning,
+  as alike as 0.80, in groups of six (eight once those left out join the group of the one nearest them).
+  Those `dedupe` would merge into another are left out, and it says how many: asked whether one holds in
+  another's place, a model takes the same said twice for that. The distiller's model
+  (`distill_model`, Haiku) reads them, 24 entries a pass, four passes at once, each one `claude -p` as locked
+  down as the distiller's and given five minutes, told what each names that's gone from the code and which
+  was said later, for those another of their group shows no longer hold: each to retire for that one, or to
+  update, with why. It thinks each through, so a pass takes a minute or two. It only lists what it proposes,
+  and keeps it; `--apply` makes that so, passing over any entry changed since, and with nothing kept, asks
+  again and makes what it says so. Every change is undone with `restore`. It needs the models; on crystal's
+  own memory, about 480 entries once deduped, it read 76 in 29 groups for about 20 cents.
 - Whether an entry still holds goes by what it names: the identifiers, paths, commands and flags in its text,
   in backticks or shaped like code (`local_origin`, `TaskRecord`, `Request::Shutdown` as `Shutdown`,
   `src/agent_rules.rs`, `agents/`, `--test-threads`), that are in the worktree's code as it's remembered:
@@ -117,8 +153,9 @@ crystal memory dedupe                # entries that say what another does, by me
   worktree after.
 - `promote` asks first at a terminal; `--yes` doesn't. It writes to CLAUDE.md, or to AGENTS.md when that's the
   only one the project has.
-- `rm` forgets an entry: it leaves the list, and the distiller never adds it back. `memory list --forgotten`
-  (or `--wrong`) lists what was forgotten, as it was; remembering it again brings it back.
+- `rm` forgets an entry: it leaves the list, and the distiller never adds it back, in the same words or, with
+  search by meaning on, in others that say the same thing by the rule below. `memory list --forgotten` (or
+  `--wrong`) lists what was forgotten, as it was; remembering it again brings it back.
 - `m` in the sidebar opens the selected session's project's list, drifting, stale and expired entries marked:
   the entry the bar is on is shown in full beside it, with what's gone, `/` filters, `Enter` opens its file in
   your `$EDITOR` (in the worktree it was remembered in while that's there, as a session of its own), `x`
@@ -141,6 +178,36 @@ line on how to read the rest and add more:
   one. A prompt that would pass 16 KiB with them loses what the memory has first. An agent that takes no first
   prompt, like Aider, isn't told.
 
+As Claude Code reads or edits a file (`Read`, `Edit`, `Write`, `MultiEdit`, `NotebookEdit`), crystal shows it
+the entries about that file it hasn't been shown yet: the few lessons that matter just as it's about to work
+there, which the few it was shown as it started, or what it thinks to search for, may not have.
+
+- The entries about a file are those about it with `-f`, or about a directory it's in, and those whose text
+  names its path, or names something in it, like `round_cents`, that no more than one other file has. Lessons
+  come first; then those about the file itself, then those naming what's in it, then those about its
+  directory; then those that have most to do with what the session was started to do and the prompt you last
+  sent, by their words; then those said most often, those you or an agent remembered before the distiller's,
+  those about the fewest files, and the newest. None that's stale, expired or a task's outcome; drifting ones
+  are marked `[may be out of date]`.
+- It's shown at most three, in 600 bytes in all, each by its id, its kind and its title cut to about a sentence,
+  under a line saying which file they're about. It reads one in full with `memory_show`.
+- Each file once a session, and never an entry it was shown already, at launch or with another file. What a
+  session was shown goes with it through a `restart-server`, a `crystal worktree move` and a stop for being idle,
+  since its agent goes on in its conversation, and ends with it.
+- A subagent's reads aren't shown anything: what it finds reaches the agent only as what it says.
+- It goes through crystal's own `PreToolUse` hook, which Claude Code waits on before the tool runs. The daemon
+  looks the file's entries up in a few milliseconds, with no model, telling what holds by the code as it last
+  read it, at most a minute before; the hook gives up on a daemon that hasn't answered in 300 ms, and adds
+  nothing. Claude Code reads what it adds beside what the tool gives it.
+- What it adds to the context: on crystal's own memory (512 entries), a session asked one of nine merged pull
+  requests' titles, reading every file the pull request touched (6 to 27), was told something about most of
+  them, 2.3 entries and about 490 bytes each, 3 to 10 KB in all.
+- Being shown an entry doesn't count as finding it again: crystal chose to show it. An agent it helps reads it
+  in full with `memory_show`, which does, so it doesn't expire.
+- `recall_on_read = false` under `[memory]` (or the settings view's Memory tab) turns it off, at once for the
+  sessions running. Only Claude Code sessions crystal starts get it, not one typed into a shell with `crystal
+  integration`'s hooks, nor a background task.
+
 `crystal plugin disable memory` turns it all off: see [plugins](plugins.md).
 
 ## Through MCP
@@ -156,7 +223,8 @@ and a session in a terminal would stop to ask about.
 
 Words only find words: "db" never finds "Postgres has to be running". So crystal also searches by what entries
 mean, with two models run on your machine through [Candle](https://github.com/huggingface/candle): no API, no
-key, and nothing leaves the machine.
+key, and nothing leaves the machine, unless you have [Gemini](#gemini-instead-of-the-model-here) make the
+vectors.
 
 - [jinaai/jina-embeddings-v5-text-small](https://huggingface.co/jinaai/jina-embeddings-v5-text-small) turns
   each entry, and each query, into a vector, so an entry that means what a query asks is found whatever its
@@ -182,9 +250,11 @@ crystal memory embed   # downloads both models now (2.4 GB), and gives every ent
   and every task's `memory_search` ask it, and only search in their own process when no daemon is running. A
   search takes about half a second on an Apple silicon Mac, most of it the reranker's; on a CPU, a few
   seconds.
-- Each entry's vector is kept beside it in `memory.db`. An entry without one, say one remembered while the
-  models were off, gets it the first time a search needs it, and vectors from a model crystal no longer uses
-  are let go.
+- Each entry's vector is kept beside it in `memory.db`, and so is each merged or forgotten one's. An entry
+  without one, say one remembered while the models were off, gets it the first time a search needs it, and
+  vectors from a model crystal no longer uses are let go. The model has once given a vector that wasn't
+  numbers (NaN), for a text it never did again, on the GPU or the CPU: one like it is made again, and never
+  kept, and one kept from before is made again as the daemon starts, or with `crystal memory embed`.
 - An entry being added is held against those there already, tasks' outcomes aside: one whose vector is as
   alike as 0.92 says the same thing; one as alike as 0.87 does when the reranker, reading the new one as the
   query, scores it 0.40 or more. On crystal's own memory, every pair that alike said the same thing, and
@@ -200,6 +270,56 @@ crystal memory embed   # downloads both models now (2.4 GB), and gives every ent
 - Both models are licensed [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/): yours to use,
   but not commercially. `embeddings = false` under `[memory]` turns search by meaning off, and `rerank =
   false` leaves the reranker out: faster on a CPU, but a search then always brings back what's nearest.
+- `crystal memory status` says how it stands: what makes the vectors, how many entries have theirs, whether
+  the models are downloaded and loaded, and with Gemini, where its key is and how its last request went.
+
+## Gemini instead of the model here
+
+`embedder = "gemini"` under `[memory]` has Google's [Gemini API](https://ai.google.dev/gemini-api/docs/embeddings)
+turn entries and searches into vectors, with `gemini-embedding-2`, in place of jina's model. The reranker here
+still reads the best of each search: the Gemini API has none.
+
+- **What goes to Google:** every entry's text (with credentials taken out, as memory keeps it), each search,
+  the first prompt of each agent that starts (what it's shown of the memory is found by it), and the last
+  things a session said that the distiller holds against the memory, credentials taken out again on the way. Turn it on only where you're fine sending your memory to Google; the settings view's row
+  says so too.
+- **The key:** put it in `~/.config/crystal/gemini.key`, one line, readable by you alone (`chmod 600`), or
+  name another file with `gemini_key_file`; with no file, `GEMINI_API_KEY` or `GOOGLE_API_KEY` in the
+  daemon's environment. Never in `config.toml`, which `crystal config export` bundles: crystal refuses a key
+  there. It's read as each request goes, so a new one counts at once, and handed to `curl` on its standard
+  input, never on its command line, where `ps` shows it; it's never logged, said in an error or passed to
+  sessions.
+- Entries go a hundred to a request, four requests at once. Crystal's own 512 entries took 31,691 tokens,
+  about $0.006 at $0.20 a million tokens, in 7 to 14 seconds. Each entry keeps a vector from each model, so
+  switching to Gemini and back embeds only what's missing; changing `gemini_dimensions` embeds every entry
+  again. A search's vector is kept an hour, since agents ask the same again.
+- **When Gemini fails** (offline, out of quota, a key it refuses), it's said once in the daemon's log, and
+  searches go by the model here while it's downloaded, else by words, until Gemini is asked again: 30
+  seconds after the network failed, as long as a 429 asks, five minutes after a refusal, or at once with a
+  new key. Nothing fails for it: a search finds what it can, and a remember keeps its entry. `crystal memory
+  status` and the settings view say why.
+- **Thresholds are its own.** Gemini's cosines sit higher and closer together than jina's (two entries are
+  0.63 alike in the middle, against jina's 0.31), so each threshold tied to them was measured again on
+  crystal's own memory, per size. By meaning, only entries within 0.08 of the best match count (0.03 to
+  0.11 tried), and a search is sent as a question to answer (`task: question answering`), which ranked a
+  little better than as a search for results. Two different lessons on one subject reached 0.913 alike,
+  higher than with jina, and the reranker scores pairs like that as high as the same said again, so an
+  entry is the same as another from 0.92 alike (0.925 at 768), and the reranker is asked only from 0.915
+  (0.918): on crystal's memory, `dedupe` finds 22 entries said again in 15 groups, every one rightly,
+  where jina finds 33. Entries are near one another, for `reconcile` and the hint as you remember, from
+  0.82 (0.825), below every pair where one corrected the other.
+- **Measured** on crystal's own 512 entries, 97 questions (a right entry among the first five, of 93 that
+  have one; the mean reciprocal rank of the first right one among ten):
+
+  | | with the reranker | without it |
+  | --- | --- | --- |
+  | jina, here | 90 of 93, 0.816 | 84, 0.746 |
+  | Gemini, 3072 | 89, 0.813 | 84, 0.804 |
+  | Gemini, 768 | 89, 0.801 | 83, 0.794 |
+
+  By meaning alone, Gemini ranks well ahead (0.83 against 0.74), but with the reranker, which the
+  default keeps, it doesn't beat the model here. And a search waits on Google: about 0.55 seconds for its
+  vector at 768, 0.77 at 3072, unless it was asked in the last hour.
 
 ## The distiller
 
@@ -227,11 +347,16 @@ task closed done or failed and it was read then. It's one `claude -p` run on Hai
   checkout.
 - What passes is kept like anything else, `from the distiller, after task <name>`: what's there already, in
   its words or others, is seen again rather than added twice, and what you forgot with `rm` it never adds
-  back (you can, by remembering it yourself).
+  back, in its words or others (you can, by remembering it yourself).
+- What it keeps may correct an entry it was shown: then it says which, why it no longer holds, and how, an
+  update (what it keeps is that entry corrected, and goes in its place under its id) or a retirement (what it
+  keeps is a new entry, and the old one is retired). Only an entry it was shown may be replaced, once, with a
+  reason, by an entry that, when it names anything, names something that's in the checkout; `memory.superseded`
+  says so of each, and `restore` puts one back.
 - It's also shown up to 4 of the stale entries about the files the work touched (those its branch changed
   since it left the default one, and those it edited), with what each names that's gone, and says of each the
   record settles whether it still holds (it's anchored again, to the code as it is), holds once reworded (its
-  text is replaced, under the same id), or no longer holds (it's forgotten, as `rm` forgets). A verdict on an
+  text is replaced, under the same id, as an update is), or no longer holds (it's forgotten, as `rm` forgets). A verdict on an
   entry it wasn't shown is refused, and so is one that keeps an entry, or rewords it, naming only what isn't
   in the checkout.
 - How it went is a line in the daemon's log, `default.log` beside the socket. `crystal memory distill <session>`
@@ -246,4 +371,9 @@ distill_model = "claude-haiku-4-5"  # the model, as `claude --model` takes it
 distill_budget_usd = 0.25           # the most one task's pass may spend
 embeddings = true                   # false to search by words alone: see above
 rerank = true                       # false to leave the reranker out
+recall_on_read = true               # false to stop showing Claude Code what's known about each file it reads
+embedder = "local"                  # "gemini" for Google's Gemini API, which entries' text goes to: see above
+gemini_model = "gemini-embedding-2" # Gemini's model
+gemini_dimensions = 768             # 3072, 1536 or 768 numbers to a vector
+# gemini_key_file = "~/.config/crystal/gemini.key"  # where its key is; never the key itself
 ```

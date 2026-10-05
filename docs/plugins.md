@@ -269,9 +269,11 @@ runs the action its handlers give a link, to try them.
 | `memory.stale` | all an entry names is gone from the code, or naming nothing to look for, every file it's about, as the daemon finds hourly and as each task closes |
 | `memory.promoted` | an entry is written into the project's CLAUDE.md or AGENTS.md, which its `file` names |
 | `memory.changed` | an entry's kind is changed, by `crystal memory kind`, `c` in the memory view or the distiller |
-| `memory.distilled` | the [distiller](memory.md#the-distiller) has read what a session did: its `distill` says how many entries it `added`, found `again`, `rechecked` of those gone stale and `rejected`, and what it cost |
+| `memory.distilled` | the [distiller](memory.md#the-distiller) has read what a session did: its `distill` says how many entries it `added`, found `again`, `rechecked` of those gone stale, `superseded` (updated or retired) of those it was shown and `rejected`, and what it cost |
 | `memory.distill_failed` | the distiller couldn't: its `distill`'s `failed` says why |
 | `memory.merged` | `crystal memory dedupe --apply` merged entries that say the same thing into one: `memory` is the one kept, as it is now, and `from` the ids of those that went into it |
+| `memory.superseded` | an entry stopped holding, another said in its place, by `remember --replaces`, `memory retire`, `memory reconcile --apply` or the distiller: `superseded` is it as it was, with `by` the entry that holds in its place (its own id when it was updated) and `why`, and `memory` that entry as it is now |
+| `memory.restored` | `crystal memory restore` put an entry that stopped holding back as it was: `memory` is it |
 | `backlog.added` | an item goes on a project's backlog |
 | `backlog.closed` | an item is marked done |
 | `plugin.paused` | a plugin is paused for failing |

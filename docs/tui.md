@@ -40,6 +40,7 @@ waiting on you moves to the top, and that session leads its worktree.
 | `▲` waiting | the agent is asking you something, like a permission |
 | `◐` working | the agent is working on a turn; the mark turns while it does |
 | `✓` done | the agent finished its turn, and you haven't looked yet |
+| `◇` open | its task is still open, but the agent asks nothing of you: it said it waits on something else, like CI |
 | `▸` | running: an agent at its prompt |
 | `❯` | a terminal: muted at a shell's prompt, brighter while a program runs in it |
 | `■` | ended: muted when it exited well, red when it failed or [couldn't start again](sessions.md#after-a-restart); the pane's header says how |
@@ -158,7 +159,7 @@ lines past its first take the place of its task's line and its reported line, un
 | `agent` | what's in front in it, in a word, or the agent reported with `--display-agent` |
 | `model` | the model its agent runs on |
 | `subagents` | how many subagents its agent has running, `+2` |
-| `state` | its status in a word (`waiting`, `working`, `done`, `idle`, `running`, `ended`, `failed`, `starting`), or the label reported for it with `--state-label` |
+| `state` | its status in a word (`waiting`, `working`, `done`, `open`, `idle`, `running`, `ended`, `failed`, `starting`), or the label reported for it with `--state-label` |
 | `when` | how long ago it changed, or the tab it's in when it's shown from another |
 | `bell` | `♪` while its bell rang out of sight |
 | `task` | its task: what it was asked to do, or how that went |

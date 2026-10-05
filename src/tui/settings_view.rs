@@ -28,7 +28,7 @@ use super::search::letters_in;
 use super::text_input::TextInput;
 use super::theme::{self, Theme};
 use crate::config::{
-    self, BarPosition, Config, EmptiedWorktree, Fold, NewCwd, SessionSettings, ShellMode,
+    self, BarPosition, Config, Embedder, EmptiedWorktree, Fold, NewCwd, SessionSettings, ShellMode,
     SidebarOrder, TaskSettings, ThemeName,
 };
 use crate::embed::Status;
@@ -111,7 +111,10 @@ pub enum Setting {
     DistillModel,
     DistillBudget,
     Embeddings,
+    Embedder,
+    GeminiDimensions,
     Rerank,
+    RecallOnRead,
 }
 
 impl Setting {
@@ -172,7 +175,10 @@ impl Setting {
             Setting::DistillModel => &["memory", "distill_model"],
             Setting::DistillBudget => &["memory", "distill_budget_usd"],
             Setting::Embeddings => &["memory", "embeddings"],
+            Setting::Embedder => &["memory", "embedder"],
+            Setting::GeminiDimensions => &["memory", "gemini_dimensions"],
             Setting::Rerank => &["memory", "rerank"],
+            Setting::RecallOnRead => &["memory", "recall_on_read"],
         }
     }
 
@@ -233,7 +239,10 @@ impl Setting {
             Setting::DistillModel => "  model",
             Setting::DistillBudget => "  budget",
             Setting::Embeddings => "search by meaning",
+            Setting::Embedder => "  vectors by",
+            Setting::GeminiDimensions => "  dimensions",
             Setting::Rerank => "  rerank",
+            Setting::RecallOnRead => "shown as files are read",
         }
     }
 
@@ -381,6 +390,16 @@ const DISTILL_BUDGETS: [i64; 4] = [10, 25, 50, 100];
 /// The shell modes and the places a new terminal starts, as the file
 /// writes them.
 const SHELL_MODES: [&str; 3] = ["auto", "login", "non_login"];
+
+/// What `[memory] embedder` takes, as the file writes it.
+const EMBEDDERS: [&str; 2] = ["local", "gemini"];
+
+fn embedder_name(embedder: Embedder) -> &'static str {
+    match embedder {
+        Embedder::Local => EMBEDDERS[0],
+        Embedder::Gemini => EMBEDDERS[1],
+    }
+}
 const NEW_CWDS: [&str; 3] = ["follow", "home", "current"];
 
 /// The choice after `now` among `choices`, in order, or before it, going
@@ -560,7 +579,10 @@ const TABS: [Tab; 8] = [
                 S::DistillModel,
                 S::DistillBudget,
                 S::Embeddings,
+                S::Embedder,
+                S::GeminiDimensions,
                 S::Rerank,
+                S::RecallOnRead,
             ],
         )],
     },
@@ -1204,7 +1226,16 @@ impl SettingsView {
             S::Distill => on(!config.memory.distill),
             S::DistillBudget => money(config.memory.distill_budget_usd, &DISTILL_BUDGETS),
             S::Embeddings => on(!config.memory.embeddings),
+            S::Embedder => {
+                let now = embedder_name(config.memory.embedder);
+                Change::set(setting, next_named(&EMBEDDERS, now, forward))
+            }
+            S::GeminiDimensions => {
+                let now = config.memory.gemini_dimensions;
+                number(next_of(&crate::gemini::DIMENSIONS, now, forward).into())
+            }
             S::Rerank => on(!config.memory.rerank),
+            S::RecallOnRead => on(!config.memory.recall_on_read),
             S::NotifyCommand
             | S::Separator
             | S::WindowTitle
@@ -1358,7 +1389,7 @@ fn model_says(status: Option<&Status>, on: bool) -> (String, Option<bool>) {
     };
     let mb = |bytes: u64| bytes / 1_000_000;
     if let Some(doing) = &status.preparing {
-        if !status.is_downloaded() {
+        if !status.is_downloaded() && doing.starts_with("downloading") {
             let got = format!("{} of {} MB", mb(status.on_disk), mb(status.size));
             return (format!("{doing} · {got}"), None);
         }
@@ -1384,6 +1415,39 @@ fn model_says(status: Option<&Status>, on: bool) -> (String, Option<bool>) {
             Some(true),
         ),
         (false, false) => ("downloaded, not loaded".to_string(), None),
+    }
+}
+
+/// What the Gemini line says of how Gemini stands: where its key is, or
+/// why it failed last and what searches go by meanwhile.
+fn gemini_says(status: Option<&Status>) -> (String, Option<bool>) {
+    let Some((status, gemini)) = status.and_then(|status| Some((status, status.gemini.as_ref()?)))
+    else {
+        return ("the daemon didn't say".to_string(), None);
+    };
+    if let Some(failed) = &gemini.failed {
+        let meanwhile = match status.is_downloaded() {
+            true => "jina v5",
+            false => "words",
+        };
+        return (
+            format!("{failed}; searches go by {meanwhile} meanwhile"),
+            Some(false),
+        );
+    }
+    let key = gemini.key.as_deref().unwrap_or("nowhere");
+    if gemini.key_shared {
+        return (
+            format!("key in {key}, which others can read: chmod 600 it"),
+            Some(false),
+        );
+    }
+    match gemini.tokens {
+        0 => (format!("key in {key}; asked nothing yet"), Some(true)),
+        tokens => (
+            format!("key in {key}; {tokens} tokens sent since the daemon started"),
+            Some(true),
+        ),
     }
 }
 
@@ -2043,13 +2107,42 @@ fn shown(setting: Setting, config: &Config) -> Shown {
         },
         S::Embeddings => Shown {
             dim: !memory_on,
-            ..switch(config.memory.embeddings, "jina v5, on this machine")
+            ..switch(
+                config.memory.embeddings,
+                "as well as by words; enter gets it ready",
+            )
+        },
+        S::Embedder => Shown {
+            dim: !memory_on || !config.memory.embeddings,
+            ..choice(
+                embedder_name(config.memory.embedder).to_string(),
+                match config.memory.embedder {
+                    Embedder::Local => "jina v5, on this machine: ←/→",
+                    Embedder::Gemini => "Google's Gemini API: entries' text goes to Google: ←/→",
+                },
+            )
+        },
+        S::GeminiDimensions => Shown {
+            dim: !memory_on
+                || !config.memory.embeddings
+                || config.memory.embedder != Embedder::Gemini,
+            ..choice(
+                config.memory.gemini_dimensions.to_string(),
+                "of each of Gemini's vectors; a change embeds every entry again: ←/→",
+            )
         },
         S::Rerank => Shown {
             dim: !memory_on || !config.memory.embeddings,
             ..switch(
                 config.memory.rerank,
                 "jina's reranker reads the best of a search again",
+            )
+        },
+        S::RecallOnRead => Shown {
+            dim: !memory_on,
+            ..switch(
+                config.memory.recall_on_read,
+                "what's known about a file, as Claude Code reads or edits it",
             )
         },
     };
@@ -2196,6 +2289,10 @@ fn after_section(
         let memory = &config.memory;
         let (said, good) = model_says(view.model(), memory.embeddings);
         lines.push(detail("models", said, good));
+        if memory.embeddings && memory.embedder == Embedder::Gemini {
+            let (said, good) = gemini_says(view.model());
+            lines.push(detail("gemini", said, good));
+        }
         if let Some(status) = view.model()
             && (memory.embeddings || status.is_downloaded())
         {
@@ -2456,6 +2553,7 @@ mod tests {
             (S::Distill, false),
             (S::Embeddings, false),
             (S::Rerank, false),
+            (S::RecallOnRead, false),
             (S::HideDrafts, true),
         ];
         for (setting, to) in switches {
@@ -2586,6 +2684,18 @@ mod tests {
             cents(S::DistillBudget, 50),
             cents(S::DistillBudget, 10),
         );
+        both(
+            &mut view,
+            S::Embedder,
+            change(S::Embedder, "gemini"),
+            change(S::Embedder, "gemini"),
+        );
+        both(
+            &mut view,
+            S::GeminiDimensions,
+            number(S::GeminiDimensions, 1536),
+            number(S::GeminiDimensions, 3072),
+        );
     }
 
     #[test]
@@ -2643,7 +2753,7 @@ mod tests {
             }
         }
         let settings: usize = (0..KEYS_TAB).map(|tab| rows(tab, &[]).len()).sum();
-        assert_eq!(settings, 55);
+        assert_eq!(settings, 58);
     }
 
     /// Writes `change` to a config file made of `text`, and reads it back.
@@ -3328,6 +3438,61 @@ mod tests {
             ..ready
         };
         assert!(memory(&config, Some(failed)).contains("couldn't get them ready"));
+    }
+
+    #[test]
+    fn with_gemini_the_view_says_entries_go_to_google_and_how_its_key_stands() {
+        let row = |name: &str, value: &str| format!("{name:<22}{value}");
+        let mut config = Config::default();
+        let memory = |config: &Config, model| {
+            let mut view = view_of(config.clone(), model);
+            press(&mut view, KeyCode::Char('6'));
+            text(&view)
+        };
+        let shown = memory(&config, Some(status()));
+        assert!(shown.contains(&row("  vectors by", "local")), "{shown}");
+        assert!(!shown.contains("    gemini"), "{shown}");
+        config.memory.embedder = Embedder::Gemini;
+        let gemini = |gemini: crate::gemini::Status| Status {
+            on_disk: 134_000_000,
+            gemini: Some(gemini),
+            ..status()
+        };
+        let working = crate::gemini::Status {
+            model: "gemini-embedding-2@768".into(),
+            key: Some("~/.config/crystal/gemini.key".into()),
+            tokens: 31_691,
+            ..crate::gemini::Status::default()
+        };
+        let shown = memory(&config, Some(gemini(working.clone())));
+        assert!(shown.contains(&row("  vectors by", "gemini")), "{shown}");
+        assert!(shown.contains("entries' text goes to Google"), "{shown}");
+        assert!(shown.contains(&row("  dimensions", "768")), "{shown}");
+        assert!(
+            shown.contains("key in ~/.config/crystal/gemini.key; 31691 tokens sent"),
+            "{shown}"
+        );
+        let failed = crate::gemini::Status {
+            failed: Some("gemini-embedding-2: Quota exceeded. (RESOURCE_EXHAUSTED)".into()),
+            failed_secs_ago: Some(30),
+            ..working.clone()
+        };
+        let shown = memory(&config, Some(gemini(failed.clone())));
+        assert!(
+            shown.contains("Quota exceeded. (RESOURCE_EXHAUSTED); searches go by jina v5"),
+            "{shown}"
+        );
+        let undownloaded = Status {
+            on_disk: 0,
+            ..gemini(failed)
+        };
+        assert!(memory(&config, Some(undownloaded)).contains("searches go by words meanwhile"));
+        let shared = crate::gemini::Status {
+            key_shared: true,
+            ..working
+        };
+        assert!(memory(&config, Some(gemini(shared))).contains("others can read: chmod 600"));
+        assert!(memory(&config, Some(status())).contains("the daemon didn't say"));
     }
 
     #[test]

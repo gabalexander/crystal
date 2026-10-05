@@ -12,7 +12,7 @@ use crate::artifacts;
 use crate::backlog;
 use crate::catalog;
 use crate::codex;
-use crate::config::{Config, MemorySettings};
+use crate::config::{self, Config, MemorySettings};
 use crate::db;
 use crate::db::Db;
 use crate::distill::{self, Job};
@@ -190,6 +190,7 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
         moves: Mutex::default(),
         spare: Mutex::default(),
         sweep,
+        earlier: Mutex::default(),
     });
     // A daemon starts again after every upgrade, or is handed over to the
     // new crystal, so this is where the skill an earlier crystal installed
@@ -349,6 +350,9 @@ struct Daemon {
     spare: Mutex<Option<Spare>>,
     /// Asks for a look for entries of memory gone stale: see [`tell_stale`].
     sweep: SyncSender<()>,
+    /// The CPU time each process had at the looks at what crystal takes,
+    /// for the next look to count from.
+    earlier: Mutex<resources::Earlier>,
 }
 
 /// The projects the sessions run in that are on the list already, as
@@ -836,24 +840,30 @@ impl Daemon {
             });
             self.list_projects_of(&sessions);
             // Written while the list is still locked, so that an older list
-            // can never be written after a shutdown has emptied it.
+            // can never be written after a shutdown has emptied it; and with
+            // the flow runs, in one go, so that a crash never leaves a step's
+            // session written down without its run.
             let saved = written_down(&sessions, &self.moves.lock().unwrap());
-            if saved != last_saved {
-                match self.db.lock().unwrap().save_sessions(&saved) {
-                    Ok(()) => last_saved = saved,
-                    Err(err) => errln!("crystal daemon: couldn't save the sessions: {err:#}"),
+            let runs = self.flows.lock().unwrap().clone();
+            if saved != last_saved || runs != last_runs {
+                match self
+                    .db
+                    .lock()
+                    .unwrap()
+                    .save_sessions_and_runs(&saved, &runs)
+                {
+                    Ok(()) => {
+                        last_saved = saved;
+                        last_runs = runs;
+                    }
+                    Err(err) => {
+                        errln!("crystal daemon: couldn't save the sessions and flow runs: {err:#}")
+                    }
                 }
             }
             if screens_checked.elapsed() >= SCREENS_CHECK_EVERY {
                 screens_checked = Instant::now();
                 self.keep_screens(&sessions, &mut kept_screens);
-            }
-            let runs = self.flows.lock().unwrap().clone();
-            if runs != last_runs {
-                match self.db.lock().unwrap().save_flow_runs(&runs) {
-                    Ok(()) => last_runs = runs,
-                    Err(err) => errln!("crystal daemon: couldn't save the flow runs: {err:#}"),
-                }
             }
         }
     }
@@ -1104,11 +1114,10 @@ impl Daemon {
         // Written down first: whatever goes wrong from here, the next
         // daemon starts them again, as after any restart.
         let saved = written_down(&sessions, &moves);
-        {
-            let mut db = self.db.lock().unwrap();
-            db.save_sessions(&saved)?;
-            db.save_flow_runs(&flows)?;
-        }
+        self.db
+            .lock()
+            .unwrap()
+            .save_sessions_and_runs(&saved, &flows)?;
         handover::HELPERS.finish(deadline);
         handover::stop_reading();
         let mut handed = Vec::new();
@@ -1766,35 +1775,36 @@ impl Daemon {
         })
     }
 
-    /// How the model that searches memory by meaning stands. Asked while
-    /// the config says not to search with it, the daemon lets it go; while
-    /// it has it loaded and entries have no vector yet, it gives them one,
-    /// in the background, rather than at the next search.
+    /// How the models that search memory by meaning stand. Asked while
+    /// the config says not to search with them, the daemon lets them go;
+    /// while entries have no vector yet from what searches use, and it
+    /// could give them one (the models here loaded, or Gemini with a key
+    /// and not resting after a failure), it does, in the background, rather
+    /// than at the next search.
     fn embedding_status(&self) -> Result<embed::Status> {
         let settings = settings().memory;
         embed::let_go_unless(&settings);
-        let on_disk = embed::models_dir().map_or(0, |dir| embed::on_disk(&dir));
-        let (entries, embedded) = memory::Store::open(&self.socket)?.counts(embed::MODEL)?;
-        if embed::is_loaded() && embedded < entries {
-            self.prepare_embeddings(true);
+        let mut status = embed::status(&self.socket, &settings)?;
+        let could = match status.gemini {
+            Some(_) => embed::gemini_ready(&settings),
+            None => embed::is_loaded(),
+        };
+        if could && status.embedded < status.entries {
+            self.prepare_embeddings(false);
         }
         let preparing = self.preparing.lock().unwrap();
-        Ok(embed::Status {
-            on_disk,
-            size: embed::size(),
-            loaded: embed::is_loaded(),
-            preparing: preparing.doing.map(String::from),
-            failed: preparing.failed.clone(),
-            entries,
-            embedded,
-        })
+        status.preparing = preparing.doing.map(String::from);
+        status.failed = preparing.failed.clone();
+        Ok(status)
     }
 
-    /// Gets the models that search memory by meaning ready, on a thread of
-    /// their own, unless that's being done already: downloads them if they
-    /// aren't here and `download` says to, then, while the config still says
-    /// to search with them, loads them, lets go of other models' vectors and
-    /// gives every entry its vector.
+    /// Gets what searches memory by meaning ready, on a thread of its own,
+    /// unless that's being done already: with Gemini, gives every entry its
+    /// vector from it first, which takes seconds; then downloads the models
+    /// here if they aren't yet and `download` says to, which takes minutes,
+    /// and, while the config still says to search by meaning, loads them,
+    /// lets go of the vectors of models it doesn't search with or fall back
+    /// on, and with no Gemini, gives every entry its vector from them.
     fn prepare_embeddings(&self, download: bool) {
         {
             let mut preparing = self.preparing.lock().unwrap();
@@ -1802,7 +1812,7 @@ impl Daemon {
                 return;
             }
             *preparing = Preparing {
-                doing: Some("downloading the models"),
+                doing: Some("getting the models ready"),
                 failed: None,
             };
         }
@@ -1811,24 +1821,40 @@ impl Daemon {
         thread::spawn(move || {
             let doing = |what| preparing.lock().unwrap().doing = Some(what);
             let prepared = (|| -> Result<()> {
+                let settings = settings().memory;
+                let mut store = memory::Store::open(&socket)?;
+                let gemini = settings.embedder == config::Embedder::Gemini;
+                if gemini && let Some(remote) = embed::shared(&settings) {
+                    doing("embedding the entries with Gemini");
+                    // A failure is said as it happens, and kept for the
+                    // status: the models here are got ready all the same.
+                    if let Ok(count @ 1..) = store.embed_missing(&*remote) {
+                        errln!(
+                            "crystal daemon: embedded {count} entries of memory with {}",
+                            remote.model()
+                        );
+                    }
+                }
                 let downloaded = embed::models_dir().is_some_and(|dir| embed::is_downloaded(&dir));
                 if !downloaded {
                     if !download {
                         return Ok(());
                     }
+                    doing("downloading the models");
                     errln!("crystal daemon: downloading {}", embed::names());
                     embed::download(false)?;
                 }
                 doing("loading the models");
-                let Some(models) = embed::shared_now() else {
+                let Some(models) = embed::shared(&settings) else {
                     return Ok(());
                 };
-                doing("embedding the entries");
-                let mut store = memory::Store::open(&socket)?;
-                store.forget_vectors_but(embed::MODEL)?;
-                match store.embed_missing(&*models)? {
-                    0 => {}
-                    count => errln!("crystal daemon: embedded {count} entries of memory"),
+                store.forget_vectors_but(&[embed::MODEL, &embed::gemini_model(&settings)])?;
+                if !gemini {
+                    doing("embedding the entries");
+                    match store.embed_missing(&*models)? {
+                        0 => {}
+                        count => errln!("crystal daemon: embedded {count} entries of memory"),
+                    }
                 }
                 Ok(())
             })();
@@ -2122,6 +2148,38 @@ impl Daemon {
         self.tell_renamed(session, &old_name);
     }
 
+    /// What the session `id`, or else called `name`, is told of its
+    /// project's memory as its agent reads or edits `file`, the first time
+    /// it does: the entries about it it hasn't been shown, as
+    /// [`Response::Context`]. Nothing for a file it was told of already, or
+    /// that's outside its project, or with memory or `recall_on_read` off.
+    /// The sessions aren't held while the memory is looked through.
+    fn recall(&self, name: &str, id: Option<&str>, file: &Path) -> Result<Response> {
+        let config = settings();
+        if !memory::enabled(&config) || !config.memory.recall_on_read {
+            return Ok(Response::Done);
+        }
+        let (id, lookup) = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let session = id_or_name(&mut sessions, id.map(String::from), Some(name.to_string()))?;
+            let Some(lookup) = session.recall_lookup(file) else {
+                return Ok(Response::Done);
+            };
+            (session.id.clone(), lookup)
+        };
+        let (lookup, asked) = lookup;
+        let mut store = memory::Store::open(&self.socket)?;
+        let found = store.about_file(&lookup.project, &lookup.top, &lookup.file, &asked)?;
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions.iter_mut().find(|session| session.id == id) else {
+            return Ok(Response::Done);
+        };
+        Ok(match session.recalled().tell(&lookup.file, &found) {
+            Some(text) => Response::Context { text },
+            None => Response::Done,
+        })
+    }
+
     /// Tells that `session` was called `from` until now, and keeps a flow's
     /// step to it under its new name.
     fn tell_renamed(&self, session: &Session, from: &str) {
@@ -2169,6 +2227,8 @@ impl Daemon {
                 subagent,
                 model,
                 wakeup,
+                said,
+                pending,
             } => {
                 let agent = agent.unwrap_or_else(|| "claude".to_string());
                 // The agent kept warm is in no list till it's taken over.
@@ -2212,6 +2272,15 @@ impl Daemon {
                 }
                 let moving = self.is_moving(&id);
                 let session = with_id(&mut sessions, &id)?;
+                // Before it's reminded of its task: whether it asks the user
+                // anything, and what of its own is still to come, say whether
+                // its turn is over.
+                if event == AgentEvent::TurnEnded {
+                    session.turn_ended_with(said.as_deref(), pending);
+                }
+                if let Some(prompt) = &prompt {
+                    session.recalled().asked(prompt);
+                }
                 if let Some(conversation) = conversation {
                     session.set_hooked_conversation(&agent, conversation);
                 }
@@ -2278,6 +2347,7 @@ impl Daemon {
                     None => Ok(Response::Done),
                 }
             }
+            Request::Recall { name, id, file } => self.recall(&name, id.as_deref(), &file),
             Request::ReportAgent {
                 id,
                 name,
@@ -2582,16 +2652,38 @@ impl Daemon {
                 let entries = memory::Memory::read(&self.socket, &project)?.listed();
                 Ok(Response::Memory { entries })
             }
-            Request::Remember { project, entry } => {
+            Request::Remember {
+                project,
+                entry,
+                replaces,
+            } => {
                 crate::plugins::ensure_enabled(&settings(), "memory")?;
                 let embedder = embed::shared_now();
+                let embedder = embed::as_embed(&embedder);
                 let mut store = memory::Store::open(&self.socket)?;
-                let added = store.add_with(&project, entry, embed::as_embed(&embedder))?;
-                if let memory::Added::New(entry) = &added {
-                    let added = Event::memory(Kind::MemoryAdded, project, entry.clone());
-                    self.events.emit(added);
+                let (added, retired) = match &replaces {
+                    Some(replacing) => {
+                        store.replace(&project, entry, replacing.id, &replacing.why, embedder)?
+                    }
+                    None => (store.add_with(&project, entry, embedder)?, None),
+                };
+                for event in crate::events::remembered(&project, &added, retired.as_ref()) {
+                    self.events.emit(event);
                 }
-                Ok(Response::Remembered(added))
+                Ok(match replaces {
+                    Some(_) => Response::Replaced {
+                        added,
+                        retired: retired.map(Box::new),
+                    },
+                    None => Response::Remembered(added),
+                })
+            }
+            Request::NearMemory { dir } => {
+                crate::plugins::ensure_enabled(&settings(), "memory")?;
+                let project = memory::project_of(&dir);
+                let embedder = embed::shared_now();
+                let near = memory::near(&self.socket, &project, embed::as_embed(&embedder))?;
+                Ok(Response::Near(near))
             }
             Request::DedupeMemory { dir, apply } => {
                 crate::plugins::ensure_enabled(&settings(), "memory")?;
@@ -2666,7 +2758,8 @@ impl Daemon {
             }
             Request::TaskToTerminal { task, env } => self.task_to_terminal(&task, env),
             Request::Resources { client } => {
-                // `ps` takes a moment: the sessions aren't held meanwhile.
+                // A look takes a moment, and the first waits half a second
+                // for CPU to count: the sessions aren't held meanwhile.
                 let running: Vec<(String, u32)> = {
                     let sessions = self.sessions.lock().unwrap();
                     let running = sessions
@@ -2674,9 +2767,16 @@ impl Daemon {
                         .filter_map(|session| Some((session.name.clone(), session.running_pid()?)));
                     running.collect()
                 };
-                let warm = self.spare_pid();
-                let taken = resources::measure(std::process::id(), client, &running, warm);
-                Ok(Response::Resources(taken))
+                let whose = resources::Whose {
+                    daemon: std::process::id(),
+                    client,
+                    sessions: &running,
+                    warm: self.spare_pid(),
+                };
+                Ok(Response::Resources(resources::measure(
+                    &self.earlier,
+                    &whose,
+                )))
             }
             Request::Spending => Ok(Response::Spending(protocol::Spending {
                 today_usd: self.spending.today(),
@@ -3348,9 +3448,12 @@ impl Daemon {
 
         // The ended session makes way for the new one, and comes back if
         // that doesn't start.
-        let ended = sessions.remove(index);
+        let mut ended = sessions.remove(index);
         let launch = ended.launch();
         let name_given = launch.name_given;
+        // An agent picked up in its conversation has what it was shown of
+        // its project's memory there still.
+        let goes_on = launch.conversation.is_some() || launch.resume.is_some();
         // Run again, its task is open again: the work goes on.
         let backlog = launch.goal.as_ref().and_then(|goal| goal.backlog);
         let brief = brief_of(&launch);
@@ -3411,6 +3514,11 @@ impl Daemon {
         let mut started = sessions.pop().expect("start added a session");
         if name_given {
             started.keep_given_name();
+        }
+        if goes_on {
+            started
+                .recalled()
+                .carry_on(std::mem::take(ended.recalled()));
         }
         // It's the same task, open again, under the same number.
         if let (Some(goal), true) = (launch.goal, started.task_record().is_some()) {
@@ -3655,6 +3763,7 @@ fn distill_about(report: &Result<distill::Report>) -> DistillAbout {
             made_lessons: report.made_lessons.len(),
             rejected: report.rejected.len(),
             rechecked: report.kept.len() + report.reworded.len() + report.forgot.len(),
+            superseded: report.updated.len() + report.retired.len(),
             cost_usd: report.cost_usd,
             failed: None,
         },
@@ -3666,12 +3775,16 @@ fn distill_about(report: &Result<distill::Report>) -> DistillAbout {
 }
 
 /// Tells of the entries the distiller added to the memory of `job`'s
-/// project, and the notes it made lessons, by their ids, and of the stale
-/// ones it forgot.
+/// project, and the notes it made lessons, by their ids, of those it
+/// updated, retired or reworded, and of the stale ones it forgot.
 fn tell_distilled(events: &Bus, job: &Job, report: &distill::Report) {
     for entry in &report.forgot_entries {
         let forgot = Event::memory(Kind::MemoryForgotten, job.project.clone(), entry.clone());
         events.emit(forgot);
+    }
+    for (was, holder) in &report.superseded {
+        let superseded = Event::superseded(job.project.clone(), holder.clone(), was.clone());
+        events.emit(superseded);
     }
     let Ok(mut store) = memory::Store::open(&job.socket) else {
         return;
@@ -3883,8 +3996,8 @@ fn start_as(
     let task = task.filter(|_| tasks::enabled(&config));
     // Picked up again with its own command, its conversation has heard
     // crystal's notes already.
-    let instructions = if resumed {
-        Vec::new()
+    let (instructions, remembered) = if resumed {
+        (Vec::new(), Vec::new())
     } else {
         launch_notes(socket, &cwd, &command, task.as_deref(), &brief, &config)
     };
@@ -3915,6 +4028,7 @@ fn start_as(
     if agent_names {
         session.let_agent_name();
     }
+    session.recalled().launched(&remembered);
     session.set_about(&brief);
     if let Some(goal) = task {
         session.give_task(new_task_info(goal, false, backlog, brief));
@@ -3969,7 +4083,8 @@ fn names_itself(name: Option<&str>, command: &[String], config: &Config) -> bool
 /// tasks on, and of the pull request and the issue `brief` names, whether
 /// it's a task or not; how to work on several things at once here and show
 /// the user files, for Claude Code; the notes its worktree's sessions left; and what its
-/// project remembers that has to do with the words of `command`.
+/// project remembers that has to do with the words of `command`. And the
+/// entries of its project's memory that shows it, by id.
 fn launch_notes(
     socket: &Path,
     cwd: &Path,
@@ -3977,14 +4092,17 @@ fn launch_notes(
     task: Option<&str>,
     brief: &TaskBrief,
     config: &Config,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<u64>) {
     let about_task = paragraphs([
         task.map(|_| tasks::instructions(backlog::enabled(config))),
         tasks::forge_notes(brief, cwd, task.is_some()),
     ]);
     let parallel = (agents::program_name(command) == Some("claude"))
         .then(|| format!("{} {}", agents::PARALLEL_WORK, agents::SHOWING_FILES));
-    let remembered = remembered(socket, cwd, command);
+    let memory::Launch {
+        text: remembered,
+        shown,
+    } = remembered(socket, cwd, command);
     let said = [
         task,
         about_task.as_deref(),
@@ -3992,7 +4110,7 @@ fn launch_notes(
         remembered.as_deref(),
     ];
     let handoff = handoff_note(cwd, &said);
-    notes(about_task, parallel, handoff, remembered)
+    (notes(about_task, parallel, handoff, remembered), shown)
 }
 
 /// Whether the session called `name` can be resumed with `argv`, the
@@ -4065,15 +4183,15 @@ fn handoff_note(cwd: &Path, said: &[Option<&str>]) -> Option<String> {
 /// with the words of its command as what it was asked, unless the config
 /// turns memory off: Claude Code, Codex, or another agent crystal knows
 /// that's given a first prompt to say it in.
-fn remembered(socket: &Path, cwd: &Path, command: &[String]) -> Option<String> {
-    let reader = match agents::program_name(command)? {
-        "claude" => memory::Reader::Claude,
-        "codex" => memory::Reader::Agent,
-        _ if catalog::first_prompt_at(command).is_some() => memory::Reader::Agent,
-        _ => return None,
+fn remembered(socket: &Path, cwd: &Path, command: &[String]) -> memory::Launch {
+    let reader = match agents::program_name(command) {
+        Some("claude") => memory::Reader::Claude,
+        Some("codex") => memory::Reader::Agent,
+        Some(_) if catalog::first_prompt_at(command).is_some() => memory::Reader::Agent,
+        _ => return memory::Launch::default(),
     };
     if !memory::enabled_now() {
-        return None;
+        return memory::Launch::default();
     }
     let asked = command[1..].join(" ");
     launch_memory(socket, cwd, &asked, reader)
@@ -4082,14 +4200,12 @@ fn remembered(socket: &Path, cwd: &Path, command: &[String]) -> Option<String> {
 /// What the memory of the project `cwd` is in tells `reader` as it starts
 /// there, asked `asked`: what has to do with the files its worktree has
 /// changed comes first.
-fn launch_memory(socket: &Path, cwd: &Path, asked: &str, reader: memory::Reader) -> Option<String> {
+fn launch_memory(socket: &Path, cwd: &Path, asked: &str, reader: memory::Reader) -> memory::Launch {
     let project = memory::project_of(cwd);
     let changed = git::branch_changes(cwd).unwrap_or_default();
     let embedder = embed::shared_now();
     let embedder = embed::as_embed(&embedder);
-    memory::for_launch(socket, &project, asked, &changed, reader, embedder)
-        .ok()
-        .flatten()
+    memory::for_launch(socket, &project, asked, &changed, reader, embedder).unwrap_or_default()
 }
 
 /// What gives a Claude Code session in `cwd` the tools crystal tells it
@@ -4213,6 +4329,7 @@ fn crystal_commands(config: &Config) -> Vec<&'static str> {
             "Bash(crystal memory list:*)",
             "Bash(crystal memory search:*)",
             "Bash(crystal memory show:*)",
+            "Bash(crystal memory retire:*)",
         ]);
     }
     rules
@@ -4233,7 +4350,7 @@ fn task_args(
     let config = settings();
     let memory_on = memory::enabled(&config);
     let remembered = memory_on
-        .then(|| launch_memory(socket, cwd, &spec.prompt, memory::Reader::Task))
+        .then(|| launch_memory(socket, cwd, &spec.prompt, memory::Reader::Task).text)
         .flatten();
     // Its runs close it, so it's told nothing of closing it: only of the
     // pull request and the issue it's about.
@@ -4799,6 +4916,7 @@ mod tests {
             "Bash(crystal memory search:*)",
             "Bash(crystal memory list:*)",
             "Bash(crystal memory add:*)",
+            "Bash(crystal memory retire:*)",
         ] {
             assert!(rules.contains(&allowed), "{allowed}: {rules:?}");
         }
@@ -4817,6 +4935,8 @@ mod tests {
             "crystal memory rm",
             "crystal memory distill",
             "crystal memory promote",
+            "crystal memory restore",
+            "crystal memory reconcile",
             "crystal kill-server",
         ] {
             let covers = |rule: &&str| {

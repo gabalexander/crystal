@@ -47,6 +47,8 @@ crystal kill review                         # stop one session; asks if its empt
 crystal archive review                      # stop it and keep it in the archive, out of the list
 crystal unarchive review                    # start it again where it was, in its conversation
 crystal ls --archived                       # the archived sessions
+crystal usage                               # the memory and CPU each session takes, and crystal's own
+crystal usage --json                        # the same, as JSON, with the totals
 crystal project                             # the projects crystal knows, running or not
 crystal project run                         # run this worktree's project in a session of its own
 crystal kill-server                         # stop every session, and the daemon
@@ -89,10 +91,10 @@ Their pages say more: `task`, `result` and `answer` in [background tasks](tasks.
 agents](driving.md); `pane`, `tab`, `title`, `sidebar move` and `layout` in [laying out the
 TUI](driving.md#laying-out-the-tui), and `skill` in [a skill for Claude
 Code](driving.md#a-skill-for-claude-code); `archive` and `unarchive` in
-[archiving](sessions.md#archiving-and-idle-agents); `update` and `completions` in [installing
-crystal](install.md); `server` and `ssh` in [other machines and servers](servers.md); `config` and `profile`
-in [settings](configuration.md); `integration` in [agents you start
-yourself](agents.md#agents-you-start-yourself); `open` and `mermaid` in [files an agent shows
+[archiving](sessions.md#archiving-and-idle-agents); `usage` in [resources](sessions.md#resources); `update`
+and `completions` in [installing crystal](install.md); `server` and `ssh` in [other machines and
+servers](servers.md); `config` and `profile` in [settings](configuration.md); `integration` in [agents you
+start yourself](agents.md#agents-you-start-yourself); `open` and `mermaid` in [files an agent shows
 you](code.md#files-an-agent-shows-you) and [the file finder](code.md#the-file-finder-and-the-tree-browser);
 and `guide` prints [the guide](guide.md).
 

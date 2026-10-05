@@ -499,6 +499,13 @@
           "minimum": 0,
           "default": 0
         },
+        "superseded": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "description": "How many of the entries it was shown it updated or retired, as what it kept replaced them.",
+          "default": 0
+        },
         "cost_usd": {
           "type": "number",
           "format": "double"
@@ -575,6 +582,26 @@
           "description": "The ids of the stale entries it said no longer hold, forgotten.",
           "default": []
         },
+        "updated": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "description": "The ids of the entries it was shown that what it kept corrected, each put in its place under its id.",
+          "default": []
+        },
+        "retired": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "description": "The ids of the entries it was shown that what it kept replaced, each retired.",
+          "default": []
+        },
         "rejected": {
           "type": "array",
           "items": {
@@ -643,12 +670,29 @@
           "type": "integer",
           "format": "uint",
           "minimum": 0,
-          "description": "How many entries every project has, and how many of them have their vector from the model."
+          "description": "How many entries every project has, and how many of them have their vector from the model searches use now."
         },
         "embedded": {
           "type": "integer",
           "format": "uint",
           "minimum": 0
+        },
+        "embedder": {
+          "type": "string",
+          "description": "What searches use, as its vectors are kept under: `MODEL`, or Gemini's model at its size.",
+          "default": ""
+        },
+        "gemini": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GeminiStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How Gemini stands, while searches use it.",
+          "default": null
         }
       },
       "required": [
@@ -753,6 +797,17 @@
               "type": "null"
             }
           ]
+        },
+        "superseded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemorySuperseded"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "An entry of memory that stopped holding, as it was, with what holds in its place and why: `memory` is that, as it is now."
         },
         "backlog": {
           "anyOf": [
@@ -1060,6 +1115,14 @@
         {
           "const": "memory.merged",
           "description": "entries that say the same thing are merged into one, by `crystal memory dedupe`"
+        },
+        {
+          "const": "memory.superseded",
+          "description": "an entry stops holding, another said in its place: updated, or retired"
+        },
+        {
+          "const": "memory.restored",
+          "description": "an entry that stopped holding is put back as it was"
         },
         {
           "const": "backlog.added",
@@ -1565,6 +1628,53 @@
       ],
       "description": "What's in front in a session's terminal: the program its keys go to."
     },
+    "GeminiStatus": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string",
+          "description": "The model and its size, as each vector is kept under: `gemini-embedding-2@768`."
+        },
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Where the key is read from, or `None` with none found."
+        },
+        "key_shared": {
+          "type": "boolean",
+          "description": "Whether the key's file can be read by others than its owner."
+        },
+        "failed": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why the key can't be had, or why the last request failed, while none has worked since; and how many seconds ago it failed."
+        },
+        "failed_secs_ago": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "How many tokens Google has counted since the process started."
+        }
+      },
+      "required": [
+        "model",
+        "key_shared",
+        "tokens"
+      ],
+      "description": "How the Gemini API stands for memory, as the daemon says it does."
+    },
     "HandoffAbout": {
       "type": "object",
       "properties": {
@@ -1582,6 +1692,23 @@
         "note"
       ],
       "description": "A note added to a worktree's handoff file."
+    },
+    "HelperUsage": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Its program's name, as the system keeps it: cut to 15 bytes."
+        },
+        "usage": {
+          "$ref": "#/$defs/ProcessUsage"
+        }
+      },
+      "required": [
+        "name",
+        "usage"
+      ],
+      "description": "What a process the daemon runs that isn't a session's takes, with every process under it: the distiller's `claude -p`, git, a plugin's hook."
     },
     "InProgress": {
       "type": "string",
@@ -2394,7 +2521,7 @@
             "string",
             "null"
           ],
-          "description": "The line an agent or a script put on its row with `crystal report --line`, until it's taken off or its time is up.",
+          "description": "The line an agent or a script put on its row with `crystal report --line`, until it's taken off or its time is up; or, held working while work of its own runs, what that is.",
           "default": null
         },
         "row": {
@@ -2447,6 +2574,115 @@
         "status"
       ],
       "description": "A session as `ls --json` lists it: what the daemon knows, and the word its STATE column shows."
+    },
+    "Machine": {
+      "type": "object",
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "Its memory, in bytes: 0 when it can't say."
+        },
+        "cores": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Its cores, those online: 0 when it can't say."
+        }
+      },
+      "required": [
+        "bytes",
+        "cores"
+      ],
+      "description": "What the machine has."
+    },
+    "MemoryAdded": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "new": {
+              "$ref": "#/$defs/MemoryEntry"
+            }
+          },
+          "required": [
+            "new"
+          ],
+          "additionalProperties": false,
+          "description": "A new entry."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "near": {
+              "type": "object",
+              "properties": {
+                "entry": {
+                  "$ref": "#/$defs/MemoryEntry"
+                },
+                "near": {
+                  "$ref": "#/$defs/MemoryTwin"
+                }
+              },
+              "required": [
+                "entry",
+                "near"
+              ]
+            }
+          },
+          "required": [
+            "near"
+          ],
+          "additionalProperties": false,
+          "description": "A new entry, near one said before but not the same, `near`, as alike as `Embed::near_from`: about the same thing, it may say something else of it, or correct it, and then supersede it."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "again": {
+              "$ref": "#/$defs/MemoryEntry"
+            }
+          },
+          "required": [
+            "again"
+          ],
+          "additionalProperties": false,
+          "description": "The project had it already, in the same words: it was seen again, with any new files it named added to its own."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "alike": {
+              "$ref": "#/$defs/MemoryEntry"
+            }
+          },
+          "required": [
+            "alike"
+          ],
+          "additionalProperties": false,
+          "description": "The project had it already in other words: this entry, which says the same thing, or had one merged into it in those words, was seen again, as with `Added::Again`."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "outdated": {
+              "$ref": "#/$defs/MemorySuperseded"
+            }
+          },
+          "required": [
+            "outdated"
+          ],
+          "additionalProperties": false,
+          "description": "An entry said it, in these words, and stopped holding since: this, as it was. It isn't added; `crystal memory restore` puts the entry back."
+        },
+        {
+          "type": "string",
+          "const": "refused",
+          "description": "The user forgot it, and crystal can't add it back."
+        }
+      ],
+      "description": "What adding an entry came to."
     },
     "MemoryEntry": {
       "type": "object",
@@ -2620,6 +2856,35 @@
       ],
       "description": "Entries of a project that say the same thing, as `crystal memory dedupe` finds them: the one kept, and those that go into it, each as alike to it as it is."
     },
+    "MemoryNear": {
+      "type": "object",
+      "properties": {
+        "groups": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/MemoryListed"
+            }
+          },
+          "description": "The groups, each entry with whether it still holds."
+        },
+        "said_again": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "description": "The ids of the entries left out, as each says what another does: `dedupe`'s to merge, into one that may be in a group.",
+          "default": []
+        }
+      },
+      "required": [
+        "groups"
+      ],
+      "description": "The entries of a project's memory near one another, as `crystal memory reconcile` asks about them."
+    },
     "MemoryNew": {
       "type": "object",
       "properties": {
@@ -2653,6 +2918,24 @@
         "source"
       ],
       "description": "An entry about to be added."
+    },
+    "MemoryReplacing": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "why"
+      ],
+      "description": "The entry one about to be added replaces, by its id, which no longer holds, and why."
     },
     "MemorySource": {
       "oneOf": [
@@ -2703,6 +2986,37 @@
         }
       ],
       "description": "Who an entry came from."
+    },
+    "MemorySuperseded": {
+      "type": "object",
+      "properties": {
+        "entry": {
+          "$ref": "#/$defs/MemoryEntry"
+        },
+        "by": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "The entry that holds in its place: another, which replaced it, or its own id, rewritten."
+        },
+        "why": {
+          "type": "string",
+          "description": "Why it no longer holds."
+        },
+        "superseded": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "When it stopped holding, in seconds since the Unix epoch."
+        }
+      },
+      "required": [
+        "entry",
+        "by",
+        "why",
+        "superseded"
+      ],
+      "description": "An entry that stopped holding, as it was then: retired, another entry holding in its place, or updated, rewritten under its id."
     },
     "MemoryTwin": {
       "type": "object",
@@ -3069,6 +3383,60 @@
       ],
       "description": "A way to go from a pane on screen: to the pane there, or to move a border."
     },
+    "Pending": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/PendingKind"
+        },
+        "what": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "What it is, in a few words: a command, a watch's or a subagent's description."
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "description": "Work of an agent's own still to come as its turn ended, which wakes it once it's done or due, as Claude Code's Stop hook lists it: a task in the background, or a wakeup it scheduled."
+    },
+    "PendingKind": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "shell",
+          "description": "A command run in the background."
+        },
+        {
+          "type": "string",
+          "const": "monitor",
+          "description": "A Monitor watch."
+        },
+        {
+          "type": "string",
+          "const": "subagent",
+          "description": "A subagent in the background."
+        },
+        {
+          "type": "string",
+          "const": "wakeup",
+          "description": "A wakeup scheduled once."
+        },
+        {
+          "type": "string",
+          "const": "cron",
+          "description": "A wakeup that comes again and again."
+        },
+        {
+          "type": "string",
+          "const": "other",
+          "description": "Any other task, like a workflow or a teammate."
+        }
+      ],
+      "description": "What sort of work is still to come."
+    },
     "PendingTask": {
       "type": "object",
       "properties": {
@@ -3275,7 +3643,12 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0,
-          "description": "Resident memory, in bytes."
+          "description": "Memory, in bytes: the physical footprint on a Mac, the resident set on Linux."
+        },
+        "cpu": {
+          "type": "number",
+          "format": "double",
+          "description": "CPU since the look counted from, in percent of one core, to a tenth: 100 is one core busy all that while."
         },
         "processes": {
           "type": "integer",
@@ -3287,6 +3660,7 @@
       "required": [
         "pid",
         "bytes",
+        "cpu",
         "processes"
       ],
       "description": "What a process, and with a session's, every process under it, takes."
@@ -3631,6 +4005,23 @@
               ],
               "description": "Work the agent scheduled to wake it later, when its hooks say it just did: it isn't idle meanwhile."
             },
+            "said": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "What the agent said last as its turn ended, when its hooks say: whether it asks the user anything goes by it."
+            },
+            "pending": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/$defs/Pending"
+              },
+              "description": "The work of its own still to come as its turn ended, which wakes it, when its hooks say: none when they say there's none."
+            },
             "type": {
               "type": "string",
               "const": "report"
@@ -3642,6 +4033,35 @@
             "event"
           ],
           "description": "Something the agent in a session did, sent by its hooks."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "As `Request::Report`'s."
+            },
+            "id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "file": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "recall"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "file"
+          ],
+          "description": "Claude Code in a session is about to read or edit `file`, by its path as the agent gave it, its hook says: what its project's memory has about it that the session hasn't been shown, if anything, comes back as `Response::Context`. See `crate::recall`."
         },
         {
           "type": "object",
@@ -4114,7 +4534,7 @@
           "required": [
             "type"
           ],
-          "description": "The memory each running session's processes take, the daemon's own, and the asking client's, whose process is `client`."
+          "description": "The memory and CPU each running session's processes take, the daemon's own and its helpers', and the asking client's, whose process is `client`."
         },
         {
           "type": "object",
@@ -4315,6 +4735,16 @@
             "entry": {
               "$ref": "#/$defs/MemoryNew"
             },
+            "replaces": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/MemoryReplacing"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "const": "remember"
@@ -4325,7 +4755,24 @@
             "project",
             "entry"
           ],
-          "description": "Add `entry` to the memory of `project`, a project's main worktree: the daemon, which keeps the models loaded, finds whether the project has it already in other words."
+          "description": "Add `entry` to the memory of `project`, a project's main worktree: the daemon, which keeps the models loaded, finds whether the project has it already in other words. With `replaces`, in place of that entry, which no longer holds, and is retired."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "dir": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "near_memory"
+            }
+          },
+          "required": [
+            "type",
+            "dir"
+          ],
+          "description": "The entries of the memory of the project `dir` is in near one another in meaning, in groups, each with whether it still holds: for `crystal memory reconcile` to ask a model whether any of them no longer holds."
         },
         {
           "type": "object",
@@ -5186,7 +5633,15 @@
       "properties": {
         "daemon": {
           "$ref": "#/$defs/ProcessUsage",
-          "description": "The daemon's own process, without its sessions'."
+          "description": "The daemon's own process, without its sessions' or its helpers'."
+        },
+        "helpers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HelperUsage"
+          },
+          "description": "The processes the daemon runs that aren't sessions' programs or the agent kept warm, each with every process under it.",
+          "default": []
         },
         "client": {
           "anyOf": [
@@ -5197,7 +5652,7 @@
               "type": "null"
             }
           ],
-          "description": "The client that asked, when it said which process it is."
+          "description": "The client that asked, with every process under it, when it said which process it is."
         },
         "sessions": {
           "type": "array",
@@ -5217,17 +5672,21 @@
           ],
           "description": "The agent kept warm for a new session to take over, while there's one: `[sessions] warm_agent`."
         },
-        "total": {
+        "machine": {
+          "$ref": "#/$defs/Machine"
+        },
+        "cpu_over_ms": {
           "type": "integer",
           "format": "uint64",
           "minimum": 0,
-          "description": "The memory the machine has, in bytes: 0 when it can't say."
+          "description": "How long CPU was counted over, in milliseconds: 0 when it couldn't be, every process's CPU then 0."
         }
       },
       "required": [
         "daemon",
         "sessions",
-        "total"
+        "machine",
+        "cpu_over_ms"
       ],
       "description": "One look at what crystal takes."
     },
@@ -5545,7 +6004,7 @@
             "type",
             "text"
           ],
-          "description": "What the hook reporting a prompt the user sent adds to it for Claude Code to read: crystal asking it to name its session."
+          "description": "What a hook adds for Claude Code to read: with a prompt the user sent, crystal asking it to name its session; with a file it's about to read or edit, what its project's memory has about it."
         },
         {
           "$ref": "#/$defs/Backlog",
@@ -5795,6 +6254,30 @@
             {
               "type": "object",
               "properties": {
+                "near": {
+                  "type": "object",
+                  "properties": {
+                    "entry": {
+                      "$ref": "#/$defs/MemoryEntry"
+                    },
+                    "near": {
+                      "$ref": "#/$defs/MemoryTwin"
+                    }
+                  },
+                  "required": [
+                    "entry",
+                    "near"
+                  ]
+                }
+              },
+              "required": [
+                "near"
+              ],
+              "description": "A new entry, near one said before but not the same, `near`, as alike as `Embed::near_from`: about the same thing, it may say something else of it, or correct it, and then supersede it."
+            },
+            {
+              "type": "object",
+              "properties": {
                 "again": {
                   "$ref": "#/$defs/MemoryEntry"
                 }
@@ -5817,6 +6300,18 @@
               "description": "The project had it already in other words: this entry, which says the same thing, or had one merged into it in those words, was seen again, as with `Added::Again`."
             },
             {
+              "type": "object",
+              "properties": {
+                "outdated": {
+                  "$ref": "#/$defs/MemorySuperseded"
+                }
+              },
+              "required": [
+                "outdated"
+              ],
+              "description": "An entry said it, in these words, and stopped holding since: this, as it was. It isn't added; `crystal memory restore` puts the entry back."
+            },
+            {
               "type": "string",
               "const": "refused",
               "description": "The user forgot it, and crystal can't add it back."
@@ -5833,6 +6328,47 @@
           "required": [
             "type"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "added": {
+              "$ref": "#/$defs/MemoryAdded"
+            },
+            "retired": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/MemorySuperseded"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "replaced"
+            }
+          },
+          "required": [
+            "type",
+            "added"
+          ],
+          "description": "What adding an entry to a project's memory in place of another came to, and the entry it replaced, as it was, retired; `None` when it wasn't added, and the other is left as it was."
+        },
+        {
+          "$ref": "#/$defs/MemoryNear",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "near"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "description": "The entries of a project's memory near one another in meaning, in groups, and those left out as they say what another does."
         },
         {
           "type": "object",
@@ -6574,7 +7110,7 @@
             "string",
             "null"
           ],
-          "description": "The line an agent or a script put on its row with `crystal report --line`, until it's taken off or its time is up.",
+          "description": "The line an agent or a script put on its row with `crystal report --line`, until it's taken off or its time is up; or, held working while work of its own runs, what that is.",
           "default": null
         },
         "row": {

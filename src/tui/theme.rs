@@ -779,7 +779,7 @@ impl Theme {
             Status::Waiting => self.waiting,
             Status::Working => self.working,
             Status::Done => self.done,
-            Status::Running => self.running,
+            Status::Running | Status::Open => self.running,
             Status::Ended => self.ended,
             Status::Failed => self.failed,
             Status::Starting => self.muted,
