@@ -14,6 +14,20 @@
 //! the entry it went into said again, and a search finds that entry by its
 //! words and meaning too.
 //!
+//! What's learned later can correct what was learned before: a default
+//! that changed, a decision reversed, a command renamed. The newer then
+//! supersedes the older, which stops holding: rewritten under its id (an
+//! update), or retired, another entry holding in its place. Either way what
+//! it said is kept apart, with why and when, out of every search, of what
+//! agents starting are shown and of what the distiller is told the memory
+//! has; said again, it's told it no longer holds; and it can be put back.
+//! What a retired entry said finds the one in its place, as what was
+//! merged finds the one kept.
+//! The distiller says which of the entries it's shown what it keeps
+//! supersedes, `crystal remember --replaces` says so by hand, and `crystal
+//! memory reconcile` has a model look through the entries near one another
+//! for those that no longer hold.
+//!
 //! Every agent crystal starts is shown, as it starts, the entries that have
 //! most to do with its launch: first those about files its worktree has
 //! changed, then those about what it was asked. Claude Code searches the
@@ -187,6 +201,15 @@ pub const SEARCH_LIMIT: usize = 50;
 /// The most entries said before that the reranker reads with one being
 /// added, to find whether it says what one of them does: the most alike.
 const TWIN_POOL: usize = 20;
+
+/// The most entries in one group of those near one another that `crystal
+/// memory reconcile` asks about: an entry and the five most alike, few
+/// enough for a model to weigh each against each.
+const NEAR_GROUP: usize = 6;
+
+/// The most a group of those near one another grows to as entries left out
+/// of every group join the group of the one nearest them.
+const NEAR_GROUP_JOINED: usize = 8;
 
 /// The longest a title of an entry's own may be, in characters: a line.
 const MAX_TITLE: usize = 120;
@@ -441,6 +464,25 @@ CREATE TABLE apart_vectors (
 );
 ";
 
+/// Each entry that stopped holding, as it was, as JSON, under its id:
+/// retired, the entry `by_id` holding in its place, or rewritten under its
+/// id, `by_id` its own; why, and when. A hash of its key, as
+/// [`FORGOTTEN_ENTRIES`] keeps the forgotten, tells what it said said again.
+/// An entry rewritten more than once has a row for each wording it had.
+const SUPERSEDED: &str = "
+CREATE TABLE superseded (
+  project    TEXT NOT NULL,
+  key        TEXT NOT NULL,
+  id         INTEGER NOT NULL,
+  entry      TEXT NOT NULL,
+  by_id      INTEGER NOT NULL,
+  why        TEXT NOT NULL,
+  superseded INTEGER NOT NULL
+);
+CREATE INDEX superseded_id ON superseded (project, id);
+CREATE INDEX superseded_key ON superseded (project, key);
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
@@ -456,6 +498,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     count_from_now,
     |conn| Ok(conn.execute_batch(MERGED)?),
     |conn| Ok(conn.execute_batch(APART)?),
+    |conn| Ok(conn.execute_batch(SUPERSEDED)?),
 ];
 
 /// The columns [`entry_of`] reads, in its order.
@@ -717,14 +760,28 @@ pub struct New {
     pub checkout: Option<PathBuf>,
 }
 
-/// What adding an entry came to.
+/// The entry one about to be added replaces, by its id, which no longer
+/// holds, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "MemoryReplacing"))]
+pub struct Replacing {
+    pub id: u64,
+    pub why: String,
+}
+
+/// What adding an entry came to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[cfg_attr(test, schemars(rename = "MemoryAdded"))]
 #[serde(rename_all = "lowercase")]
 pub enum Added {
     /// A new entry.
     New(Entry),
+    /// A new entry, near one said before but not the same, `near`, as
+    /// alike as [`Embed::near_from`]: about the same thing, it may say
+    /// something else of it, or correct it, and then supersede it.
+    Near { entry: Entry, near: Twin },
     /// The project had it already, in the same words: it was seen again,
     /// with any new files it named added to its own.
     Again(Entry),
@@ -732,17 +789,48 @@ pub enum Added {
     /// the same thing, or had one merged into it in those words, was seen
     /// again, as with [`Added::Again`].
     Alike(Entry),
+    /// An entry said it, in these words, and stopped holding since: this,
+    /// as it was. It isn't added; `crystal memory restore` puts the entry
+    /// back.
+    Outdated(Superseded),
     /// The user forgot it, and crystal can't add it back.
     Refused,
 }
 
-#[cfg(test)]
 impl Added {
+    /// The entry it came to, new or said before: none when it was refused,
+    /// or no longer holds.
     pub fn entry(&self) -> Option<&Entry> {
         match self {
-            Added::New(entry) | Added::Again(entry) | Added::Alike(entry) => Some(entry),
-            Added::Refused => None,
+            Added::New(entry)
+            | Added::Near { entry, .. }
+            | Added::Again(entry)
+            | Added::Alike(entry) => Some(entry),
+            Added::Outdated(_) | Added::Refused => None,
         }
+    }
+}
+
+/// An entry that stopped holding, as it was then: retired, another entry
+/// holding in its place, or updated, rewritten under its id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "MemorySuperseded"))]
+pub struct Superseded {
+    pub entry: Entry,
+    /// The entry that holds in its place: another, which replaced it, or
+    /// its own id, rewritten.
+    pub by: u64,
+    /// Why it no longer holds.
+    pub why: String,
+    /// When it stopped holding, in seconds since the Unix epoch.
+    pub superseded: u64,
+}
+
+impl Superseded {
+    /// Whether it was rewritten under its id, rather than retired.
+    pub fn updated(&self) -> bool {
+        self.by == self.entry.id
     }
 }
 
@@ -777,14 +865,18 @@ struct Meant {
     vector: Vec<f32>,
     twin: Option<u64>,
     forgotten: bool,
+    /// The most alike of the entries near it that don't say what it does.
+    near: Option<Twin>,
 }
 
 /// What a project keeps apart, with vectors: each entry merged into one
-/// still there, by that one's id, with what it said; and what each
-/// forgotten entry said.
+/// still there, by that one's id, with what it said; what each forgotten
+/// entry said; and each entry retired for one still there, by that one's
+/// id, with what it said.
 struct Apart {
     merged: Vec<(u64, String, Vec<f32>)>,
     forgotten: Vec<(String, Vec<f32>)>,
+    retired: Vec<(u64, String, Vec<f32>)>,
 }
 
 /// What a search keeps to besides its words, and the most it gives.
@@ -873,23 +965,66 @@ impl Store {
     /// entries merged into another too, which count as that one. So is one
     /// in the words of an entry merged into another. What says what was
     /// forgotten, by the same rule, crystal can't add, as it can't in the
-    /// same words. A new entry keeps the vector it was compared by.
+    /// same words. A new entry keeps the vector it was compared by, and is
+    /// [`Added::Near`] the most alike of those as alike as
+    /// [`Embed::near_from`] that don't say the same. One in the words of an
+    /// entry that stopped holding isn't added: it's [`Added::Outdated`].
     pub fn add_with(
         &mut self,
         project: &Path,
         new: New,
         embedder: Option<&dyn Embed>,
     ) -> Result<Added> {
+        Ok(self.adding(project, new, embedder, None)?.0)
+    }
+
+    /// [`Store::add_with`], `new` replacing entry `id` of `project`, which
+    /// no longer holds, for `why`: never taken for it said again, in its
+    /// words or by its meaning, and retired once `new` is in, what adding it
+    /// came to, a new entry or one said before seen again, holding in its
+    /// place. Gives that, and the entry retired, as it was; or, when `new`
+    /// was refused, `None`, and entry `id` is left as it is. In the words of
+    /// what stopped holding, it's added all the same: replacing says that
+    /// it holds again.
+    pub fn replace(
+        &mut self,
+        project: &Path,
+        new: New,
+        id: u64,
+        why: &str,
+        embedder: Option<&dyn Embed>,
+    ) -> Result<(Added, Option<Superseded>)> {
+        let why = one_line(&clean(&secrets::redact(why)));
+        if why.is_empty() {
+            bail!("say why entry {id} no longer holds");
+        }
+        self.adding(project, new, embedder, Some((id, &why)))
+    }
+
+    /// [`Store::add_with`], and with `replacing`, [`Store::replace`].
+    fn adding(
+        &mut self,
+        project: &Path,
+        new: New,
+        embedder: Option<&dyn Embed>,
+        replacing: Option<(u64, &str)>,
+    ) -> Result<(Added, Option<Superseded>)> {
         let text = clean(&secrets::redact(new.text.trim()));
         if text.trim().is_empty() {
             bail!("there's nothing to remember");
         }
         let key = key_of(&text);
         let name = self.ready(project)?;
+        let replaced = replacing.map(|(id, _)| id);
+        if let Some(id) = replaced
+            && get(&self.conn, &name, id)?.is_none()
+        {
+            bail!("there's no entry {id} to replace");
+        }
         // By meaning before the write, which holds up every other while
         // the models take their time.
         let meant = embedder.and_then(|embedder| {
-            self.meaning(&name, &text, embedder, new.source.is_crystal())
+            self.meaning(&name, &text, embedder, new.source.is_crystal(), replaced)
                 .map(|meant| (meant, embedder.model()))
                 .inspect_err(|err| errln!("crystal: couldn't compare it by meaning: {err:#}"))
                 .ok()
@@ -903,6 +1038,19 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // What came of it, and once it's in, the entry it replaces retired
+        // in its place.
+        let done =
+            |tx: rusqlite::Transaction<'_>, added: Added| -> Result<(Added, Option<Superseded>)> {
+                let retired = match (replacing, added.entry()) {
+                    (Some((id, why)), Some(holder)) => {
+                        Some(retire_in(&tx, &name, id, holder.id, why, now)?)
+                    }
+                    _ => None,
+                };
+                tx.commit()?;
+                Ok((added, retired))
+            };
         let said: Option<Entry> = if key.is_empty() {
             None
         } else {
@@ -917,9 +1065,14 @@ impl Store {
             .optional()?
         };
         if let Some(said) = said {
+            if Some(said.id) == replaced {
+                bail!(
+                    "it says what entry {} says: nothing new to replace it",
+                    said.id
+                );
+            }
             let entry = seen_again(&tx, &name, &said, &new, checkout, now, &mut code)?;
-            tx.commit()?;
-            return Ok(Added::Again(entry));
+            return done(tx, Added::Again(entry));
         }
         let forgotten = hash(&key);
         let was_forgotten: bool = tx.query_row(
@@ -929,7 +1082,7 @@ impl Store {
         )?;
         if was_forgotten {
             if new.source.is_crystal() {
-                return Ok(Added::Refused);
+                return Ok((Added::Refused, None));
             }
             tx.execute(
                 "DELETE FROM forgotten WHERE project = ?1 AND key = ?2",
@@ -948,16 +1101,25 @@ impl Store {
             )
             .optional()?;
         if let Some(kept) = merged_into {
-            match get(&tx, &name, kept)? {
-                Some(kept) => {
+            if Some(kept) == replaced {
+                bail!("it says what entry {kept} says: nothing new to replace it");
+            }
+            let outdated = match replaced {
+                None => last_superseded(&tx, &name, kept)?,
+                Some(_) => None,
+            };
+            match (get(&tx, &name, kept)?, outdated) {
+                (Some(kept), _) => {
                     let entry = seen_again(&tx, &name, &kept, &new, checkout, now, &mut code)?;
-                    tx.commit()?;
-                    return Ok(Added::Alike(entry));
+                    return done(tx, Added::Alike(entry));
                 }
+                // The entry it went into stopped holding since, and so did
+                // what it said.
+                (None, Some(was)) => return Ok((Added::Outdated(was), None)),
                 // The entry it went into was forgotten since, and with it
                 // what it said.
-                None if new.source.is_crystal() => return Ok(Added::Refused),
-                None => {
+                (None, None) if new.source.is_crystal() => return Ok((Added::Refused, None)),
+                (None, None) => {
                     tx.execute(
                         "DELETE FROM merged WHERE project = ?1 AND key = ?2",
                         params![name, forgotten],
@@ -969,16 +1131,22 @@ impl Store {
                 }
             }
         }
+        // Said by an entry that no longer holds: unless it's to replace
+        // another, which says it holds again.
+        if replaced.is_none()
+            && let Some(was) = superseded_saying(&tx, &name, &forgotten)?
+        {
+            return Ok((Added::Outdated(was), None));
+        }
         let twin = meant.as_ref().and_then(|(meant, _)| meant.twin);
         // Only while it's there: it may have gone as the models ran.
         if let Some(twin) = twin.map(|id| get(&tx, &name, id)).transpose()?.flatten() {
             let entry = seen_again(&tx, &name, &twin, &new, checkout, now, &mut code)?;
-            tx.commit()?;
-            return Ok(Added::Alike(entry));
+            return done(tx, Added::Alike(entry));
         }
         // What the user forgot crystal can't add back in other words either.
         if meant.as_ref().is_some_and(|(meant, _)| meant.forgotten) {
-            return Ok(Added::Refused);
+            return Ok((Added::Refused, None));
         }
         let id: u64 = tx.query_row(
             "SELECT next_id FROM projects WHERE path = ?1",
@@ -1011,8 +1179,247 @@ impl Store {
                 params![tx.last_insert_rowid(), model, bytes_of(&meant.vector)],
             )?;
         }
+        // Only one still there, as it was read.
+        let near = meant.and_then(|(meant, _)| meant.near).filter(|near| {
+            get(&tx, &name, near.entry.id)
+                .ok()
+                .flatten()
+                .is_some_and(|now| now.text == near.entry.text)
+        });
+        match near {
+            Some(near) => done(tx, Added::Near { entry, near }),
+            None => done(tx, Added::New(entry)),
+        }
+    }
+
+    /// Puts `text` in place of what entry `id` of `project` says, for
+    /// `why`, under the same id: an update, the entry corrected. It's said
+    /// again now, made of `kind` when that's given, about `files` too, and
+    /// anchored to its files and what `text` names as they are in
+    /// `checkout`. What it said before is kept, as it was, as stopped
+    /// holding, for [`Store::restore`] to put back. Cleaned as
+    /// [`Store::add`] cleans what it keeps; refused when it says what it
+    /// says already, what another entry says, or what was forgotten. Gives
+    /// what it was and the entry as it is now.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update(
+        &mut self,
+        project: &Path,
+        id: u64,
+        text: &str,
+        kind: Option<Kind>,
+        files: &[String],
+        checkout: &Path,
+        why: &str,
+    ) -> Result<(Superseded, Entry)> {
+        let text = clean(&secrets::redact(text.trim()));
+        let key = key_of(&text);
+        if key.is_empty() {
+            bail!("it says nothing");
+        }
+        let why = one_line(&clean(&secrets::redact(why)));
+        if why.is_empty() {
+            bail!("say why entry {id} no longer holds as it says");
+        }
+        let name = self.ready(project)?;
+        let now = seconds_since_epoch(SystemTime::now());
+        let mut code = Code::default();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let entry = get(&tx, &name, id)?.with_context(|| format!("there's no entry {id}"))?;
+        if key == key_of(&entry.text) {
+            bail!("it says what entry {id} says already");
+        }
+        let other: Option<u64> = tx
+            .query_row(
+                "SELECT id FROM entries WHERE project = ?1 AND key = ?2 AND id != ?3",
+                params![name, key, id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(other) = other {
+            bail!("it says what entry {other} says");
+        }
+        let forgotten: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM forgotten WHERE project = ?1 AND key = ?2)",
+            params![name, hash(&key)],
+            |row| row.get(0),
+        )?;
+        if forgotten {
+            bail!("it says what was forgotten");
+        }
+        let was = record(&tx, &name, &entry, id, &why, now)?;
+        let files = joined(&entry.files, files);
+        tx.execute(
+            "UPDATE entries SET text = ?3, key = ?4, kind = ?5, files = ?6, anchors = ?7, \
+             names = ?8, checkout = ?9, last_seen = ?10, told_stale = 0 \
+             WHERE project = ?1 AND id = ?2",
+            params![
+                name,
+                id,
+                text,
+                key,
+                kind.unwrap_or(entry.kind).to_string(),
+                serde_json::to_string(&files)?,
+                serde_json::to_string(&anchors_in(checkout, &files))?,
+                serde_json::to_string(&code.names_in(checkout, &text, &files))?,
+                checkout.to_string_lossy(),
+                now,
+            ],
+        )?;
+        let entry = get(&tx, &name, id)?.context("the entry just updated is gone")?;
         tx.commit()?;
-        Ok(Added::New(entry))
+        Ok((was, entry))
+    }
+
+    /// Retires entry `id` of `project`, which no longer holds, for `why`:
+    /// entry `by`, there already, holds in its place. It leaves the list,
+    /// kept apart as it was, for [`Store::restore`] to put back. Gives it,
+    /// as it was.
+    pub fn retire(&mut self, project: &Path, id: u64, by: u64, why: &str) -> Result<Superseded> {
+        let why = one_line(&clean(&secrets::redact(why)));
+        if why.is_empty() {
+            bail!("say why entry {id} no longer holds");
+        }
+        if by == id {
+            bail!("entry {id} can't hold in its own place");
+        }
+        let name = self.ready(project)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if get(&tx, &name, by)?.is_none() {
+            bail!("there's no entry {by} to hold in its place");
+        }
+        let now = seconds_since_epoch(SystemTime::now());
+        let retired = retire_in(&tx, &name, id, by, &why, now)?;
+        tx.commit()?;
+        Ok(retired)
+    }
+
+    /// The entries of `project` that stopped holding, the latest first:
+    /// each as it was, with what holds in its place and why. An entry
+    /// rewritten more than once is there once for each wording it had.
+    pub fn superseded(&mut self, project: &Path) -> Result<Vec<Superseded>> {
+        let name = self.ready(project)?;
+        let mut query = self.conn.prepare(
+            "SELECT entry, by_id, why, superseded, id FROM superseded WHERE project = ?1 \
+             ORDER BY superseded DESC, rowid DESC",
+        )?;
+        let rows = query.query_map(params![name], superseded_of)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// What entry `id` of `project` was when it last stopped holding: as
+    /// it was before it was last rewritten, or as it was retired. `None`
+    /// when it never did.
+    pub fn last_superseded(&mut self, project: &Path, id: u64) -> Result<Option<Superseded>> {
+        let name = self.ready(project)?;
+        last_superseded(&self.conn, &name, id)
+    }
+
+    /// The entry of `project` that holds where entry `id` did, when it
+    /// stopped holding or was merged into another: the one that replaced it,
+    /// or that one's own in its turn, as far as one still there. `None` when
+    /// none is.
+    pub fn holding(&mut self, project: &Path, id: u64) -> Result<Option<Entry>> {
+        let name = self.ready(project)?;
+        let mut at = id;
+        // A chain is short; a loop, by restores and retirements one way then
+        // the other, ends here.
+        for _ in 0..16 {
+            if let Some(entry) = get(&self.conn, &name, at)? {
+                return Ok(Some(entry));
+            }
+            let merged: Option<u64> = self
+                .conn
+                .query_row(
+                    "SELECT kept FROM merged WHERE project = ?1 AND id = ?2 LIMIT 1",
+                    params![name, at],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let next = match merged {
+                Some(kept) => kept,
+                None => match last_superseded(&self.conn, &name, at)? {
+                    Some(was) if !was.updated() => was.by,
+                    _ => return Ok(None),
+                },
+            };
+            at = next;
+        }
+        Ok(None)
+    }
+
+    /// Puts entry `id` of `project` back as it was before it last stopped
+    /// holding: a retired entry back in the list, under its id, or an
+    /// updated one's words before back in place of its words now. Refused
+    /// when the entry it would be says what another entry says now. Gives
+    /// it back as it is then.
+    pub fn restore(&mut self, project: &Path, id: u64) -> Result<Entry> {
+        let name = self.ready(project)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(was) = last_superseded(&tx, &name, id)? else {
+            bail!("entry {id} never stopped holding: there's nothing to put back");
+        };
+        let key = key_of(&was.entry.text);
+        let other: Option<u64> = tx
+            .query_row(
+                "SELECT id FROM entries WHERE project = ?1 AND key = ?2 AND id != ?3",
+                params![name, key, id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(other) = other {
+            bail!("it says what entry {other} says now");
+        }
+        let now = get(&tx, &name, id)?;
+        match (was.updated(), now) {
+            (true, Some(_)) => {
+                let entry = &was.entry;
+                tx.execute(
+                    "UPDATE entries SET text = ?3, key = ?4, kind = ?5, files = ?6, anchors = ?7, \
+                     names = ?8, checkout = ?9, told_stale = 0 WHERE project = ?1 AND id = ?2",
+                    params![
+                        name,
+                        id,
+                        entry.text,
+                        key,
+                        entry.kind.to_string(),
+                        serde_json::to_string(&entry.files)?,
+                        serde_json::to_string(&entry.anchors)?,
+                        serde_json::to_string(&entry.names)?,
+                        path_text(&entry.checkout),
+                    ],
+                )?;
+            }
+            (true, None) => bail!("entry {id} was forgotten since it was updated"),
+            (false, Some(_)) => bail!("entry {id} is in the list already"),
+            (false, None) => {
+                insert(&tx, &name, &was.entry)?;
+                tx.execute(
+                    "UPDATE entries SET used = ?3 WHERE project = ?1 AND id = ?2",
+                    params![name, id, was.entry.used],
+                )?;
+                // What was merged into it finds it again.
+                write_merged_words(&tx, &name, id)?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM superseded WHERE rowid = (SELECT rowid FROM superseded \
+             WHERE project = ?1 AND id = ?2 ORDER BY superseded DESC, rowid DESC LIMIT 1)",
+            params![name, id],
+        )?;
+        // The one in its place no longer has what it said.
+        if !was.updated() {
+            write_merged_words(&tx, &name, was.by)?;
+        }
+        let entry = get(&tx, &name, id)?.context("the entry just put back is gone")?;
+        tx.commit()?;
+        Ok(entry)
     }
 
     /// Anchors entry `id` of `project` again to its files and what it names
@@ -1038,78 +1445,40 @@ impl Store {
         get(&self.conn, &name, id)?.context("the entry just anchored is gone")
     }
 
-    /// Puts `text` in place of what entry `id` of `project` says, anchored
-    /// to its files and what `text` names as they are in `checkout` now,
-    /// under the same id. Cleaned as [`Store::add`] cleans what it keeps;
-    /// refused when it says what another entry says, or what was forgotten.
-    /// Gives the entry back.
+    /// Puts `text` in place of what entry `id` of `project` says, under the
+    /// same id, as the distiller rewords an entry gone stale: an update,
+    /// anchored to its files and what `text` names as they are in
+    /// `checkout` now, what it said kept, as [`Store::update`] keeps it.
+    /// Gives what it was and the entry as it is now.
     pub fn reword(
         &mut self,
         project: &Path,
         id: u64,
         text: &str,
         checkout: &Path,
-    ) -> Result<Entry> {
-        let text = clean(&secrets::redact(text.trim()));
-        let key = key_of(&text);
-        if key.is_empty() {
-            bail!("it says nothing");
-        }
-        let name = self.ready(project)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let entry = get(&tx, &name, id)?.with_context(|| format!("there's no entry {id}"))?;
-        let other: Option<u64> = tx
-            .query_row(
-                "SELECT id FROM entries WHERE project = ?1 AND key = ?2 AND id != ?3",
-                params![name, key, id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(other) = other {
-            bail!("it says what entry {other} says");
-        }
-        let forgotten: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM forgotten WHERE project = ?1 AND key = ?2)",
-            params![name, hash(&key)],
-            |row| row.get(0),
-        )?;
-        if forgotten {
-            bail!("it says what was forgotten");
-        }
-        let mut code = Code::default();
-        tx.execute(
-            "UPDATE entries SET text = ?3, key = ?4, anchors = ?5, names = ?6, checkout = ?7, \
-             told_stale = 0 WHERE project = ?1 AND id = ?2",
-            params![
-                name,
-                id,
-                text,
-                key,
-                serde_json::to_string(&anchors_in(checkout, &entry.files))?,
-                serde_json::to_string(&code.names_in(checkout, &text, &entry.files))?,
-                checkout.to_string_lossy(),
-            ],
-        )?;
-        let entry = get(&tx, &name, id)?.context("the entry just reworded is gone")?;
-        tx.commit()?;
-        Ok(entry)
+    ) -> Result<(Superseded, Entry)> {
+        let why = "what it named was gone from the code, and the distiller reworded it";
+        self.update(project, id, text, None, &[], checkout, why)
     }
 
     /// What `text`, being added to the project called `project`, comes to
     /// by its meaning: see [`Store::add_with`]. Whether it says what one
     /// forgotten said is only looked for with `forgotten`, and while no
-    /// entry there says it.
+    /// entry there says it. The most alike of those near it, as alike as
+    /// [`Embed::near_from`], that don't say what it does is `near` it.
+    /// Entry `except`, and what was merged into it, is none of them.
     fn meaning(
         &mut self,
         project: &str,
         text: &str,
         embedder: &dyn Embed,
         forgotten: bool,
+        except: Option<u64>,
     ) -> Result<Meant> {
-        let entries = self.with_vectors(project, embedder)?;
-        let apart = self.apart(project, embedder.model())?;
+        let mut entries = self.with_vectors(project, embedder)?;
+        entries.retain(|(entry, _)| Some(entry.id) != except);
+        let mut apart = self.apart(project, embedder.model())?;
+        apart.merged.retain(|(kept, ..)| Some(*kept) != except);
         let vector = embedder
             .embed_passages(&[text])?
             .pop()
@@ -1122,19 +1491,23 @@ impl Store {
             .iter()
             .map(|(entry, other)| (entry.id, &entry.text, other));
         let merged = (apart.merged.iter()).map(|(kept, said, other)| (*kept, said, other));
+        let from = embedder.near_from().min(embedder.alike_from());
         let mut said: Vec<(f32, &str, u64)> = own
             .chain(merged)
             .map(|(id, said, other)| (dot(&vector, other), said.as_str(), id))
-            .filter(|(score, ..)| *score >= embedder.alike_from())
+            .filter(|(score, ..)| *score >= from)
             .collect();
         said.sort_by(|a, b| b.0.total_cmp(&a.0));
         let alike: Vec<(f32, &str)> = said
             .iter()
             .map(|(score, said, _)| (*score, *said))
             .collect();
-        let twin = saying_the_same(text, &alike, embedder)
-            .first()
-            .map(|(at, _)| said[*at].2);
+        let judged = judging(text, &alike, embedder);
+        let same: Vec<u64> = (judged.iter())
+            .filter(|(.., same)| *same)
+            .map(|(at, ..)| said[*at].2)
+            .collect();
+        let twin = same.first().copied();
         let forgotten = forgotten && twin.is_none() && {
             let mut said: Vec<(f32, &str)> = (apart.forgotten.iter())
                 .map(|(said, other)| (dot(&vector, other), said.as_str()))
@@ -1143,18 +1516,35 @@ impl Store {
             said.sort_by(|a, b| b.0.total_cmp(&a.0));
             !saying_the_same(text, &said, embedder).is_empty()
         };
+        // The most alike that doesn't say the same, as the reranker read it
+        // when it did.
+        let near = (said.iter().enumerate())
+            .filter(|(_, (score, _, id))| *score >= embedder.near_from() && !same.contains(id))
+            .find_map(|(at, (score, _, id))| {
+                let entry = entries.iter().find(|(entry, _)| entry.id == *id)?;
+                let reranked = (judged.iter())
+                    .find(|(read, ..)| *read == at)
+                    .and_then(|(_, reranked, _)| *reranked);
+                Some(Twin {
+                    entry: entry.0.clone(),
+                    alike: *score,
+                    reranked,
+                })
+            });
         Ok(Meant {
             vector,
             twin,
             forgotten,
+            near,
         })
     }
 
     /// What the project called `project` keeps apart, with its vectors from
     /// the model called `model`: each entry merged into one still there,
-    /// with that one's id and what it said, and what each forgotten entry
-    /// said. Those with no vector yet ([`Store::embed_missing_in`] gives
-    /// them one) are left out.
+    /// with that one's id and what it said, what each forgotten entry said,
+    /// and each entry retired for one still there, with that one's id and
+    /// what it said. Those with no vector yet ([`Store::embed_missing_in`]
+    /// gives them one) are left out.
     fn apart(&self, project: &str, model: &str) -> Result<Apart> {
         let vector = |row: &rusqlite::Row, at: usize| -> rusqlite::Result<Vec<f32>> {
             Ok(vector_of(&row.get::<_, Vec<u8>>(at)?))
@@ -1178,7 +1568,63 @@ impl Store {
             Ok((row.get(0)?, vector(row, 1)?))
         })?;
         let forgotten = forgotten.collect::<rusqlite::Result<_>>()?;
-        Ok(Apart { merged, forgotten })
+        let mut retired = self.conn.prepare(
+            "SELECT s.by_id, json_extract(s.entry, '$.text'), a.vector FROM superseded s \
+             JOIN apart_vectors a ON a.project = s.project AND a.key = s.key AND a.model = ?2 \
+             JOIN entries e ON e.project = s.project AND e.id = s.by_id \
+             WHERE s.project = ?1 AND s.by_id != s.id ORDER BY s.rowid",
+        )?;
+        let retired = retired.query_map(params![project, model], |row| {
+            Ok((row.get(0)?, row.get(1)?, vector(row, 2)?))
+        })?;
+        let retired = retired.collect::<rusqlite::Result<_>>()?;
+        Ok(Apart {
+            merged,
+            forgotten,
+            retired,
+        })
+    }
+
+    /// The entries of `project` near one another in meaning, in groups, for
+    /// `crystal memory reconcile` to ask whether any of them no longer holds
+    /// as another of its group shows, but for those `except`: each entry
+    /// held against every other, as alike as [`Embed::near_from`], by the
+    /// model alone. Each group is an entry with the most near it left, then
+    /// those, the most alike first, [`NEAR_GROUP`] at most. One whose near
+    /// ones all went into groups joins the group of the one nearest it,
+    /// while that's smaller than [`NEAR_GROUP_JOINED`], or else makes a
+    /// group of two with it, so an entry may be in two groups. One near none
+    /// is in none. Tasks' outcomes aren't held against anything.
+    pub fn near(
+        &mut self,
+        project: &Path,
+        embedder: &dyn Embed,
+        except: &[u64],
+    ) -> Result<Vec<Vec<Entry>>> {
+        let name = self.ready(project)?;
+        let mut entries = self.with_vectors(&name, embedder)?;
+        entries.retain(|(entry, _)| !except.contains(&entry.id));
+        let at: HashMap<u64, usize> = (entries.iter().enumerate())
+            .map(|(n, (entry, _))| (entry.id, n))
+            .collect();
+        let near: Vec<Vec<(f32, usize)>> = (entries.iter())
+            .map(|(entry, vector)| {
+                let alike = alike_to(vector, &entries, embedder.near_from()).into_iter();
+                (alike.filter(|(_, other)| other.id != entry.id))
+                    .map(|(score, other)| (score, at[&other.id]))
+                    .collect()
+            })
+            .collect();
+        let ids: Vec<u64> = entries.iter().map(|(entry, _)| entry.id).collect();
+        let mut groups: Vec<Vec<Entry>> = (near_groups(&near, &ids).into_iter())
+            .map(|group| {
+                let mut group: Vec<Entry> = group.iter().map(|&n| entries[n].0.clone()).collect();
+                group.sort_by_key(|entry| entry.id);
+                group
+            })
+            .collect();
+        groups.sort_by_key(|group| group[0].id);
+        Ok(groups)
     }
 
     /// Every entry of the project called `project` but tasks' outcomes,
@@ -1834,8 +2280,11 @@ impl Store {
         let rows = rows.query_map(params![project, model, only, but, files, now], |row| {
             Ok((entry_of(row)?, row.get::<_, Vec<u8>>("vector")?))
         })?;
+        // What went into each entry, merged or retired for it, finds it by
+        // its meaning too.
         let mut merged: HashMap<u64, Vec<Vec<f32>>> = HashMap::new();
-        for (kept, _, vector) in self.apart(project, model)?.merged {
+        let apart = self.apart(project, model)?;
+        for (kept, _, vector) in apart.merged.into_iter().chain(apart.retired) {
             merged.entry(kept).or_default().push(vector);
         }
         let mut alike = Vec::new();
@@ -2375,12 +2824,15 @@ fn keep_apart_vector(conn: &Connection, project: &str, id: u64, key: &str) -> Re
 }
 
 /// Writes down, beside entry `id` of the project called `project`, what
-/// the entries merged into it said, a line each, for their words to find
-/// it: see [`APART`].
+/// the entries merged into it said, and those retired for it, a line each,
+/// for their words to find it: see [`APART`]. A search for what no longer
+/// holds finds what holds in its place.
 fn write_merged_words(conn: &Connection, project: &str, id: u64) -> Result<()> {
     conn.execute(
-        "UPDATE entries SET merged_words = coalesce((SELECT group_concat(m.text, char(10)) \
-         FROM merged m WHERE m.project = ?1 AND m.kept = ?2), '') \
+        "UPDATE entries SET merged_words = coalesce((SELECT group_concat(said, char(10)) FROM \
+         (SELECT m.text AS said FROM merged m WHERE m.project = ?1 AND m.kept = ?2 \
+         UNION ALL SELECT json_extract(s.entry, '$.text') FROM superseded s \
+         WHERE s.project = ?1 AND s.by_id = ?2 AND s.id != ?2)), '') \
          WHERE project = ?1 AND id = ?2",
         params![project, id],
     )?;
@@ -2435,6 +2887,20 @@ fn saying_the_same(
     alike: &[(f32, &str)],
     embedder: &dyn Embed,
 ) -> Vec<(usize, Option<f32>)> {
+    (judging(text, alike, embedder).into_iter())
+        .filter_map(|(at, reranked, same)| same.then_some((at, reranked)))
+        .collect()
+}
+
+/// Of `alike`, what was said before at least [`Embed::alike_from`] alike to
+/// `text`, the first [`TWIN_POOL`], each by its place in it, with what the
+/// reranker scored it when it was asked, and whether it says what `text`
+/// does, as [`saying_the_same`] tells it.
+fn judging(
+    text: &str,
+    alike: &[(f32, &str)],
+    embedder: &dyn Embed,
+) -> Vec<(usize, Option<f32>, bool)> {
     let pool: Vec<(usize, f32, &str)> = (alike.iter().enumerate())
         .filter(|(_, (score, _))| *score >= embedder.alike_from())
         .take(TWIN_POOL)
@@ -2462,13 +2928,122 @@ fn saying_the_same(
     };
     pool.into_iter()
         .enumerate()
-        .filter_map(|(read, (at, score, _))| {
+        .map(|(read, (at, score, _))| {
             let reranked = scores.as_ref().map(|scores| scores[read]);
             let same = score >= embedder.same_from()
                 || reranked.is_some_and(|reranked| reranked >= embedder.same_reranked_from());
-            same.then_some((at, reranked))
+            (at, reranked, same)
         })
         .collect()
+}
+
+/// Retires entry `id` of the project called `project`, as [`Store::retire`]
+/// does, `by` holding in its place, in `conn`'s transaction.
+fn retire_in(
+    conn: &Connection,
+    project: &str,
+    id: u64,
+    by: u64,
+    why: &str,
+    now: u64,
+) -> Result<Superseded> {
+    let entry = get(conn, project, id)?.with_context(|| format!("there's no entry {id}"))?;
+    let retired = record(conn, project, &entry, by, why, now)?;
+    // What it said finds the one in its place, by its words and meaning.
+    keep_apart_vector(conn, project, id, &hash(&key_of(&entry.text)))?;
+    conn.execute(
+        "DELETE FROM entries WHERE project = ?1 AND id = ?2",
+        params![project, id],
+    )?;
+    write_merged_words(conn, project, by)?;
+    Ok(retired)
+}
+
+/// Keeps `entry` of the project called `project` as it is, stopped holding
+/// at `now`, for `why`, `by` holding in its place, and gives it so.
+fn record(
+    conn: &Connection,
+    project: &str,
+    entry: &Entry,
+    by: u64,
+    why: &str,
+    now: u64,
+) -> Result<Superseded> {
+    conn.execute(
+        "INSERT INTO superseded (project, key, id, entry, by_id, why, superseded) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            project,
+            hash(&key_of(&entry.text)),
+            entry.id,
+            serde_json::to_string(entry)?,
+            by,
+            why,
+            now,
+        ],
+    )?;
+    Ok(Superseded {
+        entry: entry.clone(),
+        by,
+        why: why.to_string(),
+        superseded: now,
+    })
+}
+
+/// What entry `id` of the project called `project` was when it last
+/// stopped holding, if it ever did.
+fn last_superseded(conn: &Connection, project: &str, id: u64) -> Result<Option<Superseded>> {
+    Ok(conn
+        .query_row(
+            "SELECT entry, by_id, why, superseded, id FROM superseded \
+             WHERE project = ?1 AND id = ?2 ORDER BY superseded DESC, rowid DESC LIMIT 1",
+            params![project, id],
+            superseded_of,
+        )
+        .optional()?)
+}
+
+/// The entry of the project called `project` that said what has the key
+/// whose hash is `key` and stopped holding since, as it was, the latest if
+/// more than one did.
+fn superseded_saying(conn: &Connection, project: &str, key: &str) -> Result<Option<Superseded>> {
+    Ok(conn
+        .query_row(
+            "SELECT entry, by_id, why, superseded, id FROM superseded \
+             WHERE project = ?1 AND key = ?2 ORDER BY superseded DESC, rowid DESC LIMIT 1",
+            params![project, key],
+            superseded_of,
+        )
+        .optional()?)
+}
+
+/// An entry that stopped holding, from a row of `entry, by_id, why,
+/// superseded, id`. What it was that doesn't read is a note under its id
+/// that says nothing, rather than a read that fails.
+fn superseded_of(row: &rusqlite::Row) -> rusqlite::Result<Superseded> {
+    let entry: String = row.get(0)?;
+    let id: u64 = row.get(4)?;
+    let entry = serde_json::from_str(&entry).unwrap_or_else(|_| Entry {
+        id,
+        kind: Kind::Note,
+        text: String::new(),
+        files: Vec::new(),
+        source: Source::User,
+        created: 0,
+        seen: 1,
+        last_seen: 0,
+        anchors: BTreeMap::new(),
+        checkout: None,
+        names: Vec::new(),
+        used: None,
+        counted_from: None,
+    });
+    Ok(Superseded {
+        entry,
+        by: row.get(1)?,
+        why: row.get(2)?,
+        superseded: row.get(3)?,
+    })
 }
 
 /// `entries` grouped about the ones kept, by `same`, the entries each of
@@ -2535,6 +3110,48 @@ fn grouped(entries: &[Entry], same: &[Vec<Twin>]) -> Vec<Merge> {
         }
     }
     merges
+}
+
+/// The entries near one another in groups, by their places: `near` has,
+/// for each, those near it, by their places, the nearest first, and `ids`
+/// each one's id, which settles ties. Each group is the entry with the most
+/// near it left, then those, [`NEAR_GROUP`] at most. One whose near ones all
+/// went into groups joins the group of the one nearest it, while that's
+/// smaller than [`NEAR_GROUP_JOINED`], or else makes a group of two with it.
+fn near_groups(near: &[Vec<(f32, usize)>], ids: &[u64]) -> Vec<Vec<usize>> {
+    let mut left = vec![true; near.len()];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    loop {
+        let near_left = |n: usize| -> Vec<usize> {
+            let others = near[n].iter().map(|(_, other)| *other);
+            others.filter(|other| left[*other]).collect()
+        };
+        let next = (0..near.len())
+            .filter(|&n| left[n] && !near_left(n).is_empty())
+            .max_by_key(|&n| (near_left(n).len(), std::cmp::Reverse(ids[n])));
+        let Some(first) = next else {
+            break;
+        };
+        let mut group = vec![first];
+        group.extend(near_left(first).into_iter().take(NEAR_GROUP - 1));
+        for &n in &group {
+            left[n] = false;
+        }
+        groups.push(group);
+    }
+    // One near others that all went into groups joins the group of the one
+    // nearest it, while that has room, or else is a group with it.
+    for n in (0..near.len()).filter(|&n| left[n]) {
+        let Some(&(_, nearest)) = near[n].first() else {
+            continue;
+        };
+        let with = groups.iter_mut().find(|group| group.contains(&nearest));
+        match with {
+            Some(group) if group.len() < NEAR_GROUP_JOINED => group.push(n),
+            _ => groups.push(vec![nearest, n]),
+        }
+    }
+    groups
 }
 
 /// A path as the database keeps it.
@@ -2944,6 +3561,50 @@ pub fn dedupe(
     }
 }
 
+/// The entries of a project's memory near one another, as `crystal memory
+/// reconcile` asks about them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "MemoryNear"))]
+pub struct Near {
+    /// The groups, each entry with whether it still holds.
+    pub groups: Vec<Vec<Listed>>,
+    /// The ids of the entries left out, as each says what another does:
+    /// `dedupe`'s to merge, into one that may be in a group.
+    #[serde(default)]
+    pub said_again: Vec<u64>,
+}
+
+/// The entries of `project`'s memory near one another in meaning, in
+/// groups ([`Store::near`]), each with whether it still holds, for `crystal
+/// memory reconcile`: but for those `crystal memory dedupe` would merge into
+/// another ([`Store::twins`]), which a model asked whether one holds in
+/// another's place takes for one that does. Only the models can tell, so
+/// without an `embedder` it's refused.
+pub fn near(socket: &Path, project: &Path, embedder: Option<&dyn Embed>) -> Result<Near> {
+    let Some(embedder) = embedder else {
+        bail!(
+            "only the models that search by meaning can tell which entries are near one another: \
+             `crystal memory embed` downloads them, and `embeddings = true` under `[memory]` in \
+             the config turns them on"
+        );
+    };
+    let mut store = Store::open(socket)?;
+    let said_again: Vec<u64> = (store.twins(project, embedder)?.iter())
+        .flat_map(|merge| merge.merged.iter().map(|twin| twin.entry.id))
+        .collect();
+    let groups = store.near(project, embedder, &said_again)?;
+    let mut code = Code::default();
+    let groups = groups
+        .into_iter()
+        .map(|group| {
+            let group = group.into_iter();
+            group.map(|entry| code.listed(entry, project)).collect()
+        })
+        .collect();
+    Ok(Near { groups, said_again })
+}
+
 /// `entries` with whether each still holds, in the order they came.
 pub fn marked(entries: Vec<Entry>, project: &Path) -> Vec<Listed> {
     let mut code = Code::default();
@@ -3044,8 +3705,9 @@ fn launch_order(
 fn launch_paragraph(lines: Vec<(u64, String)>, reader: Reader) -> Option<String> {
     let how_to_add = "When you learn something a later session here should know, like a \
                       decision, a gotcha or a command that works, keep it with \
-                      `crystal remember \"<what>\"` (add `-k decision|gotcha|command|note`, and \
-                      `-f <file>` for each file it's about).";
+                      `crystal remember \"<what>\"` (add `-k decision|gotcha|command|note`, \
+                      `-f <file>` for each file it's about, and `--replaces <id>` when it \
+                      corrects an entry that no longer holds).";
     if lines.is_empty() {
         return (reader != Reader::Task).then(|| how_to_add.to_string());
     }
@@ -5186,21 +5848,36 @@ mod tests {
             adding(&mut store, "@25 refunds wait for the ledger", &ANGLED),
             Added::Alike(Entry { id: 1, .. })
         ));
-        assert!(matches!(
-            adding(&mut store, "@25 unlike: refunds skip the ledger", &ANGLED),
-            Added::New(Entry { id: 2, .. })
-        ));
+        // Alike, but saying something else: new, and near the one it's like.
+        let Added::Near { entry, near } =
+            adding(&mut store, "@25 unlike: refunds skip the ledger", &ANGLED)
+        else {
+            panic!("not new, or not near");
+        };
+        assert_eq!((entry.id, near.entry.id), (2, 1));
+        assert_eq!(near.reranked, Some(0.1));
         let alone = Angled { reranker: false };
+        // Without the reranker, only as alike as the same says the same.
         assert!(matches!(
             adding(&mut store, "@-26 refunds go to the ledger", &alone),
-            Added::New(Entry { id: 3, .. })
+            Added::Near {
+                entry: Entry { id: 3, .. },
+                near: Twin { reranked: None, .. },
+            }
         ));
         assert!(matches!(
             adding(&mut store, "@-70 the ledger's own tests", &ANGLED),
             Added::New(Entry { id: 4, .. })
         ));
+        // Near, as alike as 0.80, without the reranker asked.
+        let Added::Near { near, .. } = adding(&mut store, "@-100 refunds are logged", &ANGLED)
+        else {
+            panic!("not near");
+        };
+        assert_eq!((near.entry.id, near.reranked), (4, None));
+        assert!((near.alike - 30_f32.to_radians().cos()).abs() < 1e-6);
         // A new entry keeps the vector it was compared by.
-        assert_eq!(store.counts("angled").unwrap(), (4, 4));
+        assert_eq!(store.counts("angled").unwrap(), (5, 5));
     }
 
     #[test]
@@ -5534,7 +6211,11 @@ mod tests {
             note("@10 redis has to run for the ledger"),
             Some(&ANGLED),
         );
-        assert!(matches!(theirs.unwrap(), Added::New(Entry { id: 4, .. })));
+        // Added, and near the one 35 degrees from it.
+        let Added::Near { entry, near } = theirs.unwrap() else {
+            panic!("not added");
+        };
+        assert_eq!((entry.id, near.entry.id), (4, 2));
         // Forgotten with its vector, kept apart as it goes.
         store.remove(project, 3).unwrap();
         let again = store.add_with(project, distilled("@58 deploys on tuesdays"), Some(&ANGLED));
@@ -5629,6 +6310,262 @@ mod tests {
     }
 
     #[test]
+    fn an_update_keeps_what_it_said_and_restoring_puts_that_back() {
+        let (_dir, _socket, mut store) = remembering(&[
+            (Kind::Note, "Idle stop is off by default"),
+            (Kind::Gotcha, "Sessions keep their names"),
+        ]);
+        let project = Path::new(APP);
+        let files = ["src/daemon.rs".to_string()];
+        let (was, now) = store
+            .update(
+                project,
+                1,
+                "Idle stop is on by default: 30 minutes for agents",
+                Some(Kind::Decision),
+                &files,
+                project,
+                "  the default\nflipped ",
+            )
+            .unwrap();
+        assert_eq!(was.entry.text, "Idle stop is off by default");
+        assert_eq!((was.by, was.why.as_str()), (1, "the default flipped"));
+        assert!(was.updated());
+        assert_eq!((now.id, now.kind), (1, Kind::Decision));
+        assert_eq!(now.files, files);
+        // Found by its words now, not by those it had.
+        assert_eq!(
+            ids(&store.search(project, "minutes", None, 9, None).unwrap()),
+            [1]
+        );
+        assert!(
+            store
+                .search(project, "off", None, 9, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.superseded(project).unwrap(),
+            std::slice::from_ref(&was)
+        );
+        assert_eq!(
+            store.last_superseded(project, 1).unwrap(),
+            Some(was.clone())
+        );
+
+        // What it said before, said again, is told it no longer holds.
+        let again = store.add(project, note("idle stop is OFF by default"));
+        assert_eq!(again.unwrap(), Added::Outdated(was.clone()));
+        let mut refused = |text: &str| {
+            let update = store.update(project, 1, text, None, &[], project, "why");
+            update.unwrap_err().to_string()
+        };
+        assert!(refused("Idle stop is on by default: 30 minutes for agents").contains("already"));
+        assert!(refused("Sessions keep their names").contains("entry 2 says"));
+        let why = store.update(project, 1, "anything", None, &[], project, " ");
+        assert!(why.unwrap_err().to_string().contains("say why"));
+
+        let back = store.restore(project, 1).unwrap();
+        assert_eq!(
+            (back.text.as_str(), back.kind, back.files.len()),
+            ("Idle stop is off by default", Kind::Note, 0)
+        );
+        assert!(store.superseded(project).unwrap().is_empty());
+        let again = store.restore(project, 1).unwrap_err().to_string();
+        assert!(again.contains("never stopped holding"), "{again}");
+    }
+
+    #[test]
+    fn a_retired_entry_finds_what_holds_in_its_place_and_can_be_put_back() {
+        let (_dir, socket, mut store) = remembering(&[
+            (Kind::Command, "List the sessions with crystal ls"),
+            (Kind::Note, "The sessions list is sorted by name"),
+        ]);
+        let project = Path::new(APP);
+        let new = New {
+            kind: Kind::Command,
+            ..note("List the sessions with crystal list")
+        };
+        let (added, retired) = store
+            .replace(project, new, 1, "ls was renamed list", None)
+            .unwrap();
+        let Added::New(holder) = added else {
+            panic!("not added: {added:?}");
+        };
+        let retired = retired.unwrap();
+        assert_eq!((holder.id, retired.entry.id, retired.by), (3, 1, 3));
+        assert!(!retired.updated());
+        assert_eq!(ids(&store.entries(project).unwrap()), [3, 2]);
+        assert_eq!(store.get(project, 1).unwrap(), None);
+        let found = store.search(project, "sessions ls", None, 9, None).unwrap();
+        assert!(!ids(&found).contains(&1), "{found:?}");
+        // What it said finds what holds in its place.
+        let found = store.search(project, "ls", None, 9, None).unwrap();
+        assert_eq!(ids(&found), [3]);
+        let paragraph = launch(&socket, project, "list the sessions", Reader::Claude);
+        assert!(!paragraph.unwrap().unwrap().contains("crystal ls"));
+        assert_eq!(store.holding(project, 1).unwrap().map(|e| e.id), Some(3));
+
+        // Said again, by anyone, it's told what holds now.
+        for source in [Source::User, Source::Distilled("fixer".into())] {
+            let again = New {
+                source,
+                ..note("list the sessions with crystal LS")
+            };
+            assert_eq!(
+                store.add(project, again).unwrap(),
+                Added::Outdated(retired.clone())
+            );
+        }
+        // An entry retired for one retired since holds where that one does.
+        store
+            .retire(project, 3, 2, "merged into the list's note")
+            .unwrap();
+        assert_eq!(store.holding(project, 1).unwrap().map(|e| e.id), Some(2));
+
+        let back = store.restore(project, 1).unwrap();
+        assert_eq!(back, retired.entry, "as it was");
+        assert_eq!(ids(&store.entries(project).unwrap()), [2, 1]);
+        let found = store.search(project, "ls", None, 9, None).unwrap();
+        assert_eq!(ids(&found), [1], "its words are its own again");
+        assert_eq!(store.holding(project, 1).unwrap().map(|e| e.id), Some(1));
+        let twice = store.restore(project, 2).unwrap_err().to_string();
+        assert!(twice.contains("never stopped holding"), "{twice}");
+    }
+
+    #[test]
+    fn what_a_retired_entry_meant_finds_what_holds_in_its_place() {
+        let (_dir, _socket, mut store) = remembering(&[
+            (Kind::Decision, "@0 idle stop is off by default"),
+            (Kind::Note, "@90 sessions keep their names"),
+        ]);
+        let project = Path::new(APP);
+        store.embed_missing(&ANGLED).unwrap();
+        let new = note("@170 agents stop once left alone");
+        store
+            .replace(project, new, 1, "it flipped", Some(&ANGLED))
+            .unwrap();
+        // Nothing has its words; what meant it is 2 degrees off.
+        let found = store.search(project, "@2 quietly", None, 1, Some(&ANGLED));
+        assert_eq!(ids(&found.unwrap()), [3]);
+    }
+
+    #[test]
+    fn what_replaces_an_entry_is_never_that_entry_said_again() {
+        let (_dir, _socket, mut store) = remembering(&[
+            (Kind::Decision, "@0 idle stop is off by default"),
+            (Kind::Note, "@60 sessions keep their names"),
+        ]);
+        let project = Path::new(APP);
+        let replace = |store: &mut Store, text: &str, id: u64| {
+            store.replace(project, note(text), id, "it flipped", Some(&ANGLED))
+        };
+        // Alike enough to be it said again, but it's what replaces it.
+        let (added, retired) = replace(&mut store, "@3 idle stop is on by default", 1).unwrap();
+        assert!(
+            matches!(added, Added::New(Entry { id: 3, .. })),
+            "{added:?}"
+        );
+        assert_eq!(retired.unwrap().by, 3);
+        // What another says already holds in its place.
+        let (added, retired) = replace(&mut store, "@60 Sessions keep their NAMES", 3).unwrap();
+        assert!(
+            matches!(added, Added::Again(Entry { id: 2, .. })),
+            "{added:?}"
+        );
+        assert_eq!(retired.unwrap().by, 2);
+
+        let same = replace(&mut store, "@60 sessions keep their names!", 2).unwrap_err();
+        assert!(
+            same.to_string().contains("says what entry 2 says"),
+            "{same}"
+        );
+        let gone = replace(&mut store, "@90 anything", 9).unwrap_err();
+        assert!(gone.to_string().contains("no entry 9"), "{gone}");
+        let why = store.replace(project, note("@90 anything"), 2, " ", None);
+        assert!(why.unwrap_err().to_string().contains("say why"));
+        // What stopped holding, said in place of another, holds again.
+        let (added, _) = replace(&mut store, "@0 idle stop is off by default", 2).unwrap();
+        assert!(
+            matches!(added, Added::New(Entry { id: 4, .. })),
+            "{added:?}"
+        );
+        let retire_itself = store.retire(project, 4, 4, "why").unwrap_err();
+        assert!(retire_itself.to_string().contains("its own place"));
+        let retire_for_none = store.retire(project, 4, 2, "why").unwrap_err();
+        assert!(retire_for_none.to_string().contains("no entry 2"));
+    }
+
+    #[test]
+    fn entries_near_one_another_are_grouped_for_reconciling() {
+        // As near as 0.80 is within 36 degrees: one at 30 is near those at 0
+        // and 60, which aren't near each other.
+        let (dir, mut store) = said(&[
+            "@0 one",
+            "@30 two",
+            "@60 three",
+            "@100 four",
+            "@103 five",
+            "@140 six",
+            "@200 seven",
+            "@225 unlike eight",
+        ]);
+        let project = Path::new(APP);
+        store
+            .conn
+            .execute("UPDATE entries SET kind = 'outcome' WHERE id = 6", [])
+            .unwrap();
+        let grouped = |groups: &[Vec<Entry>]| -> Vec<Vec<u64>> {
+            groups.iter().map(|group| ids(group)).collect()
+        };
+        let groups = store.near(project, &ANGLED, &[]).unwrap();
+        assert_eq!(grouped(&groups), [vec![1, 2, 3], vec![4, 5], vec![7, 8]]);
+        let groups = store.near(project, &ANGLED, &[2]).unwrap();
+        assert_eq!(grouped(&groups), [vec![4, 5], vec![7, 8]]);
+
+        // Those dedupe would merge into another are left out: three apart
+        // say the same, and so do 25 apart when the reranker says so.
+        let socket = dir.path().join("crystal.sock");
+        let near = near(&socket, project, Some(&ANGLED)).unwrap();
+        assert_eq!(near.said_again, [5, 7]);
+        let groups: Vec<Vec<u64>> = (near.groups.iter())
+            .map(|group| group.iter().map(|item| item.entry.id).collect())
+            .collect();
+        assert_eq!(groups, [vec![1, 2, 3]]);
+        let refused = super::near(&socket, project, None).unwrap_err();
+        assert!(
+            refused.to_string().contains("crystal memory embed"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn one_left_out_of_every_group_joins_the_one_nearest_it_while_there_s_room() {
+        // Seven near one another, six of them a group, and three each near
+        // one of them alone.
+        let mut near: Vec<Vec<(f32, usize)>> = (0..7_usize)
+            .map(|n| {
+                let others = (0..7).filter(|&other| other != n);
+                let mut near: Vec<(f32, usize)> = others
+                    .map(|other| (0.99 - n.abs_diff(other) as f32 / 100.0, other))
+                    .collect();
+                near.sort_by(|a, b| b.0.total_cmp(&a.0));
+                near
+            })
+            .collect();
+        for (alone, with) in [(7, 0), (8, 1), (9, 2)] {
+            near.push(vec![(0.81, with)]);
+            near[with].push((0.81, alone));
+        }
+        let ids: Vec<u64> = (1..=10).collect();
+        assert_eq!(
+            near_groups(&near, &ids),
+            [vec![0, 1, 2, 3, 4, 5, 6, 7], vec![1, 8], vec![2, 9]]
+        );
+        assert!(near_groups(&[vec![], vec![]], &[1, 2]).is_empty());
+    }
+
+    #[test]
     fn the_drifting_and_the_stale_are_marked_where_they_rank() {
         let project = project_with(&["a.rs", "b.rs"]);
         fs::write(project.path().join("a.rs"), "fn ledger_timeout() {}").unwrap();
@@ -5708,6 +6645,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(paragraph.starts_with("When you learn something"));
+        assert!(paragraph.contains("`--replaces <id>` when it corrects an entry"));
         assert_eq!(
             launch(&socket, Path::new(APP), "anything", Reader::Task).unwrap(),
             None,
@@ -6253,9 +7191,11 @@ mod tests {
         let a_rs = ["a.rs".to_string()];
         assert_eq!(store.stale_about(at, &a_rs, 1).unwrap().len(), 1);
 
-        let reworded = store
+        let (was, reworded) = store
             .reword(at, 1, "Flaky calls go through `ledger_retry_twice`", at)
             .unwrap();
+        assert_eq!(was.entry.text, "Flaky calls go through `ledger_retry`");
+        assert!(was.updated());
         assert_eq!(reworded.id, 1);
         assert_eq!(reworded.names, ["ledger_retry_twice"]);
         assert_eq!(reworded.kind, Kind::Note);

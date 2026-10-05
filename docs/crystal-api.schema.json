@@ -499,6 +499,13 @@
           "minimum": 0,
           "default": 0
         },
+        "superseded": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "description": "How many of the entries it was shown it updated or retired, as what it kept replaced them.",
+          "default": 0
+        },
         "cost_usd": {
           "type": "number",
           "format": "double"
@@ -573,6 +580,26 @@
             "minimum": 0
           },
           "description": "The ids of the stale entries it said no longer hold, forgotten.",
+          "default": []
+        },
+        "updated": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "description": "The ids of the entries it was shown that what it kept corrected, each put in its place under its id.",
+          "default": []
+        },
+        "retired": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "description": "The ids of the entries it was shown that what it kept replaced, each retired.",
           "default": []
         },
         "rejected": {
@@ -753,6 +780,17 @@
               "type": "null"
             }
           ]
+        },
+        "superseded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemorySuperseded"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "An entry of memory that stopped holding, as it was, with what holds in its place and why: `memory` is that, as it is now."
         },
         "backlog": {
           "anyOf": [
@@ -1060,6 +1098,14 @@
         {
           "const": "memory.merged",
           "description": "entries that say the same thing are merged into one, by `crystal memory dedupe`"
+        },
+        {
+          "const": "memory.superseded",
+          "description": "an entry stops holding, another said in its place: updated, or retired"
+        },
+        {
+          "const": "memory.restored",
+          "description": "an entry that stopped holding is put back as it was"
         },
         {
           "const": "backlog.added",
@@ -2487,6 +2533,93 @@
       ],
       "description": "What the machine has."
     },
+    "MemoryAdded": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "new": {
+              "$ref": "#/$defs/MemoryEntry"
+            }
+          },
+          "required": [
+            "new"
+          ],
+          "additionalProperties": false,
+          "description": "A new entry."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "near": {
+              "type": "object",
+              "properties": {
+                "entry": {
+                  "$ref": "#/$defs/MemoryEntry"
+                },
+                "near": {
+                  "$ref": "#/$defs/MemoryTwin"
+                }
+              },
+              "required": [
+                "entry",
+                "near"
+              ]
+            }
+          },
+          "required": [
+            "near"
+          ],
+          "additionalProperties": false,
+          "description": "A new entry, near one said before but not the same, `near`, as alike as `Embed::near_from`: about the same thing, it may say something else of it, or correct it, and then supersede it."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "again": {
+              "$ref": "#/$defs/MemoryEntry"
+            }
+          },
+          "required": [
+            "again"
+          ],
+          "additionalProperties": false,
+          "description": "The project had it already, in the same words: it was seen again, with any new files it named added to its own."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "alike": {
+              "$ref": "#/$defs/MemoryEntry"
+            }
+          },
+          "required": [
+            "alike"
+          ],
+          "additionalProperties": false,
+          "description": "The project had it already in other words: this entry, which says the same thing, or had one merged into it in those words, was seen again, as with `Added::Again`."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "outdated": {
+              "$ref": "#/$defs/MemorySuperseded"
+            }
+          },
+          "required": [
+            "outdated"
+          ],
+          "additionalProperties": false,
+          "description": "An entry said it, in these words, and stopped holding since: this, as it was. It isn't added; `crystal memory restore` puts the entry back."
+        },
+        {
+          "type": "string",
+          "const": "refused",
+          "description": "The user forgot it, and crystal can't add it back."
+        }
+      ],
+      "description": "What adding an entry came to."
+    },
     "MemoryEntry": {
       "type": "object",
       "properties": {
@@ -2659,6 +2792,35 @@
       ],
       "description": "Entries of a project that say the same thing, as `crystal memory dedupe` finds them: the one kept, and those that go into it, each as alike to it as it is."
     },
+    "MemoryNear": {
+      "type": "object",
+      "properties": {
+        "groups": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/MemoryListed"
+            }
+          },
+          "description": "The groups, each entry with whether it still holds."
+        },
+        "said_again": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "description": "The ids of the entries left out, as each says what another does: `dedupe`'s to merge, into one that may be in a group.",
+          "default": []
+        }
+      },
+      "required": [
+        "groups"
+      ],
+      "description": "The entries of a project's memory near one another, as `crystal memory reconcile` asks about them."
+    },
     "MemoryNew": {
       "type": "object",
       "properties": {
@@ -2692,6 +2854,24 @@
         "source"
       ],
       "description": "An entry about to be added."
+    },
+    "MemoryReplacing": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "why"
+      ],
+      "description": "The entry one about to be added replaces, by its id, which no longer holds, and why."
     },
     "MemorySource": {
       "oneOf": [
@@ -2742,6 +2922,37 @@
         }
       ],
       "description": "Who an entry came from."
+    },
+    "MemorySuperseded": {
+      "type": "object",
+      "properties": {
+        "entry": {
+          "$ref": "#/$defs/MemoryEntry"
+        },
+        "by": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "The entry that holds in its place: another, which replaced it, or its own id, rewritten."
+        },
+        "why": {
+          "type": "string",
+          "description": "Why it no longer holds."
+        },
+        "superseded": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "When it stopped holding, in seconds since the Unix epoch."
+        }
+      },
+      "required": [
+        "entry",
+        "by",
+        "why",
+        "superseded"
+      ],
+      "description": "An entry that stopped holding, as it was then: retired, another entry holding in its place, or updated, rewritten under its id."
     },
     "MemoryTwin": {
       "type": "object",
@@ -4460,6 +4671,16 @@
             "entry": {
               "$ref": "#/$defs/MemoryNew"
             },
+            "replaces": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/MemoryReplacing"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "const": "remember"
@@ -4470,7 +4691,24 @@
             "project",
             "entry"
           ],
-          "description": "Add `entry` to the memory of `project`, a project's main worktree: the daemon, which keeps the models loaded, finds whether the project has it already in other words."
+          "description": "Add `entry` to the memory of `project`, a project's main worktree: the daemon, which keeps the models loaded, finds whether the project has it already in other words. With `replaces`, in place of that entry, which no longer holds, and is retired."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "dir": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "near_memory"
+            }
+          },
+          "required": [
+            "type",
+            "dir"
+          ],
+          "description": "The entries of the memory of the project `dir` is in near one another in meaning, in groups, each with whether it still holds: for `crystal memory reconcile` to ask a model whether any of them no longer holds."
         },
         {
           "type": "object",
@@ -5952,6 +6190,30 @@
             {
               "type": "object",
               "properties": {
+                "near": {
+                  "type": "object",
+                  "properties": {
+                    "entry": {
+                      "$ref": "#/$defs/MemoryEntry"
+                    },
+                    "near": {
+                      "$ref": "#/$defs/MemoryTwin"
+                    }
+                  },
+                  "required": [
+                    "entry",
+                    "near"
+                  ]
+                }
+              },
+              "required": [
+                "near"
+              ],
+              "description": "A new entry, near one said before but not the same, `near`, as alike as `Embed::near_from`: about the same thing, it may say something else of it, or correct it, and then supersede it."
+            },
+            {
+              "type": "object",
+              "properties": {
                 "again": {
                   "$ref": "#/$defs/MemoryEntry"
                 }
@@ -5974,6 +6236,18 @@
               "description": "The project had it already in other words: this entry, which says the same thing, or had one merged into it in those words, was seen again, as with `Added::Again`."
             },
             {
+              "type": "object",
+              "properties": {
+                "outdated": {
+                  "$ref": "#/$defs/MemorySuperseded"
+                }
+              },
+              "required": [
+                "outdated"
+              ],
+              "description": "An entry said it, in these words, and stopped holding since: this, as it was. It isn't added; `crystal memory restore` puts the entry back."
+            },
+            {
               "type": "string",
               "const": "refused",
               "description": "The user forgot it, and crystal can't add it back."
@@ -5990,6 +6264,47 @@
           "required": [
             "type"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "added": {
+              "$ref": "#/$defs/MemoryAdded"
+            },
+            "retired": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/MemorySuperseded"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "replaced"
+            }
+          },
+          "required": [
+            "type",
+            "added"
+          ],
+          "description": "What adding an entry to a project's memory in place of another came to, and the entry it replaced, as it was, retired; `None` when it wasn't added, and the other is left as it was."
+        },
+        {
+          "$ref": "#/$defs/MemoryNear",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "near"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "description": "The entries of a project's memory near one another in meaning, in groups, and those left out as they say what another does."
         },
         {
           "type": "object",
