@@ -1480,5 +1480,98 @@ mod tests {
             rechecked.line(),
             "0 entries added, of the stale 1 kept, 2 forgotten ($0.0000)"
         );
+        let made = Report {
+            made_lessons: vec![7],
+            ..Report::default()
+        };
+        assert_eq!(
+            made.line(),
+            "0 entries added, 1 note made a lesson ($0.0000)"
+        );
+    }
+
+    #[test]
+    fn notes_it_was_shown_that_are_lessons_are_made_lessons_and_nothing_else() {
+        let dir = checkout();
+        let answer = json!({"entries": [], "rechecked": [], "kinds": [
+            {"id": 3, "kind": "gotcha"},
+            {"id": 4, "kind": "decision"},
+            {"id": 5, "kind": "note"},
+            {"id": 3, "kind": "command"},
+            {"kind": "gotcha"},
+        ]});
+        let checked = check(&answer, dir.path(), &[], &[3, 5]).unwrap();
+        assert_eq!(
+            checked.lessons,
+            [(3, Kind::Gotcha)],
+            "the first word on each"
+        );
+        assert_eq!(
+            checked.rejected,
+            [
+                "note 4: not a note it was shown",
+                "note 5: \"note\" isn't a lesson's kind",
+                "a note made a lesson with no id: {\"kind\":\"gotcha\"}",
+            ]
+        );
+        let schema = schema();
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("kinds"))
+        );
+        let kinds = &schema["properties"]["kinds"]["items"]["properties"]["kind"]["enum"];
+        assert_eq!(*kinds, json!(["decision", "gotcha", "command"]));
+        assert!(SYSTEM_PROMPT.contains("give its id in kinds"));
+    }
+
+    #[test]
+    fn a_pass_over_notes_reads_each_by_its_id_and_is_told_what_is_no_lesson() {
+        let note = |id, text: &str, files: &[&str]| Entry {
+            id,
+            kind: Kind::Note,
+            text: text.into(),
+            files: files.iter().map(|file| file.to_string()).collect(),
+            source: Source::User,
+            created: 0,
+            seen: 1,
+            last_seen: 0,
+            anchors: Default::default(),
+            checkout: None,
+            used: None,
+            names: Vec::new(),
+            counted_from: None,
+        };
+        let notes = [
+            note(
+                3,
+                "The ledger tests need\nREDIS_PASSWORD=hunter22x set",
+                &["tests/ledger.rs"],
+            ),
+            note(5, "The sidebar's width is kept in the ui table", &[]),
+        ];
+        assert_eq!(
+            notes_message(&notes),
+            "The notes, each after its id:\n\
+             - 3: The ledger tests need REDIS_PASSWORD=[redacted] set [tests/ledger.rs]\n\
+             - 5: The sidebar's width is kept in the ui table\n\
+             \nReturn the notes that are lessons, each with its kind."
+        );
+        for rule in [
+            "a decision: a choice made and why",
+            "a gotcha: a trap or a surprise",
+            "a command: a command line to run",
+            "These are not lessons, and stay notes",
+            "When unsure, leave it out",
+        ] {
+            assert!(NOTES_PROMPT.contains(rule), "{rule}");
+        }
+        let schema = notes_schema();
+        assert_eq!(schema["required"], json!(["lessons"]));
+        assert_eq!(schema["properties"]["lessons"]["maxItems"], NOTES_AT_ONCE);
+        let args = pass_args(&MemorySettings::default(), NOTES_PROMPT, &schema);
+        assert!(args.contains(&"--no-session-persistence".to_string()));
+        assert!(args.contains(&NOTES_PROMPT.to_string()));
     }
 }

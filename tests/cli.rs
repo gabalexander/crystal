@@ -13714,18 +13714,26 @@ fn a_closed_task_is_kept_in_its_project_s_history_not_its_memory() {
 /// not give, and that the first stale entry it's asked about no longer
 /// holds. Returns the directory to put on the PATH.
 fn distilling_claude(dir: &Path) -> PathBuf {
+    distilling_claude_answering(
+        dir,
+        r#"{"entries":[{"kind":"gotcha","text":"The ledger tests need redis up","files":["ledger.rs"]},{"kind":"outcome","text":"fixed it","files":[]}],"rechecked":['"$rechecked"']}"#,
+    )
+}
+
+/// [`distilling_claude`], answering as the distiller with `answer`.
+fn distilling_claude_answering(dir: &Path, answer: &str) -> PathBuf {
     let bin = dir.join("distilling-bin");
     std::fs::create_dir(&bin).unwrap();
     script(
         &bin.join("claude"),
-        r#"case " $* " in
+        &r#"case " $* " in
 *" --json-schema "*)
     cat > distill-message
     printf '%s\n' "$@" > distill-args.new && mv distill-args.new distill-args
     stale=$(sed -n 's/^- id \([0-9]*\): .*/\1/p' distill-message | head -n 1)
     rechecked=""
     [ -n "$stale" ] && rechecked='{"id":'"$stale"',"verdict":"forget","text":""}'
-    echo '{"type":"result","subtype":"success","is_error":false,"result":"","structured_output":{"entries":[{"kind":"gotcha","text":"The ledger tests need redis up","files":["ledger.rs"]},{"kind":"outcome","text":"fixed it","files":[]}],"rechecked":['"$rechecked"']},"total_cost_usd":0.01}'
+    echo '{"type":"result","subtype":"success","is_error":false,"result":"","structured_output":ANSWER,"total_cost_usd":0.01}'
     ;;
 *)
     printf '%s\n' "$@" > task-args.new && mv task-args.new task-args
@@ -13739,7 +13747,8 @@ fn distilling_claude(dir: &Path) -> PathBuf {
     done
     ;;
 esac
-"#,
+"#
+        .replace("ANSWER", answer),
     );
     bin
 }
@@ -13967,6 +13976,145 @@ fn the_distiller_is_asked_whether_a_stale_entry_the_task_touched_still_holds() {
     assert!(forgot.contains("old_ledger"), "{forgot}");
     let distilled = crystal.ok(&["events", "-k", "memory.distilled"]);
     assert!(distilled.contains("1 stale rechecked"), "{distilled}");
+}
+
+#[test]
+fn the_distiller_makes_the_notes_it_was_shown_that_are_lessons_lessons() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    crystal.ok(&["remember", "-C", repo_dir, "The ledger tests need redis up"]);
+    let bin = distilling_claude_answering(
+        crystal.dir.path(),
+        r#"{"entries":[],"rechecked":[],"kinds":[{"id":1,"kind":"gotcha"},{"id":7,"kind":"decision"}]}"#,
+    );
+    start_fixer(&crystal, &repo, &bin);
+
+    eventually("the note is made a lesson", || {
+        crystal
+            .ok(&["memory", "-C", repo_dir, "list", "-k", "gotcha"])
+            .contains("The ledger tests need redis up")
+    });
+    // It was shown the note by its id and kind.
+    let message = std::fs::read_to_string(repo.join("distill-message")).unwrap();
+    assert!(
+        message.contains("- 1 (note) The ledger tests need redis up\n"),
+        "{message}"
+    );
+    eventually("the pass is told of", || {
+        crystal
+            .ok(&["events", "-k", "memory.distilled"])
+            .contains("0 added, 1 made lessons, 1 rejected")
+    });
+    let changed = crystal.ok(&["events", "-k", "memory.changed"]);
+    assert!(
+        changed.contains("1 (gotcha) The ledger tests need redis up"),
+        "{changed}"
+    );
+}
+
+/// A stand-in for Claude as it reads a project's notes for the lessons
+/// among them: it writes its message to `notes-message`, and says note 1
+/// is a gotcha and note 3, which it wasn't asked about, a decision.
+/// Returns the directory to put on the PATH.
+fn notes_claude(dir: &Path) -> PathBuf {
+    let bin = dir.join("notes-bin");
+    std::fs::create_dir(&bin).unwrap();
+    script(
+        &bin.join("claude"),
+        r#"cat > notes-message
+echo '{"type":"result","subtype":"success","is_error":false,"result":"","structured_output":{"lessons":[{"id":1,"kind":"gotcha"},{"id":3,"kind":"decision"}]},"total_cost_usd":0.01}'
+"#,
+    );
+    bin
+}
+
+#[test]
+fn memory_kind_changes_entries_in_place_and_a_model_says_which_notes_are_lessons() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    let memory = |args: &[&str]| crystal.ok(&[&["memory", "-C", repo_dir], args].concat());
+    // A daemon to tell what changes, for its log.
+    crystal.ok(&["new", "-d", "-n", "here", "sleep", "30"]);
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "The ledger tests fail unless redis is up",
+    ]);
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "The sidebar's width is in the ui table",
+    ]);
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "PR #12 squash-merged into master as 8012b6c",
+    ]);
+
+    // By hand, once every one is there: what it says stays.
+    assert_eq!(
+        memory(&["kind", "decision", "2"]),
+        "2 is a decision now: The sidebar's width is in the ui table\n"
+    );
+    assert!(memory(&["list", "-k", "decision"]).contains("The sidebar's width"));
+    let missing = crystal.fails(&["memory", "-C", repo_dir, "kind", "gotcha", "1", "9"]);
+    assert!(missing.contains("there's no entry 9"), "{missing}");
+    assert_eq!(memory(&["list", "-k", "note"]).lines().count(), 2);
+    let changed = crystal.ok(&["events", "-k", "memory.changed"]);
+    assert!(
+        changed.contains("2 (decision) The sidebar's width is in the ui table"),
+        "{changed}"
+    );
+
+    // The model's word: listed first, and made so with --yes.
+    let bin = notes_claude(crystal.dir.path());
+    let ask = |yes: &[&str]| {
+        let args = [&["memory", "-C", repo_dir, "kind", "--notes"], yes].concat();
+        let out = crystal
+            .command(&args)
+            .env("PATH", path_of(&[&bin]))
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{said}");
+        (String::from_utf8(out.stdout).unwrap(), said)
+    };
+    let (listed, said) = ask(&[]);
+    assert_eq!(
+        listed,
+        "   1  note → gotcha    The ledger tests fail unless redis is up\n\
+         would make this note a lesson: add --yes to make it one\n"
+    );
+    assert!(
+        said.contains("which of the 1 notes are lessons (1 that read as status left out"),
+        "{said}"
+    );
+    assert!(
+        said.contains("rejected note 3: not a note it was shown"),
+        "{said}"
+    );
+    // It ran in the project, and was asked of the notes that aren't status.
+    let message = std::fs::read_to_string(repo.join("notes-message")).unwrap();
+    assert!(
+        message.contains("- 1: The ledger tests fail unless redis is up\n"),
+        "{message}"
+    );
+    assert!(!message.contains("squash-merged"), "{message}");
+    assert_eq!(
+        memory(&["list", "-k", "note"]).lines().count(),
+        2,
+        "a dry run"
+    );
+
+    let (made, _) = ask(&["--yes"]);
+    assert_eq!(
+        made,
+        "1 is a gotcha now: The ledger tests fail unless redis is up\n"
+    );
+    assert!(memory(&["list", "-k", "gotcha"]).contains("The ledger tests fail"));
 }
 
 #[test]

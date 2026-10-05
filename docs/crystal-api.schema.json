@@ -481,6 +481,13 @@
           "format": "uint",
           "minimum": 0
         },
+        "made_lessons": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "description": "How many of the notes it was shown it made lessons.",
+          "default": 0
+        },
         "rejected": {
           "type": "integer",
           "format": "uint",
@@ -579,6 +586,16 @@
           "type": "number",
           "format": "double",
           "description": "What the pass cost, in US dollars, as Claude counts it."
+        },
+        "made_lessons": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "description": "The ids of the notes it was shown that it made lessons.",
+          "default": []
         }
       },
       "required": [
@@ -1027,6 +1044,10 @@
         {
           "const": "memory.promoted",
           "description": "an entry is written into the project's CLAUDE.md or AGENTS.md"
+        },
+        {
+          "const": "memory.changed",
+          "description": "an entry's kind is changed, by you or by the distiller"
         },
         {
           "const": "memory.distilled",
@@ -2501,6 +2522,16 @@
           "format": "uint64",
           "minimum": 0,
           "description": "When an agent last read it in full, in seconds since the Unix epoch.",
+          "default": null
+        },
+        "counted_from": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "description": "When its time to expire counts from, when that's later than when it was last said: when crystal started telling whether an entry is found again, for one from before then, or when it was made a note.",
           "default": null
         }
       },

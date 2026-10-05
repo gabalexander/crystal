@@ -4767,6 +4767,76 @@ mod tests {
     }
 
     #[test]
+    fn a_database_from_before_counts_its_entries_time_from_the_upgrade() {
+        let (_dir, socket) = socket();
+        fs::create_dir_all(dir(&socket)).unwrap();
+        let conn = Connection::open(dir(&socket).join("memory.db")).unwrap();
+        // The database as it was before its time was counted, the ninth step.
+        let before = 8;
+        for step in &MIGRATIONS[..before] {
+            step(&conn).unwrap();
+        }
+        conn.execute_batch(&format!("PRAGMA user_version = {before}"))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO projects (path, next_id) VALUES (?1, 2)",
+            params![APP],
+        )
+        .unwrap();
+        let long_ago = seconds_since_epoch(SystemTime::now()) - 100 * DAY;
+        conn.execute(
+            "INSERT INTO entries (project, id, kind, text, key, source, created, last_seen) \
+             VALUES (?1, 1, 'note', 'the ledger needs redis', 'the ledger needs redis', \
+             '\"user\"', ?2, ?2)",
+            params![APP, long_ago],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut store = Store::open(&socket).unwrap();
+        let project = Path::new(APP);
+        let entry = store.get(project, 1).unwrap().unwrap();
+        let now = seconds_since_epoch(SystemTime::now());
+        assert!(entry.counted_from.is_some_and(|from| from + 60 >= now));
+        assert!(!entry.expired(now), "it has its month from the upgrade");
+        assert!(entry.expired(now + 30 * DAY), "and no more");
+        let found = store.search(project, "ledger redis", None, 10, None);
+        assert_eq!(ids(&found.unwrap()), [1]);
+    }
+
+    #[test]
+    fn an_entry_s_kind_changes_in_place_and_a_note_made_counts_from_then() {
+        let (_dir, _socket, mut store) =
+            remembering(&[(Kind::Note, "the ledger tests need redis")]);
+        let project = Path::new(APP);
+        assert_eq!(store.embed_missing(&MEANINGS).unwrap(), 1);
+        // Said long ago and never found again, it's expired as a note.
+        store
+            .conn
+            .execute(
+                "UPDATE entries SET created = created - ?1, last_seen = last_seen - ?1",
+                params![40 * DAY],
+            )
+            .unwrap();
+        let found =
+            |store: &mut Store| ids(&store.search(project, "redis", None, 10, None).unwrap());
+        assert!(found(&mut store).is_empty());
+
+        let made = store.set_kind(project, 1, Kind::Gotcha).unwrap();
+        assert_eq!(made.kind, Kind::Gotcha);
+        assert_eq!(made.text, "the ledger tests need redis");
+        // Its vector and its words stay: nothing is embedded again.
+        assert_eq!(store.embed_missing(&MEANINGS).unwrap(), 0);
+        assert_eq!(found(&mut store), [1], "a lesson never expires");
+        // Made a note again, its month starts now.
+        let note = store.set_kind(project, 1, Kind::Note).unwrap();
+        assert!(!note.expired(seconds_since_epoch(SystemTime::now())));
+        assert_eq!(found(&mut store), [1]);
+        let missing = store.set_kind(project, 9, Kind::Gotcha).unwrap_err();
+        assert_eq!(missing.to_string(), "there's no entry 9");
+    }
+
+    #[test]
     fn what_reads_as_status_is_told_by_its_words() {
         for status in [
             "Notifications PR #56 squash-merged into master as 8012b6c on 2026-10-04",

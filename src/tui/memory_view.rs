@@ -636,6 +636,32 @@ mod tests {
     }
 
     #[test]
+    fn c_gives_the_entry_the_kind_the_next_key_picks() {
+        let mut view = view_of(vec![item(5, Kind::Note, "the ledger needs redis")]);
+        press(&mut view, KeyCode::Char('c'));
+        assert_eq!(view.question().as_deref(), Some("entry 5's kind:"));
+        let keys: Vec<String> = hints(&view)
+            .into_iter()
+            .skip(1)
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys, ["d", "g", "c", "n"]);
+        assert!(view.typing(), "the next key is the kind's, not a move");
+        assert_eq!(
+            press(&mut view, KeyCode::Char('g')),
+            Outcome::Do(Action::SetMemoryKind {
+                dir: PathBuf::from("/code/app"),
+                id: 5,
+                kind: Kind::Gotcha,
+            })
+        );
+        // Any other key leaves it as it was.
+        press(&mut view, KeyCode::Char('c'));
+        assert_eq!(press(&mut view, KeyCode::Char('y')), Outcome::Stay);
+        assert_eq!(view.question(), None);
+    }
+
+    #[test]
     fn p_promotes_the_entry_after_y() {
         let mut view = view_of(vec![item(5, Kind::Gotcha, "run the ledger first")]);
         press(&mut view, KeyCode::Char('p'));

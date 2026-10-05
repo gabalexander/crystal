@@ -326,7 +326,8 @@ pub fn kind(socket: &Path, dir: Option<PathBuf>, kinding: Kinding) -> Result<()>
             }
             match read.lessons.len() {
                 0 => outln!("none of the notes reads as a lesson")?,
-                n => outln!("would make these {n} lessons: add --yes to make them")?,
+                1 => outln!("would make this note a lesson: add --yes to make it one")?,
+                n => outln!("would make these {n} notes lessons: add --yes to make them")?,
             }
             return Ok(());
         }

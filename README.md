@@ -2524,6 +2524,8 @@ crystal memory list --forgotten      # what was forgotten, the latest first
 crystal memory list --expired        # the notes and outcomes nobody found again
 crystal memory list --status         # the entries that read as status rather than lessons
 crystal memory rm --status           # what that would forget; `--yes` forgets them
+crystal memory kind gotcha 12 15     # make entries gotchas: what they say stays as it is
+crystal memory kind --notes          # the notes a model reads as lessons, and their kinds; `--yes` makes them so
 crystal memory promote 2             # copy one into the project's CLAUDE.md, under "Notes"
 crystal memory distill fixer         # have a model read what a session did, now
 crystal memory embed                 # download the model that searches by meaning
@@ -2548,7 +2550,14 @@ crystal memory embed                 # download the model that searches by meani
   again is said again (`remembered 3 already`), or read in full by an agent, with the `memory_show` tool or
   `crystal memory show` in a session. A search and agents starting leave the expired out; they're kept, marked
   `[expired]` in the list, `list --expired` lists them alone and `search --all` brings them back. Lessons never
-  expire.
+  expire. The entries kept before crystal told whether one was found again have their days counted from when
+  it started to, the upgrade, not from when they were said; so does an entry made a note.
+- `kind` changes the kind of entries, by their ids, once every one is there: say a lesson kept as a note to a
+  `gotcha`, which then ranks with the lessons and never expires. What it says stays as it is, and so do its
+  vector and its place in the index. `kind --notes` has the distiller's model (`distill_model`, Haiku) read
+  every note, 40 at a time, in one `claude -p` as locked down as the distiller's, and lists those it reads as
+  lessons with the kind it gives each; `--yes` gives them it. Notes that read as status (`list --status`) are
+  left out. It's a model's reading, so look through what it lists first; a pass costs a few cents.
 - `list --status` lists the entries that read as progress or status rather than lessons, by the words that
   say so: merged, pushed, committed or installed, CI passing, a pull request opened, a commit's hash, a backlog
   item that tracks it, or what holds only in this pull request. It's for you to look through: `rm --status`
@@ -2588,8 +2597,9 @@ crystal memory embed                 # download the model that searches by meani
   (or `--wrong`) lists what was forgotten, as it was; remembering it again brings it back.
 - `m` in the sidebar opens the selected session's project's list, drifting, stale and expired entries marked:
   the entry the bar is on is shown in full beside it, with what's gone, `/` filters, `Enter` opens its file in
-  your `$EDITOR` (in the worktree it was remembered in while that's there, as a session of its own), and `x`
-  forgets an entry and `p` promotes it, each after a `y`.
+  your `$EDITOR` (in the worktree it was remembered in while that's there, as a session of its own), `x`
+  forgets an entry and `p` promotes it, each after a `y`, and `c` gives it the kind the next key picks (`d`,
+  `g`, `c` or `n`).
 
 When an agent starts, crystal shows it the entries that have most to do with its launch: first those about files
 its worktree has changed since its branch left the default one (`origin`'s, or `main` or `master`), committed
@@ -2665,7 +2675,9 @@ task closed done or failed and it was read then. It's one `claude -p` run on Hai
 - It reads the end of what the task did: a task's transcript, as Claude Code keeps it (or, when it doesn't,
   what crystal read of its runs), or for Claude Code in a terminal, the transcript its hooks named. Codex leaves
   nothing it can read. Credentials are taken out before the model sees any of it.
-- It's shown what the project's memory has already on the same subject, and told never to give that again.
+- It's shown what the project's memory has already on the same subject, each entry by its id and kind, and
+  told never to give that again. Of the notes among them, those it says are lessons it makes `decision`,
+  `gotcha` or `command` (a note that reads as status it's never asked about), and `memory.changed` says so.
 - It's told to keep lessons alone, what a later session couldn't get from the code, the git log, the backlog or
   CLAUDE.md, and never progress or status (merged, pushed, installed, CI passed), a commit's hash or a pull
   request's or backlog item's number as the point of an entry, or what's only true today, with entries of each
