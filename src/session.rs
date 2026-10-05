@@ -28,7 +28,7 @@ use crate::state::SavedSession;
 use crate::task::{self, Task};
 use crate::tasks;
 use crate::vt;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -2292,33 +2292,54 @@ impl Term {
     /// Keeps the screen up to date with `output` and passes it on to every
     /// viewer. Returns what the program asked its terminal, to answer.
     fn take_output(&self, output: &[u8]) -> Vec<u8> {
+        self.screen.lock().unwrap().take(output)
+    }
+
+    /// Clears the screen and its history but for the line the cursor is
+    /// on, the daemon's and every viewer's: see [`vt::Screen::clearing`].
+    /// The program is sent nothing. Not once it has ended, nor on the
+    /// alternate screen, whose program draws all of it.
+    pub fn clear(&self) -> Result<()> {
         let mut screen = self.screen.lock().unwrap();
-        let alternate = screen.vt.alternate_screen();
-        screen.vt.process(output);
-        screen.ring.push(output, now_ms());
-        if !alternate || !screen.vt.alternate_screen() {
-            screen.main_written = WRITES.fetch_add(1, Ordering::Relaxed) + 1;
+        ensure!(!screen.ended, "its program has ended");
+        let Some(clearing) = screen.vt.clearing() else {
+            bail!("its program draws on the alternate screen, which keeps no history");
+        };
+        // Under the one lock, so no output comes between the screen read
+        // and the clearing written.
+        screen.take(&clearing);
+        Ok(())
+    }
+}
+
+impl Screen {
+    /// [`Term::take_output`], under the screen's lock.
+    fn take(&mut self, output: &[u8]) -> Vec<u8> {
+        let alternate = self.vt.alternate_screen();
+        self.vt.process(output);
+        self.ring.push(output, now_ms());
+        if !alternate || !self.vt.alternate_screen() {
+            self.main_written = WRITES.fetch_add(1, Ordering::Relaxed) + 1;
         }
         // Viewers get the same output, so that their own screens keep the
         // same history.
         let chunk: Arc<[u8]> = output.into();
         // A viewer that's gone, or too far behind to catch up, is dropped
         // rather than holding up the program.
-        screen
-            .viewers
+        self.viewers
             .retain(|viewer| viewer.feed.try_send(chunk.clone()).is_ok());
         // What the program copies, a viewer's own screen sees, and puts on
         // the clipboard; with none, nobody does.
-        let watched = screen.viewers.iter().any(Viewer::is_user);
-        if screen.vt.take_copied().is_some() && !watched {
-            screen.unseen_copies = screen.unseen_copies.saturating_add(1);
+        let watched = self.viewers.iter().any(Viewer::is_user);
+        if self.vt.take_copied().is_some() && !watched {
+            self.unseen_copies = self.unseen_copies.saturating_add(1);
         }
         // One signal waiting is enough: the listener looks at the screen as
         // it is then.
-        screen.listeners.retain(|listener| {
+        self.listeners.retain(|listener| {
             !matches!(listener.try_send(()), Err(TrySendError::Disconnected(_)))
         });
-        screen.vt.take_replies()
+        self.vt.take_replies()
     }
 }
 

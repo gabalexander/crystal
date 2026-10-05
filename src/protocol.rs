@@ -91,12 +91,18 @@ pub enum Request {
     /// Tell the user `text` with a notification, the way the daemon tells
     /// them a session needs them: about the session with `id`, or else
     /// called `name`, which a click on it takes them to, when there is one.
+    /// It's under `title`, or crystal's name; with no text, the title is
+    /// what it says. `sound` plays with it.
     Notify {
         text: String,
         #[serde(default)]
         id: Option<String>,
         #[serde(default)]
         name: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        sound: NotifySound,
     },
     /// Give a session another name.
     Rename {
@@ -441,6 +447,16 @@ pub enum Request {
         #[serde(default)]
         since_ms: Option<u64>,
     },
+    /// Clear a session's screen and history but for the line its cursor
+    /// is on, which goes to the top, its own and every viewer's, sending
+    /// its program nothing: not on the alternate screen. The session with
+    /// `id`, or else called `name`.
+    Clear {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+    },
     /// With no name, the newest session. A size of 0 by 0 leaves the
     /// session's as it is.
     Attach {
@@ -556,6 +572,20 @@ pub enum TaskStart {
     Agent { command: Vec<String> },
     /// In the background, `claude -p` with these arguments.
     Background { args: Vec<String> },
+}
+
+/// The sound a notification of `crystal notify` plays: none, or one of
+/// crystal's two, which `[sound]` can make the user's own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NotifySound {
+    None,
+    /// The one for an agent that's done.
+    Done,
+    /// The one for an agent asking the user something.
+    #[default]
+    Request,
 }
 
 /// An answer to the permission a background task asks for.

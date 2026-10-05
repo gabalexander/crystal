@@ -1,6 +1,7 @@
-//! `crystal send`, `wait`, `read`, `result`, `answer` and `interrupt`: how
-//! one agent drives another, or a script drives an agent. They work from
-//! inside a session as well, since every session knows its daemon's socket.
+//! `crystal send`, `wait`, `read`, `clear`, `result`, `answer` and
+//! `interrupt`: how one agent drives another, or a script drives an agent.
+//! They work from inside a session as well, since every session knows its
+//! daemon's socket.
 //!
 //! A wait listens to the daemon's events about its session, or its task,
 //! rather than asking again and again: each one is a reason to look again.
@@ -183,6 +184,14 @@ pub fn answer(socket: &Path, task: &str, answer: Answer, message: Option<String>
         message,
     };
     ask(socket, &request)?;
+    Ok(())
+}
+
+/// Clears the screen and history of the session called `name`, or the one
+/// this runs in, but for the line its cursor is on.
+pub fn clear(socket: &Path, name: Option<String>) -> Result<()> {
+    let id = crate::work::own_session(socket, &name, "which session")?;
+    ask(socket, &Request::Clear { id, name })?;
     Ok(())
 }
 
