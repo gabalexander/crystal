@@ -53,6 +53,7 @@ mod messages;
 mod model;
 mod names;
 mod notify;
+mod output;
 mod output_ring;
 mod plugin_cli;
 mod plugin_hooks;
@@ -95,9 +96,10 @@ mod worktree_hooks;
 use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use client::Restart;
+use output::{out, outln};
 use profile::{Launch, Profile, StartIn};
 use protocol::{ArchivedSession, Request, Response, SessionInfo, TaskSpec, TaskState};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -2069,9 +2071,13 @@ fn main() -> ExitCode {
     };
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
+        // Whatever read what it printed had what it wanted.
+        Err(err) if output::closed(&err) => ExitCode::SUCCESS,
         Err(err) => {
-            // It may quote what a session, an agent or the forge said.
-            eprintln!("crystal: {}", printable::text(&format!("{err:#}")));
+            // It may quote what a session, an agent or the forge said; and
+            // standard error may be a pipe that has gone too.
+            let said = format!("{err:#}");
+            let _ = writeln!(std::io::stderr(), "crystal: {}", printable::text(&said));
             match err.is::<drive::TimedOut>() {
                 true => ExitCode::from(TIMED_OUT),
                 false => ExitCode::FAILURE,
@@ -2218,7 +2224,7 @@ fn run(cli: Cli) -> Result<()> {
                 args: claude_args,
             };
             let name = client::new_task(&socket, name, cwd, spec, None, brief)?.name;
-            println!("{name}");
+            outln!("{name}")?;
             if wait {
                 drive::wait_for_run(&socket, &name, seconds(timeout))?;
             }
@@ -2250,9 +2256,9 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             let layout = client::lay_out(&socket, layout::Command::Show)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&layout)?);
+                outln!("{}", serde_json::to_string_pretty(&layout)?)?;
             } else {
-                print!("{}", printable::text(&layout.text()));
+                out!("{}", printable::text(&layout.text()))?;
             }
         }
         Command::Attach { name } => attach::run(&socket, name.as_deref())?,
@@ -2265,9 +2271,9 @@ fn run(cli: Cli) -> Result<()> {
                 _ => Vec::new(),
             };
             if json {
-                println!("{}", serde_json::to_string_pretty(&archived)?);
+                outln!("{}", serde_json::to_string_pretty(&archived)?)?;
             } else {
-                print_archived(&archived);
+                print_archived(&archived)?;
             }
         }
         Command::Ls { json, .. } => {
@@ -2279,7 +2285,7 @@ fn run(cli: Cli) -> Result<()> {
             if json {
                 print_sessions_json(&sessions)?;
             } else {
-                print_sessions(&sessions);
+                print_sessions(&sessions)?;
             }
         }
         Command::Send {
@@ -2376,19 +2382,19 @@ fn run(cli: Cli) -> Result<()> {
         Command::Observe { name } => stream::observe(&socket, &name)?,
         Command::Api {
             command: ApiCommand::Snapshot,
-        } => println!(
+        } => outln!(
             "{}",
             serde_json::to_string_pretty(&api::snapshot(&socket)?)?
-        ),
+        )?,
         Command::Api {
             command: ApiCommand::Schema { json, output },
         } => match output {
             Some(path) => {
                 api::schema::write(&path)?;
-                println!("wrote the API schema to {}", path.display());
+                outln!("wrote the API schema to {}", path.display())?;
             }
-            None if json => print!("{}", api::schema::JSON),
-            None => print!("{}", api::schema::summary()?),
+            None if json => out!("{}", api::schema::JSON)?,
+            None => out!("{}", api::schema::summary()?)?,
         },
         Command::Control { name, rows, cols } => {
             let size = rows.zip(cols).filter(|&(rows, cols)| rows > 0 && cols > 0);
@@ -2432,15 +2438,15 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::RestartServer { cold } => match client::restart_daemon(&socket, cold)? {
-            Restart::NoDaemon => println!("no daemon was running"),
+            Restart::NoDaemon => outln!("no daemon was running")?,
             Restart::HandedOver { sessions: 0 } | Restart::Cold { why: None } => {
-                println!("restarted the daemon");
+                outln!("restarted the daemon")?;
             }
             Restart::HandedOver { .. } => {
-                println!("restarted the daemon, and its sessions carried on")
+                outln!("restarted the daemon, and its sessions carried on")?
             }
             Restart::Cold { why: Some(why) } => {
-                println!("restarted the daemon; its sessions started again, since {why}");
+                outln!("restarted the daemon; its sessions started again, since {why}")?;
             }
         },
         Command::Update {
@@ -2493,7 +2499,7 @@ fn run(cli: Cli) -> Result<()> {
             let settings = config::Config::load()?;
             plugins::ensure_enabled(&settings, "profiles")?;
             match command {
-                None => print_profiles(&settings.profiles),
+                None => print_profiles(&settings.profiles)?,
                 Some(ProfileCommand::Show { name }) => print_profile(&settings.profiles, &name)?,
             }
         }
@@ -2507,7 +2513,7 @@ fn run(cli: Cli) -> Result<()> {
                 Some(PluginCommand::Disable { name, project }) => {
                     plugin_cli::switch(&socket, &id(&name, project)?, false, false)?
                 }
-                Some(PluginCommand::Events) => plugin_cli::events(),
+                Some(PluginCommand::Events) => plugin_cli::events()?,
                 Some(PluginCommand::Run {
                     plugin,
                     action,
@@ -2587,21 +2593,21 @@ fn run(cli: Cli) -> Result<()> {
             let ascii = ascii || config::Config::load().is_ok_and(|config| config.mermaid_ascii);
             mermaid_cli::run(file.as_deref(), width, ascii, open)?
         }
-        Command::Guide => print!("{}", tui::page::GUIDE),
+        Command::Guide => out!("{}", tui::page::GUIDE)?,
         Command::Keys => {
             let config = config::Config::load()?;
             let keymap = tui::keymap::Keymap::new(&config.keys).map_err(anyhow::Error::msg)?;
-            print!("{}", tui::keymap::listing(&keymap));
+            out!("{}", tui::keymap::listing(&keymap))?;
         }
         Command::Skill { install, force } => {
             if install {
                 skill::install(force)?;
             } else {
-                skill::print();
+                skill::print()?;
             }
         }
         Command::Integration { command } => run_integration(command)?,
-        Command::Completions { shell } => print!("{}", completions::script(shell, Cli::command())),
+        Command::Completions { shell } => out!("{}", completions::script(shell, Cli::command()))?,
         Command::Ssh {
             install,
             destination,
@@ -2649,7 +2655,7 @@ fn run(cli: Cli) -> Result<()> {
                 client::ask(&socket, &Request::List, false)
             {
                 for session in sessions {
-                    println!("{}", session.name);
+                    outln!("{}", session.name)?;
                 }
             }
         }
@@ -2664,23 +2670,23 @@ fn print_config() -> Result<()> {
     let settings = config::Config::load()?;
     let path = config::path();
     if path.exists() {
-        println!("# {}", path.display());
+        outln!("# {}", path.display())?;
     } else {
-        println!("# {} (no file yet: these are the defaults)", path.display());
+        outln!("# {} (no file yet: these are the defaults)", path.display())?;
     }
-    print!("{}", settings.to_toml());
+    out!("{}", settings.to_toml())?;
     Ok(())
 }
 
 /// A table of the profiles: one a row, its description last, since it's
 /// the one with spaces.
-fn print_profiles(profiles: &[Profile]) {
+fn print_profiles(profiles: &[Profile]) -> Result<()> {
     if profiles.is_empty() {
-        println!(
+        outln!(
             "no profiles yet: add one with P in the TUI, or in {}",
             shell::home_relative(&config::path())
-        );
-        return;
+        )?;
+        return Ok(());
     }
     let rows: Vec<[String; 4]> = profiles
         .iter()
@@ -2698,7 +2704,7 @@ fn print_profiles(profiles: &[Profile]) {
             ]
         })
         .collect();
-    print_table(["NAME", "AGENT", "WHERE", "DESCRIPTION"], &rows);
+    print_table(["NAME", "AGENT", "WHERE", "DESCRIPTION"], &rows)
 }
 
 /// What the profile called `name` is: its agent, where it starts, and the
@@ -2725,19 +2731,19 @@ fn print_profile(profiles: &[Profile], name: &str) -> Result<()> {
         Launch::Task => Some("a task"),
         Launch::Background => Some("a background task, Claude Code's; others a task"),
     };
-    println!("{}", profile.name);
+    outln!("{}", profile.name)?;
     if let Some(description) = &profile.description {
-        println!("  {description}");
+        outln!("  {description}")?;
     }
-    println!("agent   {agent}");
-    println!("starts  {place}");
+    outln!("agent   {agent}")?;
+    outln!("starts  {place}")?;
     if let Some(launch) = launch {
-        println!("as      {launch}");
+        outln!("as      {launch}")?;
     }
     if profile.skip_task {
-        println!("task    none: it starts at once");
+        outln!("task    none: it starts at once")?;
     }
-    println!("runs    {}", command.join(" "));
+    outln!("runs    {}", command.join(" "))?;
     Ok(())
 }
 
@@ -2787,7 +2793,7 @@ fn attach_or_print(socket: &Path, name: &str, detached: bool) -> Result<()> {
     if in_a_terminal && !detached {
         attach::run(socket, Some(name))
     } else {
-        println!("{name}");
+        outln!("{name}")?;
         Ok(())
     }
 }
@@ -2883,7 +2889,7 @@ fn backlog(
             let name = work::start_from_backlog(socket, dir, start)?;
             // A task in the background has no terminal to attach to.
             if background {
-                println!("{name}");
+                outln!("{name}")?;
                 return Ok(());
             }
             return attach_or_print(socket, &name, detached);
@@ -2954,10 +2960,7 @@ fn flow(socket: &Path, json: bool, command: Option<FlowCommand>) -> Result<()> {
         Some(FlowCommand::Cancel { run }) => flow_cli::cancel(socket, &run),
         Some(FlowCommand::Defs { dir }) => flow_cli::defs(&here(dir)?),
         Some(FlowCommand::Wait { run, timeout }) => flow_cli::wait(socket, &run, seconds(timeout)),
-        Some(FlowCommand::Example) => {
-            flow_cli::example();
-            Ok(())
-        }
+        Some(FlowCommand::Example) => flow_cli::example(),
     }
 }
 
@@ -2968,14 +2971,16 @@ fn run_integration(command: IntegrationCommand) -> Result<()> {
     match command {
         IntegrationCommand::Install { agent } => {
             for agent in integration::chosen(agent)? {
+                // Said along the way: each agent's hooks go in whether
+                // anything reads it.
                 for line in integration::install(agent, &crystal)? {
-                    println!("{line}");
+                    let _ = outln!("{line}");
                 }
             }
         }
         IntegrationCommand::Uninstall { agent } => {
             for agent in integration::chosen(agent)? {
-                println!("{}", integration::uninstall(agent)?);
+                let _ = outln!("{}", integration::uninstall(agent)?);
             }
         }
         IntegrationCommand::Status {
@@ -2987,7 +2992,7 @@ fn run_integration(command: IntegrationCommand) -> Result<()> {
                 let outdated =
                     integration::standing_of(agent, &crystal)? == integration::Standing::OutOfDate;
                 if outdated || !outdated_only {
-                    println!("{}", integration::status(agent, &crystal)?);
+                    outln!("{}", integration::status(agent, &crystal)?)?;
                 }
             }
         }
@@ -3011,7 +3016,7 @@ fn tab(socket: &Path, command: TabCommand) -> Result<()> {
     };
     let layout = client::lay_out(socket, command)?;
     if new && let Some(tab) = layout.current() {
-        println!("{}", tab.number);
+        outln!("{}", tab.number)?;
     }
     Ok(())
 }
@@ -3036,7 +3041,7 @@ fn pane(socket: &Path, command: PaneCommand) -> Result<()> {
                     let new =
                         client::new_session_with(socket, None, cwd, Vec::new(), purpose, &env);
                     let name = new?.name;
-                    println!("{name}");
+                    outln!("{name}")?;
                     name
                 }
             };
@@ -3251,13 +3256,13 @@ fn print_sessions_json(sessions: &[SessionInfo]) -> Result<()> {
             status: session.status(),
         })
         .collect();
-    println!("{}", serde_json::to_string_pretty(&listed)?);
+    outln!("{}", serde_json::to_string_pretty(&listed)?)?;
     Ok(())
 }
 
-fn print_sessions(sessions: &[SessionInfo]) {
+fn print_sessions(sessions: &[SessionInfo]) -> Result<()> {
     if sessions.is_empty() {
-        return;
+        return Ok(());
     }
     let rows: Vec<[String; 9]> = sessions
         .iter()
@@ -3295,7 +3300,7 @@ fn print_sessions(sessions: &[SessionInfo]) {
         "COMMAND",
         "TASK",
     ];
-    print_table(header, &rows);
+    print_table(header, &rows)?;
     // Why a session couldn't start again is too long for its row, and on
     // standard error it's out of the way of a script reading the rows.
     for session in sessions {
@@ -3303,13 +3308,14 @@ fn print_sessions(sessions: &[SessionInfo]) {
             eprintln!("{} couldn't start again: {why}", session.name);
         }
     }
+    Ok(())
 }
 
 /// Prints the archived sessions, the latest archived first, with how long
 /// ago each was archived and whether it starts again where it was.
-fn print_archived(archived: &[ArchivedSession]) {
+fn print_archived(archived: &[ArchivedSession]) -> Result<()> {
     if archived.is_empty() {
-        return;
+        return Ok(());
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3341,13 +3347,13 @@ fn print_archived(archived: &[ArchivedSession]) {
     let header = [
         "NAME", "ARCHIVED", "PROJECT", "BRANCH", "RESUMES", "COMMAND",
     ];
-    print_table(header, &rows);
+    print_table(header, &rows)
 }
 
 /// Prints `rows` under `header`, each column as wide as its widest cell,
 /// and each cell on one line, with nothing a terminal would take as an
 /// order: names, branches and commands are anyone's.
-fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {
+fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) -> Result<()> {
     let header = header.map(String::from);
     let rows: Vec<[String; N]> = rows
         .iter()
@@ -3365,8 +3371,9 @@ fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {
             .zip(widths)
             .map(|(cell, width)| format!("{cell:width$}"))
             .collect();
-        println!("{}", line.join("  ").trim_end());
+        outln!("{}", line.join("  ").trim_end())?;
     }
+    Ok(())
 }
 
 /// A session's task, for `ls`: what it was asked to do while it's open,

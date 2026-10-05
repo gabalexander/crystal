@@ -16,6 +16,7 @@
 //! keeps its comments and its order, and nothing is written unless all of
 //! it, merged, still makes sense.
 
+use crate::output::{out, outln};
 use crate::{agent_rules, config, plugins, shell};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -58,7 +59,7 @@ pub fn export(to: Option<&str>) -> Result<()> {
     let bundle = Bundle::here(&config::path(), &agent_rules::dir())?;
     let json = serde_json::to_string_pretty(&bundle)? + "\n";
     let Some(to) = to.filter(|to| *to != "-") else {
-        print!("{json}");
+        out!("{json}")?;
         return Ok(());
     };
     let mut path = PathBuf::from(to);
@@ -66,7 +67,7 @@ pub fn export(to: Option<&str>) -> Result<()> {
         path.push(FILE_NAME);
     }
     std::fs::write(&path, json).with_context(|| format!("couldn't write {}", path.display()))?;
-    println!("exported the settings to {}", shell::home_relative(&path));
+    outln!("exported the settings to {}", shell::home_relative(&path))?;
     Ok(())
 }
 
@@ -79,23 +80,23 @@ pub fn import(from: &str) -> Result<()> {
     let agents_dir = agent_rules::dir();
     let merged = bundle.merge_into(&config_path, &agents_dir)?;
     if merged.is_empty() {
-        println!("nothing to change: the settings here have all of it already");
+        outln!("nothing to change: the settings here have all of it already")?;
         return Ok(());
     }
     merged.write(&config_path, &agents_dir)?;
     if !merged.changed.is_empty() {
-        println!("merged into {}:", shell::home_relative(&config_path));
+        outln!("merged into {}:", shell::home_relative(&config_path))?;
         for change in &merged.changed {
-            println!("  {change}");
+            outln!("  {change}")?;
         }
     }
     for (name, _) in &merged.agents {
-        println!("wrote {}", shell::home_relative(&agents_dir.join(name)));
+        outln!("wrote {}", shell::home_relative(&agents_dir.join(name)))?;
     }
-    println!(
+    outln!(
         "the daemon goes by them as it reads its settings; start crystal's TUI again for all of \
          them to show there"
-    );
+    )?;
     Ok(())
 }
 

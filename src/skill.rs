@@ -5,6 +5,7 @@
 //! the daemon, as it starts, brings a copy an earlier crystal put there up
 //! to date, unless the user has changed it.
 
+use crate::output::{out, outln};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -64,8 +65,8 @@ pub enum Install {
     Refuse,
 }
 
-pub fn print() {
-    print!("{SKILL}");
+pub fn print() -> Result<()> {
+    out!("{SKILL}")
 }
 
 /// Writes the skill to Claude Code's skills directory, and says where.
@@ -73,18 +74,18 @@ pub fn install(force: bool) -> Result<()> {
     let path = path()?;
     let existing = fs::read_to_string(&path).ok();
     match decide(existing.as_deref(), force, SHIPPED) {
-        Install::UpToDate => println!("the skill is already in {}", path.display()),
+        Install::UpToDate => outln!("the skill is already in {}", path.display())?,
         Install::Refuse => bail!(
             "{} has been changed; run `crystal skill --install --force` to write over it",
             path.display()
         ),
         Install::Write => {
             write(&path)?;
-            println!("installed the skill in {}", path.display());
+            outln!("installed the skill in {}", path.display())?;
         }
         Install::Update => {
             write(&path)?;
-            println!("updated the skill in {}", path.display());
+            outln!("updated the skill in {}", path.display())?;
         }
     }
     Ok(())

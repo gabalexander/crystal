@@ -10,6 +10,7 @@
 use crate::client::{self, Subscription};
 use crate::env;
 use crate::events::{Filter, Kind};
+use crate::output::{out, outln};
 use crate::printable;
 use crate::protocol::{Activity, Answer, Front, Request, Response, SessionInfo, State};
 use crate::shell;
@@ -197,10 +198,7 @@ impl Until {
 pub fn wait(socket: &Path, name: &str, timeout: Option<Duration>, quiet: bool) -> Result<()> {
     let mut watch = Watch::start(socket, name)?;
     match watch.settle(deadline(timeout))? {
-        Some(settled) => {
-            say(&settled, quiet);
-            Ok(())
-        }
+        Some(settled) => say(&settled, quiet),
         None => timed_out(name, timeout),
     }
 }
@@ -218,10 +216,7 @@ pub fn wait_until(
 ) -> Result<()> {
     let mut watch = Watch::start(socket, name)?;
     match watch.reach(until, deadline(timeout))? {
-        Some(status) => {
-            say(&status, quiet);
-            Ok(())
-        }
+        Some(status) => say(&status, quiet),
         None => {
             let seconds = timeout.unwrap_or_default().as_secs_f64();
             let words = words(until);
@@ -267,8 +262,7 @@ pub fn wait_for_output(
         Response::TimedOut { message } => return Err(TimedOut(message).into()),
         _ => bail!("the daemon didn't say what matched"),
     };
-    say(&line, quiet);
-    Ok(())
+    say(&line, quiet)
 }
 
 /// Waits for the turn that a `send` has just started: first for the agent
@@ -282,10 +276,7 @@ pub fn wait_for_turn(
     quiet: bool,
 ) -> Result<()> {
     match turn_settled(socket, name, timeout)? {
-        Some(settled) => {
-            say(&settled, quiet);
-            Ok(())
-        }
+        Some(settled) => say(&settled, quiet),
         None => timed_out(name, timeout),
     }
 }
@@ -307,7 +298,7 @@ pub fn wait_for_run(socket: &Path, name: &str, timeout: Option<Duration>) -> Res
         Ok(Response::Result(_)) if answered => "done".to_string(),
         _ => settled,
     };
-    println!("{said}");
+    outln!("{said}")?;
     Ok(())
 }
 
@@ -335,10 +326,10 @@ pub fn result(socket: &Path, name: &str, json: bool) -> Result<()> {
         bail!("the daemon didn't send the result");
     };
     if json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        outln!("{}", serde_json::to_string_pretty(&result)?)?;
     } else {
         // What Claude said: text to read, never orders for the terminal.
-        println!("{}", printable::text(result.text.trim_end()));
+        outln!("{}", printable::text(result.text.trim_end()))?;
     }
     Ok(())
 }
@@ -376,7 +367,7 @@ pub fn read(socket: &Path, name: &str, reading: Reading) -> Result<()> {
     let Response::Screen { rows } = ask(socket, &request)? else {
         bail!("the daemon didn't send the screen");
     };
-    print!("{}", screen_text(&rows, reading.lines));
+    out!("{}", screen_text(&rows, reading.lines))?;
     Ok(())
 }
 
@@ -390,13 +381,13 @@ pub fn process_info(socket: &Path, name: &str, json: bool) -> Result<()> {
         bail!("the daemon didn't say what runs there");
     };
     if json {
-        println!("{}", serde_json::to_string_pretty(&processes)?);
+        outln!("{}", serde_json::to_string_pretty(&processes)?)?;
         return Ok(());
     }
     if processes.foreground.is_empty() {
         bail!("{name}'s terminal doesn't say what's in front");
     }
-    print!("{}", process_lines(&processes.foreground));
+    out!("{}", process_lines(&processes.foreground))?;
     Ok(())
 }
 
@@ -597,10 +588,11 @@ fn timed_out(name: &str, timeout: Option<Duration>) -> Result<()> {
 }
 
 /// Prints what a wait came to, unless it's `quiet`.
-fn say(what: &str, quiet: bool) {
+fn say(what: &str, quiet: bool) -> Result<()> {
     if !quiet {
-        println!("{what}");
+        outln!("{what}")?;
     }
+    Ok(())
 }
 
 #[cfg(test)]

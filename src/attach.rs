@@ -27,6 +27,7 @@ use crate::config::Config;
 use crate::env;
 use crate::keys::{self, Typed};
 use crate::links;
+use crate::output::outln;
 use crate::plugins::{self, Context, Id};
 use crate::protocol::{Request, Response, State};
 use crate::tui::copy_mode::{CopyMode, Outcome, SearchPrompt};
@@ -102,7 +103,7 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
             screen.process(&chunk);
         }
         print_screen(&screen)?;
-        println!("{}", ending(socket, &name));
+        outln!("{}", ending(socket, &name))?;
         return Ok(());
     }
 
@@ -123,9 +124,9 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
         relay(socket, viewer, output, (rows, cols), controls)?
     };
     if detached {
-        println!("[detached from {name}]");
+        outln!("[detached from {name}]")?;
     } else {
-        println!("{}", ending(socket, &name));
+        outln!("{}", ending(socket, &name))?;
     }
     Ok(())
 }

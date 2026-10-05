@@ -9,6 +9,7 @@ use crate::env;
 use crate::events::{self, Event, Kind};
 use crate::layout;
 use crate::memory_cli::confirm;
+use crate::output::{out, outln};
 use crate::plugin_hooks;
 use crate::plugin_manifest::{self, Manifest, PaneSpec, Placement};
 use crate::plugins::{self, Context, Id, Installed};
@@ -58,7 +59,7 @@ pub fn list(socket: &Path, dir: Option<PathBuf>) -> Result<()> {
     for plugin in plugins::installed() {
         rows.push(row(&config, socket, plugin));
     }
-    crate::print_table(["NAME", "STATE", "VERSION", "DESCRIPTION"], &rows);
+    crate::print_table(["NAME", "STATE", "VERSION", "DESCRIPTION"], &rows)?;
     let dir = match dir {
         Some(dir) => dir,
         None => std::env::current_dir()?,
@@ -67,17 +68,17 @@ pub fn list(socket: &Path, dir: Option<PathBuf>) -> Result<()> {
     let shipped = plugins::of_project(&project.path);
     if !shipped.is_empty() {
         let place = shell::home_relative(&project.path.join(plugins::PROJECT_DIR));
-        println!();
-        println!("{}'s own, in {place}, each on for it alone:", project.name);
+        outln!()?;
+        outln!("{}'s own, in {place}, each on for it alone:", project.name)?;
         let rows: Vec<[String; 4]> = shipped
             .into_iter()
             .map(|plugin| row(&config, socket, plugin))
             .collect();
-        crate::print_table(["NAME", "STATE", "VERSION", "DESCRIPTION"], &rows);
+        crate::print_table(["NAME", "STATE", "VERSION", "DESCRIPTION"], &rows)?;
     }
     if plugins::enabled(&config, "notifications") && !config.notify {
-        println!();
-        println!("{}", NOTIFY_OFF);
+        outln!()?;
+        outln!("{}", NOTIFY_OFF)?;
     }
     Ok(())
 }
@@ -110,12 +111,12 @@ fn row(config: &Config, socket: &Path, plugin: Installed) -> [String; 4] {
 
 /// `crystal plugin events`: every event a plugin's hooks can hear, and
 /// when it happens.
-pub fn events() {
+pub fn events() -> Result<()> {
     let rows: Vec<[String; 2]> = Kind::ALL
         .iter()
         .map(|kind| [kind.name().to_string(), kind.about().to_string()])
         .collect();
-    crate::print_table(["EVENT", "WHEN"], &rows);
+    crate::print_table(["EVENT", "WHEN"], &rows)
 }
 
 /// What's said when the notifications plugin is on but the older `notify`
@@ -140,30 +141,30 @@ fn switch_projects(socket: &Path, id: &Id, project: &Path, on: bool, yes: bool) 
     let path = config::path();
     if !on {
         plugins::switch(&path, socket, id, false)?;
-        println!("the {label} plugin is off");
+        outln!("the {label} plugin is off")?;
         return Ok(());
     }
     // On already: switched on again, it runs again after a pause.
     if plugins::is_on(&Config::load()?, id) {
         plugins::switch(&path, socket, id, true)?;
-        println!("the {label} plugin is on");
+        outln!("the {label} plugin is on")?;
         return Ok(());
     }
     let manifest = manifest_of(&plugin)?;
     if let Some(why) = manifest.unfit() {
         bail!("{label} can't be turned on: it {why}");
     }
-    describe(manifest, &shell::home_relative(&plugin.dir));
+    describe(manifest, &shell::home_relative(&plugin.dir))?;
     let keyed = manifest.actions.iter().any(|action| action.key.is_some());
     if keyed || !manifest.link_handlers.is_empty() {
-        println!(
+        outln!(
             "Its actions' keys and its link handlers aren't used: a project's plugin has none."
-        );
-        println!();
+        )?;
+        outln!()?;
     }
     let name = crate::project::name_of(project);
     if !yes && !confirm(&format!("Turn {} on for {name}?", id.name))? {
-        println!("{label} is still off");
+        outln!("{label} is still off")?;
         return Ok(());
     }
     let config_dir = plugins::config_dir(id);
@@ -177,7 +178,7 @@ fn switch_projects(socket: &Path, id: &Id, project: &Path, on: bool, yes: bool) 
         );
     }
     plugins::switch(&path, socket, id, true)?;
-    println!("the {} plugin is on, for {name} alone", id.name);
+    outln!("the {} plugin is on, for {name} alone", id.name)?;
     Ok(())
 }
 
@@ -195,9 +196,9 @@ fn switch_own(socket: &Path, name: &str, on: bool) -> Result<()> {
         plugins::check_can_enable(plugin, &installed)?;
     }
     plugins::set_enabled(&config::path(), socket, name, on)?;
-    println!("the {name} plugin is {}", if on { "on" } else { "off" });
+    outln!("the {name} plugin is {}", if on { "on" } else { "off" })?;
     if on && name == "notifications" && !Config::load()?.notify {
-        println!("{NOTIFY_OFF}");
+        outln!("{NOTIFY_OFF}")?;
     }
     Ok(())
 }
@@ -423,7 +424,7 @@ pub fn open_pane(
         let _ = client::ask(socket, &Request::Kill { name }, false);
         return Err(err);
     }
-    println!("{name}");
+    outln!("{name}")?;
     Ok(())
 }
 
@@ -638,9 +639,9 @@ fn install_from(
         bail!("{name} wants the key {key}, which the {other} plugin has");
     }
 
-    describe(&manifest, source);
+    describe(&manifest, source)?;
     if !yes && !confirm(&format!("Install {name}?"))? {
-        println!("{name} isn't installed");
+        outln!("{name} isn't installed")?;
         return Ok(());
     }
     fs::rename(staging, &target)?;
@@ -657,11 +658,11 @@ fn install_from(
     }
     if enable {
         plugins::set_enabled(&config::path(), socket, &name, true)?;
-        println!("installed {name} in {place}, and it's on");
+        outln!("installed {name} in {place}, and it's on")?;
     } else {
-        println!(
+        outln!(
             "installed {name} in {place}; it's off until you run `crystal plugin enable {name}`"
-        );
+        )?;
     }
     Ok(())
 }
@@ -683,7 +684,7 @@ pub fn build(socket: &Path, id: &Id) -> Result<()> {
         }
         return Err(err);
     }
-    println!("built {label}");
+    outln!("built {label}")?;
     Ok(())
 }
 
@@ -703,7 +704,8 @@ fn build_and_note(socket: &Path, id: &Id, dir: &Path, manifest: &Manifest) -> Re
 fn run_build(socket: &Path, id: &Id, dir: &Path, manifest: &Manifest) -> Result<()> {
     for once in manifest.build.iter().filter(|once| once.runs_here()) {
         let words = once.command.join(" ");
-        println!("building {}: {words}", id.label());
+        // Said along the way: the build goes on whether anything reads it.
+        let _ = outln!("building {}: {words}", id.label());
         plugins::log(socket, id, &format!("build: {words}"));
         let log = plugins::open_log(socket, id)?;
         let start = log.metadata()?.len();
@@ -745,17 +747,17 @@ fn last_printed(path: &Path, start: u64) -> String {
 /// read before saying yes: each line with nothing a terminal would take as
 /// an order, so that nothing in the manifest can hide a command or draw
 /// another over it.
-fn describe(manifest: &Manifest, source: &str) {
-    let say = |line: String| println!("{}", printable::line(&line));
+fn describe(manifest: &Manifest, source: &str) -> Result<()> {
+    let say = |line: String| outln!("{}", printable::line(&line));
     say(format!(
         "{} {}, from {source}",
         manifest.name, manifest.version
-    ));
+    ))?;
     if !manifest.description.is_empty() {
-        say(manifest.description.clone());
+        say(manifest.description.clone())?;
     }
-    println!();
-    println!("It runs these commands as you, from its own directory:");
+    outln!()?;
+    outln!("It runs these commands as you, from its own directory:")?;
     let commands = manifest.commands();
     let width = commands
         .iter()
@@ -764,9 +766,9 @@ fn describe(manifest: &Manifest, source: &str) {
         .unwrap_or(0);
     for (what, words) in commands {
         let words: Vec<String> = words.iter().map(|word| shell::quote(word)).collect();
-        say(format!("  {what:width$}  {}", words.join(" ")));
+        say(format!("  {what:width$}  {}", words.join(" ")))?;
     }
-    println!();
+    outln!()
 }
 
 /// `crystal plugin remove`. The plugin's settings and what it kept stay,
@@ -778,7 +780,7 @@ pub fn remove(name: &str) -> Result<()> {
         .with_context(|| format!("couldn't remove {}", plugin.dir.display()))?;
     plugins::set_build_failed(&id, None)?;
     plugins::forget(&config::path(), name)?;
-    println!("removed {name}");
+    outln!("removed {name}")?;
     Ok(())
 }
 
@@ -801,8 +803,8 @@ pub fn new(name: &str) -> Result<()> {
     for (file, text) in files {
         fs::write(dir.join(file), text.replace("NAME", name))?;
     }
-    println!("made {name} in {}", shell::home_relative(&dir));
-    println!("turn it on with `crystal plugin enable {name}`, then press X in the TUI");
+    outln!("made {name} in {}", shell::home_relative(&dir))?;
+    outln!("turn it on with `crystal plugin enable {name}`, then press X in the TUI")?;
     Ok(())
 }
 
@@ -883,9 +885,9 @@ read -r _
 pub fn log(socket: &Path, id: &Id) -> Result<()> {
     find(id)?;
     match fs::read_to_string(plugins::log_path(socket, id)) {
-        Ok(text) => print!("{text}"),
+        Ok(text) => out!("{text}")?,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            println!("{} hasn't logged anything yet", id.label());
+            outln!("{} hasn't logged anything yet", id.label())?;
         }
         Err(err) => return Err(err.into()),
     }

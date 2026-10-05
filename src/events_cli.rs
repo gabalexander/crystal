@@ -4,11 +4,11 @@
 use crate::client;
 use crate::event_log;
 use crate::events::{self, Event, Filter, Since, now_ms};
+use crate::output::outln;
 use crate::printable;
 use crate::project;
 use crate::protocol::{Request, Response};
 use anyhow::{Result, bail};
-use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 /// What `crystal events` was asked for.
@@ -57,9 +57,7 @@ pub fn run(socket: &Path, options: Options) -> Result<()> {
                 let logged = event_log::read(socket, &filter, since.unwrap_or(Since::Seq(0)))?;
                 let last = logged.last().map_or(0, |event| event.seq);
                 for event in newest(logged, limit) {
-                    if !print(&event, json)? {
-                        return Ok(());
-                    }
+                    print(&event, json)?;
                 }
                 // Nothing logged: only new ones.
                 (last > 0).then_some(Since::Seq(last)).or(since)
@@ -67,9 +65,7 @@ pub fn run(socket: &Path, options: Options) -> Result<()> {
             None => since,
         };
         for event in client::subscribe(socket, filter, since)? {
-            if !print(&event?, json)? {
-                break;
-            }
+            print(&event?, json)?;
         }
         return Ok(());
     }
@@ -79,9 +75,7 @@ pub fn run(socket: &Path, options: Options) -> Result<()> {
         None => logged,
     };
     for event in logged {
-        if !print(&event, json)? {
-            break;
-        }
+        print(&event, json)?;
     }
     Ok(())
 }
@@ -92,19 +86,15 @@ fn newest(mut events: Vec<Event>, limit: usize) -> Vec<Event> {
     events.split_off(first)
 }
 
-/// Prints `event`, as a line or as JSON, and says whether to go on: not
-/// once whatever reads what's printed, like `head`, has had enough.
-fn print(event: &Event, json: bool) -> Result<bool> {
+/// Prints `event`, as a line or as JSON, which stops `crystal events` once
+/// whatever reads what's printed, like `head`, has had enough.
+fn print(event: &Event, json: bool) -> Result<()> {
     let text = if json {
         serde_json::to_string(event)?
     } else {
         line(event, now_ms())
     };
-    match writeln!(std::io::stdout(), "{text}") {
-        Ok(()) => Ok(true),
-        Err(err) if err.kind() == ErrorKind::BrokenPipe => Ok(false),
-        Err(err) => Err(err.into()),
-    }
+    outln!("{text}")
 }
 
 /// What `-n name` looks for: the id of the session called `name` now, so
