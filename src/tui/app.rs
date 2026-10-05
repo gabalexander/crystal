@@ -549,6 +549,11 @@ pub enum Action {
         to: Slot,
         text: String,
     },
+    /// Pasted text for a box whose text goes to an agent, the reply box or
+    /// the new-session panel's task: any file dropped in it that would go
+    /// away is copied first (`dropped_files`), then it's handed back with
+    /// [`App::paste_staged`].
+    PasteForAgent(String),
     /// Ask Codex, off the event loop, which models it lets the user choose.
     ReadCodexModels,
     /// Show a page further back into the history of the pane at this slot.
@@ -6569,7 +6574,9 @@ impl App {
 
     /// Pasted text: into whichever text box has the keyboard, or else to
     /// the session in the pane that has it. Anywhere else, like the
-    /// sidebar, where letters are commands, a paste does nothing.
+    /// sidebar, where letters are commands, a paste does nothing. A paste
+    /// for the reply box or the new-session panel's task goes by the event
+    /// loop first, which copies a file dropped there that would go away.
     pub fn on_paste(&mut self, text: String) -> Option<Action> {
         if self.plugin_pane.is_some() {
             return Some(Action::PasteInPluginPane(text));
@@ -6601,11 +6608,14 @@ impl App {
         if self.view.is_some() || self.showing_keys() || self.confirm.is_some() {
             return None;
         }
-        if let Some(reply) = &mut self.reply {
-            reply.on_paste(&text);
+        if let Some(reply) = &self.reply {
+            return (!reply.sending).then_some(Action::PasteForAgent(text));
         } else if let Some(list) = &mut self.command_list {
             list.on_paste(&text);
         } else if let Some(launcher) = &mut self.launcher {
+            if launcher.focus() == launcher::Field::Task {
+                return Some(Action::PasteForAgent(text));
+            }
             launcher.on_paste(&text);
         } else if let Some(view) = &mut self.profiles_view {
             view.on_paste(&text);
@@ -6634,6 +6644,16 @@ impl App {
             return Some(Action::CopyPaste { slot, text });
         }
         None
+    }
+
+    /// A paste [`Action::PasteForAgent`] asked to have staged, staged: into
+    /// the reply box, or the new-session panel's task.
+    pub fn paste_staged(&mut self, text: &str) {
+        if let Some(reply) = &mut self.reply {
+            reply.on_paste(text);
+        } else if let Some(launcher) = &mut self.launcher {
+            launcher.on_paste(text);
+        }
     }
 
     fn ask(&mut self, question: Question, answer: &str) {
@@ -8652,7 +8672,14 @@ mod tests {
     fn a_paste_goes_to_the_panel_or_else_to_the_pane_typed_into() {
         let mut app = with_agents(&["claude"], vec![session("a")]);
         press(&mut app, KeyCode::Char('n'));
-        assert_eq!(app.on_paste("one\ntwo".into()), None);
+        // The task goes to an agent: the event loop copies a file dropped
+        // in it that would go away, and hands it back.
+        assert_eq!(
+            app.on_paste("one\ntwo".into()),
+            Some(Action::PasteForAgent("one\ntwo".into()))
+        );
+        assert_eq!(app.launcher().unwrap().task().text(), "");
+        app.paste_staged("one\ntwo");
         assert_eq!(app.launcher().unwrap().task().text(), "one\ntwo");
         press(&mut app, KeyCode::Esc);
 
@@ -13682,8 +13709,31 @@ gate = true
                 .label
                 .starts_with("its agent's next prompt")
         );
-        assert_eq!(app.on_paste("line one\nline two".into()), None);
+        assert_eq!(
+            app.on_paste("line one\nline two".into()),
+            Some(Action::PasteForAgent("line one\nline two".into()))
+        );
+        app.paste_staged("line one\nline two");
         assert_eq!(app.reply().unwrap().text.text(), "line one\nline two");
+
+        // On its way to the session, the box takes nothing more.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.reply().unwrap().sending);
+        assert_eq!(app.on_paste("more".into()), None);
+    }
+
+    #[test]
+    fn a_paste_into_the_branch_goes_straight_in_as_it_reaches_no_agent() {
+        let mut app = with_agents(&["claude"], vec![session("a")]);
+        press(&mut app, KeyCode::Char('w'));
+        // Back round from the task to the branch, the panel's last field.
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.launcher().unwrap().focus(), launcher::Field::Branch);
+        let before = app.launcher().unwrap().branch_name();
+
+        assert_eq!(app.on_paste("-x".into()), None);
+
+        assert_eq!(app.launcher().unwrap().branch_name(), format!("{before}-x"));
     }
 
     fn labels(app: &App) -> Vec<&'static str> {

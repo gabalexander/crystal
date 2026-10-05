@@ -1408,6 +1408,48 @@ fn a_task_pasted_whole_keeps_its_lines() {
 }
 
 #[test]
+fn a_screenshot_dropped_on_the_task_reaches_the_agent_as_a_copy_that_stays() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    // A macOS screenshot behind its floating thumbnail, which macOS deletes
+    // soon after the drop, a U+202F before `PM` in its name.
+    let thumbnails = crystal
+        .dir
+        .path()
+        .join("T/TemporaryItems/NSIRD_screencaptureui_LySI4r");
+    std::fs::create_dir_all(&thumbnails).unwrap();
+    let shot = thumbnails.join("Screenshot 2026-09-21 at 11.13.58\u{202f}PM.png");
+    std::fs::write(&shot, b"\x89PNG pixels").unwrap();
+    // Kept beside the daemon's state, a socket given by its path's beside it.
+    let copy = crystal
+        .dir
+        .path()
+        .join("crystal.attachments/Screenshot-2026-09-21-at-11.13.58-PM.png");
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    eventually("the TUI asks for pastes marked", || tui.marks_pastes());
+
+    tui.type_keys("n");
+    tui.shows("What should it do?");
+    tui.type_keys("look at ");
+    // Dropped the way Ghostty pastes it: the path escaped for a shell.
+    let dropped = shot.to_string_lossy().replace(' ', "\\ ");
+    tui.type_keys(&format!("\x1b[200~{dropped}\x1b[201~"));
+    eventually("the screenshot is copied as it's dropped", || {
+        copy.is_file()
+    });
+    std::fs::remove_file(&shot).unwrap();
+    tui.type_keys("\r");
+    tui.shows("▸ claude");
+
+    let args = written(&crystal.dir.path().join("args"));
+    let task = args.lines().last().unwrap();
+    assert!(task.starts_with("look at "), "{args:?}");
+    assert!(task.contains(&*copy.to_string_lossy()), "{args:?}");
+    assert_eq!(std::fs::read(&copy).unwrap(), b"\x89PNG pixels");
+}
+
+#[test]
 fn codex_starts_with_the_model_chosen_and_the_task() {
     let crystal = Crystal::new();
     let bin = fake_codex(crystal.dir.path());

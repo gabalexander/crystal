@@ -19,6 +19,7 @@ pub(crate) mod copy_mode;
 mod diff;
 mod diff_tree;
 mod diff_view;
+mod dropped_files;
 mod editing;
 mod finder;
 mod fuzzy;
@@ -514,7 +515,11 @@ pub fn run(socket: &Path) -> Result<()> {
         fetched_remotes: HashMap::new(),
         fetching_remotes: HashSet::new(),
         warming: warm::Warming::default(),
+        drops: dropped_files::Drops::new(crate::state::attachments_dir(socket)),
     };
+    // The copies a week old go even if nothing is dropped again.
+    let drops = tui.drops.clone();
+    std::thread::spawn(move || drops.prune());
     tui.app.set_agents(catalog::installed());
     let server = socket::server_of(socket).filter(|server| server != socket::DEFAULT);
     tui.app.set_server(server);
@@ -787,6 +792,9 @@ struct Tui {
     /// Asking the daemon to keep an agent warm where the selection is,
     /// while `[sessions] warm_agent` is on.
     warming: warm::Warming,
+    /// Where a file dropped on a task or a reply that would go away is
+    /// copied before its agent reads it.
+    drops: dropped_files::Drops,
 }
 
 impl Tui {
@@ -2053,6 +2061,19 @@ impl Tui {
                 if let Some(pane) = self.pane_in(to) {
                     pane.send_keys(&pasted(&text, pane.wants_paste_marked()));
                 }
+            }
+            Action::PasteForAgent(text) => {
+                let text = match self.drops.stage(&text) {
+                    Some(staged) => {
+                        if let Some((name, why)) = staged.failed.first() {
+                            self.app
+                                .notify(format!("couldn't keep a copy of {name}: {why}"));
+                        }
+                        staged.text
+                    }
+                    None => text,
+                };
+                self.app.paste_staged(&text);
             }
             Action::ReadCodexModels => {
                 self.read_in_background(|| Event::CodexModels(read_codex_models()));
