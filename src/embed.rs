@@ -446,6 +446,8 @@ pub fn let_go_unless(settings: &MemorySettings) {
 
 /// How the models stand, as the settings view shows them.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "EmbeddingStatus"))]
 pub struct Status {
     /// How much of the models is on disk, in bytes, downloaded or on its
     /// way, and how much they are in all.

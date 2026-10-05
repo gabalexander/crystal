@@ -3,7 +3,9 @@
 //! answered without first finding the session it's in. A background task
 //! asking for a permission is answered where it stands with `y`, `n` or
 //! `Y`, a flow run at its gate with `g` (go on) or `f` (send it back), the
-//! same keys as on the session's own row; Enter goes to the session.
+//! same keys as on the session's own row, and a session that couldn't start
+//! again after a restart is started with `r` once that's put right; Enter
+//! goes to the session.
 //!
 //! The rows come from what the TUI already has, the sessions and the flow
 //! runs, so the view never waits: the app reads them again with each fresh
@@ -39,6 +41,9 @@ pub enum Tier {
     Task,
     /// An agent asks the user something, like whether to run a command.
     Question,
+    /// A session couldn't start again after a restart, its directory gone
+    /// say: nothing runs there until the user puts that right, or kills it.
+    Restart,
     /// An agent finished a turn nobody has looked at.
     Done,
 }
@@ -83,7 +88,8 @@ pub struct Row {
 /// Everything waiting on the user, the most urgent first, and in a tier,
 /// whatever has waited longest. A thing is one row, in its most urgent
 /// tier: a task asking for a permission isn't listed again as waiting, and
-/// a gate's step isn't listed again as done. Only running sessions count.
+/// a gate's step isn't listed again as done. Only running sessions count,
+/// and those that couldn't start again after a restart.
 pub fn rows(sessions: &[SessionInfo], runs: &[FlowRun]) -> Vec<Row> {
     let running: Vec<&SessionInfo> = sessions
         .iter()
@@ -142,6 +148,12 @@ pub fn rows(sessions: &[SessionInfo], runs: &[FlowRun]) -> Vec<Row> {
         let detail = goal.or(said.map(String::from)).unwrap_or_else(command);
         rows.push(session_row(session, tier, what.to_string(), detail));
     }
+    for session in sessions {
+        if let State::Failed { why } = &session.state {
+            let what = "couldn't start again".to_string();
+            rows.push(session_row(session, Tier::Restart, what, why.clone()));
+        }
+    }
     rows.sort_by(|a, b| {
         (a.tier, a.since)
             .cmp(&(b.tier, b.since))
@@ -191,6 +203,9 @@ pub enum Step {
     GoOn(String),
     /// Send the flow run with this name back from its gate, with notes.
     SendBack(String),
+    /// Start the session with this name again, which couldn't start after
+    /// a restart.
+    StartAgain(String),
     /// Say why the key did nothing.
     Say(String),
 }
@@ -223,8 +238,8 @@ impl NeedsYouView {
     }
 
     /// `j`/`k` and the arrows move; Enter goes to the row's session; `y`,
-    /// `n` and `Y` answer a permission, `g` and `f` a gate; Esc or `q`
-    /// closes.
+    /// `n` and `Y` answer a permission, `g` and `f` a gate, and `r` starts
+    /// again a session that couldn't start; Esc or `q` closes.
     pub fn on_key(&mut self, key: &KeyEvent) -> Step {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -257,6 +272,10 @@ impl NeedsYouView {
             (KeyCode::Char('g' | 'f'), _) => {
                 Step::Say(format!("{} isn't waiting at a gate", row.name))
             }
+            (KeyCode::Char('r'), _) if !ctrl => match (row.tier, &row.session) {
+                (Tier::Restart, Some(name)) => Step::StartAgain(name.clone()),
+                _ => Step::Say(format!("{} has started already", row.name)),
+            },
             _ => Step::Stay,
         }
     }
@@ -293,6 +312,11 @@ pub fn hints(view: &NeedsYouView) -> &'static [(&'static str, &'static str)] {
         Some(Tier::Gate) => &[
             ("g", "go on"),
             ("f", "send back"),
+            ("enter", "go to it"),
+            ("esc", "close"),
+        ],
+        Some(Tier::Restart) => &[
+            ("r", "start again"),
             ("enter", "go to it"),
             ("esc", "close"),
         ],
@@ -345,6 +369,7 @@ fn mark(tier: Tier, theme: &Theme) -> (&'static str, Color) {
     match tier {
         Tier::Permission => ("⚠", theme.waiting),
         Tier::Gate | Tier::Task | Tier::Question => (Status::Waiting.mark(0), theme.waiting),
+        Tier::Restart => (Status::Failed.mark(0), theme.failed),
         Tier::Done => (Status::Done.mark(0), theme.done),
     }
 }
@@ -381,6 +406,7 @@ fn reading_lines<'a>(row: &Row, theme: &Theme) -> Vec<Line<'a>> {
         Tier::Gate => format!("{} waits at its gate", row.name),
         Tier::Task => format!("{}'s task waits on you", row.name),
         Tier::Question => format!("{} is asking you something", row.name),
+        Tier::Restart => format!("{} couldn't start again after the restart", row.name),
         Tier::Done => format!("{} finished its turn", row.name),
     };
     let mut lines = vec![Line::styled(
@@ -396,6 +422,7 @@ fn reading_lines<'a>(row: &Row, theme: &Theme) -> Vec<Line<'a>> {
     let answer = match row.tier {
         Tier::Permission => "y allows it, n denies it, Y allows calls like it from now on",
         Tier::Gate => "g goes on to the next step; f sends the run back, with notes",
+        Tier::Restart => "once that's put right, r starts it again; enter goes to it",
         _ => "enter goes to it",
     };
     lines.push(Line::default());
@@ -568,6 +595,47 @@ mod tests {
         assert_eq!(rows[0].what, "Which database, staging or prod?");
         assert_eq!(rows[0].detail, "Which database, staging or prod?");
         assert_eq!(rows[1].what, "asking you something");
+    }
+
+    #[test]
+    fn a_session_that_couldn_t_start_again_after_a_restart_is_listed_saying_why() {
+        let why = "its directory, ~/code/gone, isn't there".to_string();
+        let lost = SessionInfo {
+            state: State::Failed { why: why.clone() },
+            pid: None,
+            ..session("lost", None, 5)
+        };
+        let sessions = vec![
+            session("finished", Some(Activity::Done), 1),
+            lost,
+            session("asks", Some(Activity::Waiting), 9),
+        ];
+        let rows = rows(&sessions, &[]);
+        assert_eq!(names(&rows), ["asks", "lost", "finished"]);
+        assert_eq!(rows[1].tier, Tier::Restart);
+        assert_eq!(rows[1].what, "couldn't start again");
+        assert_eq!(rows[1].detail, why);
+        assert_eq!(blocking(&rows), 2);
+
+        // `r` starts it again; it's no permission, and no gate.
+        let mut view = NeedsYouView::new(rows);
+        press(&mut view, KeyCode::Down);
+        assert_eq!(hints(&view)[0], ("r", "start again"));
+        assert_eq!(
+            press(&mut view, KeyCode::Char('r')),
+            Step::StartAgain("lost".into())
+        );
+        assert_eq!(
+            press(&mut view, KeyCode::Char('y')),
+            Step::Say("lost isn't asking for a permission".into())
+        );
+        assert_eq!(press(&mut view, KeyCode::Enter), Step::Go("lost".into()));
+        // Nor is `r` for a session that runs.
+        press(&mut view, KeyCode::Up);
+        assert_eq!(
+            press(&mut view, KeyCode::Char('r')),
+            Step::Say("asks has started already".into())
+        );
     }
 
     #[test]

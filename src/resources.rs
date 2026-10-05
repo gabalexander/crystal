@@ -14,6 +14,8 @@ use std::collections::{HashMap, HashSet};
 
 /// What a process, and with a session's, every process under it, takes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "ProcessUsage"))]
 pub struct Usage {
     pub pid: u32,
     /// Resident memory, in bytes.
@@ -24,6 +26,7 @@ pub struct Usage {
 
 /// What a session's processes take.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SessionUsage {
     pub name: String,
     pub usage: Usage,
@@ -31,6 +34,7 @@ pub struct SessionUsage {
 
 /// One look at what crystal takes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Resources {
     /// The daemon's own process, without its sessions'.
     pub daemon: Usage,

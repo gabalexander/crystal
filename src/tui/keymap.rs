@@ -61,6 +61,8 @@ pub enum Command {
     Search,
     Commands,
     Keys,
+    Guide,
+    ReleaseNotes,
     ToggleSplit,
     SplitRight,
     SplitDown,
@@ -195,7 +197,7 @@ pub const COMMANDS: &[Spec] = &[
     spec(
         Command::Search,
         "search",
-        "find a session, project, flow run or pull request",
+        "find a session, project, flow run, pull request, issue or backlog item",
         &["/"],
     ),
     spec(
@@ -579,6 +581,18 @@ pub const COMMANDS: &[Spec] = &[
         &["#"],
     ),
     spec(Command::Keys, "keys", "every key", &["?"]),
+    spec(
+        Command::Guide,
+        "guide",
+        "the guide: what to start, the keys that matter most, what agents call",
+        &[],
+    ),
+    spec(
+        Command::ReleaseNotes,
+        "release-notes",
+        "what's new in this crystal: its release notes",
+        &[],
+    ),
     spec(
         Command::Quit,
         "quit",
@@ -1285,6 +1299,7 @@ pub enum SplitWay {
 
 /// A popup's width or height: so many cells, or a share of the screen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(untagged, expecting = "a number of cells, or a share like \"80%\"")]
 pub enum Extent {
     Cells(u16),
@@ -2232,7 +2247,11 @@ pub const HELP: &[HelpRow] = &[
         &[C::Plugins, C::Settings, C::Ram],
         "plugins / settings / RAM",
     ),
-    row("?/q", &[C::Keys, C::Quit], "keys / quit"),
+    row(
+        "?/q",
+        &[C::Keys, C::Guide, C::ReleaseNotes, C::Quit],
+        "keys / quit",
+    ),
 ];
 
 /// Resize mode's keys in the `?` overlay.

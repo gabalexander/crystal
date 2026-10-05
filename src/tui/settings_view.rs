@@ -11,20 +11,29 @@
 //! A key pressed for a command goes through the checks the config file's
 //! keys do ([`keymap::rebind`]): one another command has is taken from it
 //! only once the user says so, and one the hand-back key or a key of the
-//! user's own has, never.
+//! user's own has, never. One an installed plugin's action takes asks
+//! first too, as the command would have it before the action. `/` filters
+//! the keys' tab by a command's name, what it does or its keys.
 //!
-//! The view is state and logic only, apart from [`draw`] at the end.
+//! The mouse picks a tab, or a row, a click on the row the bar is on being
+//! Enter on it, and the wheel moves the bar.
+//!
+//! The view is state and logic only, apart from [`draw`] and [`hit`] at
+//! the end.
 
+use super::app::PluginKey;
 use super::appearance::Appearance;
 use super::keymap::{self, Binding, Chord, KeyId, Keymap, Mode, Rebinding};
+use super::search::letters_in;
 use super::text_input::TextInput;
 use super::theme::{self, Theme};
 use crate::config::{
-    self, BarPosition, Config, Fold, NewCwd, SessionSettings, ShellMode, TaskSettings, ThemeName,
+    self, BarPosition, Config, EmptiedWorktree, Fold, NewCwd, SessionSettings, ShellMode,
+    TaskSettings, ThemeName,
 };
 use crate::embed::Status;
 use crate::integration::{self, Standing};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -81,8 +90,10 @@ pub enum Setting {
     ShellMode,
     NewCwd,
     Scrollback,
+    RestoreScreens,
     WorktreeBase,
     WorktreeDirectory,
+    RemoveEmptied,
     MouseCapture,
     CopyOnSelect,
     ScrollLines,
@@ -136,8 +147,10 @@ impl Setting {
             Setting::ShellMode => &["terminal", "shell_mode"],
             Setting::NewCwd => &["terminal", "new_cwd"],
             Setting::Scrollback => &["scrollback_lines"],
+            Setting::RestoreScreens => &["sessions", "restore_screens"],
             Setting::WorktreeBase => &["worktrees", "base"],
             Setting::WorktreeDirectory => &["worktrees", "directory"],
+            Setting::RemoveEmptied => &["worktrees", "remove_emptied"],
             Setting::MouseCapture => &["mouse", "capture"],
             Setting::CopyOnSelect => &["mouse", "copy_on_select"],
             Setting::ScrollLines => &["mouse", "scroll_lines"],
@@ -191,8 +204,10 @@ impl Setting {
             Setting::ShellMode => "  login shell",
             Setting::NewCwd => "new terminals in",
             Setting::Scrollback => "scrollback",
+            Setting::RestoreScreens => "restore screens",
             Setting::WorktreeBase => "base branch",
             Setting::WorktreeDirectory => "directory",
+            Setting::RemoveEmptied => "remove once emptied",
             Setting::MouseCapture => "take the mouse",
             Setting::CopyOnSelect => "copy on select",
             Setting::ScrollLines => "wheel scrolls",
@@ -202,7 +217,7 @@ impl Setting {
             Setting::TaskPermissions => "permission mode",
             Setting::TaskBudget => "a run's budget",
             Setting::DailyBudget => "a day's budget",
-            Setting::Distill => "distill closed tasks",
+            Setting::Distill => "distill finished work",
             Setting::DistillModel => "  model",
             Setting::DistillBudget => "  budget",
             Setting::Embeddings => "search by meaning",
@@ -483,9 +498,18 @@ const TABS: [Tab; 8] = [
             ),
             (
                 "Terminals",
-                &[S::Shell, S::ShellMode, S::NewCwd, S::Scrollback],
+                &[
+                    S::Shell,
+                    S::ShellMode,
+                    S::NewCwd,
+                    S::Scrollback,
+                    S::RestoreScreens,
+                ],
             ),
-            ("Worktrees", &[S::WorktreeBase, S::WorktreeDirectory]),
+            (
+                "Worktrees",
+                &[S::WorktreeBase, S::WorktreeDirectory, S::RemoveEmptied],
+            ),
         ],
     },
     Tab {
@@ -590,9 +614,27 @@ enum Editing {
     /// Waiting for the key to give it, in place of its keys or, with
     /// `add`, beside them.
     Capture { add: bool },
-    /// A key pressed that something else has, waiting for Enter to take
-    /// it, or any other key to leave it.
-    Taking { chord: Chord, rebinding: Rebinding },
+    /// A key pressed that something else has, or that an installed
+    /// plugin's `action` takes, which the command would have first: waiting
+    /// for Enter to give it, or any other key to leave it.
+    Taking {
+        chord: Chord,
+        rebinding: Rebinding,
+        action: Option<String>,
+    },
+    /// The keys' tab's filter being typed.
+    Filter,
+}
+
+/// What the mouse is on in the view: see [`hit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spot {
+    /// A tab's name, by its place among [`TABS`].
+    Tab(usize),
+    /// A row, by its place among the tab's.
+    Row(usize),
+    /// Anywhere else, in the view or not.
+    Elsewhere,
 }
 
 pub struct SettingsView {
@@ -608,6 +650,12 @@ pub struct SettingsView {
     /// What the last thing asked for came to, when there's something to
     /// say, like what's next for Codex's hooks.
     note: Option<String>,
+    /// The keys' tab's filter, typed after `/`, while it narrows the rows.
+    filter: Option<TextInput>,
+    /// The keys the keys' tab lists: those the filter finds, in order.
+    keys: Vec<KeyId>,
+    /// The sidebar keys the installed plugins' actions took.
+    plugin_keys: Vec<PluginKey>,
 }
 
 impl SettingsView {
@@ -619,7 +667,16 @@ impl SettingsView {
             editing: None,
             problem: None,
             note: None,
+            filter: None,
+            keys: KeyId::all().collect(),
+            plugin_keys: Vec::new(),
         }
+    }
+
+    /// Takes the sidebar keys the installed plugins' actions took, to say
+    /// so of one pressed for a command.
+    pub fn set_plugin_keys(&mut self, keys: Vec<PluginKey>) {
+        self.plugin_keys = keys;
     }
 
     /// Says what came of the last thing asked for.
@@ -630,6 +687,8 @@ impl SettingsView {
     /// Takes the settings as they are now.
     pub fn set_current(&mut self, current: Current) {
         self.current = Some(current);
+        // A key given since may be one the filter finds now, or no longer.
+        self.refilter();
     }
 
     pub fn set_problem(&mut self, problem: String) {
@@ -663,17 +722,53 @@ impl SettingsView {
             .map_or(&[], |current| current.integrations.as_slice())
     }
 
-    /// The rows of the tab in front.
+    /// The rows of the tab in front: in the keys' tab, those the filter
+    /// finds.
     fn rows(&self) -> Vec<Row> {
-        rows(self.tab, self.hooked())
+        match self.tab {
+            KEYS_TAB => self.keys.iter().map(|&key| Row::Key(key)).collect(),
+            tab => rows(tab, self.hooked()),
+        }
     }
 
-    /// The row the bar is on: the tab's last, after an agent has gone
-    /// between two reads; none in a tab with none.
+    /// The place of the row the bar is on: the tab's last, after an agent
+    /// has gone between two reads; none in a tab with none.
+    fn at(&self) -> Option<usize> {
+        let last = self.rows().len().checked_sub(1)?;
+        Some(self.selected.min(last))
+    }
+
+    /// The row the bar is on.
     fn row(&self) -> Option<Row> {
+        Some(self.rows()[self.at()?])
+    }
+
+    /// Moves the bar `by` rows, down or up, stopping at either end.
+    fn move_bar(&mut self, by: isize) {
+        let last = self.rows().len().saturating_sub(1);
+        self.selected = self.selected.min(last).saturating_add_signed(by).min(last);
+    }
+
+    /// Lists the keys the filter finds, every key without one.
+    fn refilter(&mut self) {
+        let query = self.filter.as_ref().map_or("", |filter| filter.text());
+        let keymap = (self.config())
+            .and_then(|config| Keymap::new(&config.keys).ok())
+            .unwrap_or_default();
+        let keys = KeyId::all().filter(|&key| {
+            let chords = keymap.keys_of(key);
+            finds(query, key.id(), key.does(), &chords)
+        });
+        self.keys = keys.collect();
+    }
+
+    /// Takes the filter away, the bar staying on the key it was on.
+    fn drop_filter(&mut self) {
+        let was = self.row();
+        self.filter = None;
+        self.refilter();
         let rows = self.rows();
-        let last = rows.len().checked_sub(1)?;
-        Some(rows[self.selected.min(last)])
+        self.selected = (was.and_then(|was| rows.iter().position(|row| *row == was))).unwrap_or(0);
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
@@ -688,6 +783,7 @@ impl SettingsView {
                     _ => Outcome::Stay,
                 };
             }
+            Some(Editing::Filter) => return self.on_filter_key(key),
             None => {}
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -695,7 +791,13 @@ impl SettingsView {
         }
         let last = self.rows().len().saturating_sub(1);
         match key.code {
+            // Esc takes the keys' filter away before it closes the view.
+            KeyCode::Esc if self.filter.is_some() => self.drop_filter(),
             KeyCode::Esc | KeyCode::Char('q' | ',') => return Outcome::Close,
+            KeyCode::Char('/') if self.tab == KEYS_TAB => {
+                self.filter.get_or_insert_with(TextInput::default);
+                self.editing = Some(Editing::Filter);
+            }
             KeyCode::Tab | KeyCode::Char(']') => self.show_tab((self.tab + 1) % TABS.len()),
             KeyCode::BackTab | KeyCode::Char('[') => {
                 self.show_tab((self.tab + TABS.len() - 1) % TABS.len());
@@ -706,12 +808,10 @@ impl SettingsView {
                     self.show_tab(tab);
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => self.selected = (self.selected + 1).min(last),
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.selected = self.selected.min(last).saturating_sub(1);
-            }
-            KeyCode::PageDown => self.selected = (self.selected + PAGE).min(last),
-            KeyCode::PageUp => self.selected = self.selected.saturating_sub(PAGE),
+            KeyCode::Char('j') | KeyCode::Down => self.move_bar(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_bar(-1),
+            KeyCode::PageDown => self.move_bar(PAGE),
+            KeyCode::PageUp => self.move_bar(-PAGE),
             KeyCode::Home | KeyCode::Char('g') => self.selected = 0,
             KeyCode::End | KeyCode::Char('G') => self.selected = last,
             _ => {
@@ -729,6 +829,79 @@ impl SettingsView {
     fn show_tab(&mut self, tab: usize) {
         self.tab = tab;
         self.selected = 0;
+        if self.filter.take().is_some() {
+            self.refilter();
+        }
+    }
+
+    /// A key while the keys' filter is typed: the arrows move the bar
+    /// through what it finds, Enter keeps it and goes back to the rows, Esc
+    /// takes it away, and the rest edit it.
+    fn on_filter_key(&mut self, key: KeyEvent) -> Outcome {
+        match key.code {
+            KeyCode::Esc => {
+                self.drop_filter();
+                return Outcome::Stay;
+            }
+            KeyCode::Enter => {
+                if self
+                    .filter
+                    .as_ref()
+                    .is_some_and(|f| f.text().trim().is_empty())
+                {
+                    self.drop_filter();
+                }
+                return Outcome::Stay;
+            }
+            KeyCode::Down => self.move_bar(1),
+            KeyCode::Up => self.move_bar(-1),
+            KeyCode::PageDown => self.move_bar(PAGE),
+            KeyCode::PageUp => self.move_bar(-PAGE),
+            _ => {
+                if let Some(filter) = &mut self.filter {
+                    filter.on_key(&key);
+                }
+                self.refilter();
+                self.selected = 0;
+            }
+        }
+        self.editing = Some(Editing::Filter);
+        Outcome::Stay
+    }
+
+    /// What the mouse does over the view, on `spot`: a click on a tab shows
+    /// it, one on a row puts the bar there, or on the row the bar is on is
+    /// Enter there; the wheel moves the bar. Not while a setting is typed
+    /// in or a key is waited for, which a stray click mustn't answer.
+    pub fn on_mouse(&mut self, kind: MouseEventKind, spot: Spot) -> Outcome {
+        let typing_filter = matches!(self.editing, Some(Editing::Filter));
+        if self.editing.is_some() && !typing_filter {
+            return Outcome::Stay;
+        }
+        match kind {
+            MouseEventKind::ScrollDown => self.move_bar(1),
+            MouseEventKind::ScrollUp => self.move_bar(-1),
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.problem = None;
+                self.note = None;
+                match spot {
+                    Spot::Tab(tab) => {
+                        self.editing = None;
+                        self.show_tab(tab);
+                    }
+                    Spot::Row(row) => {
+                        self.editing = None;
+                        if self.at() == Some(row) {
+                            return self.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                        }
+                        self.selected = row;
+                    }
+                    Spot::Elsewhere => {}
+                }
+            }
+            _ => {}
+        }
+        Outcome::Stay
     }
 
     /// A key on a setting's row: a switch turns over, a choice goes to the
@@ -802,13 +975,32 @@ impl SettingsView {
         let (Some(Row::Key(id)), Some(config)) = (self.row(), self.config()) else {
             return Outcome::Stay;
         };
-        match keymap::rebind(&config.keys, id, chord, add) {
-            Ok(rebinding) if rebinding.taken_from.is_some() => {
-                self.editing = Some(Editing::Taking { chord, rebinding });
+        let rebinding = keymap::rebind(&config.keys, id, chord, add);
+        let action = self.action_with(id, chord);
+        match rebinding {
+            Ok(rebinding) if rebinding.taken_from.is_some() || action.is_some() => {
+                self.editing = Some(Editing::Taking {
+                    chord,
+                    rebinding,
+                    action,
+                });
                 Outcome::Stay
             }
             rebinding => self.keys_or_why(rebinding),
         }
+    }
+
+    /// The installed plugin's action whose key, or first of two, is
+    /// `chord`, as the view names it, when `id` given it would run in the
+    /// action's place: a command's key in the sidebar, or the prefix, which
+    /// does nothing there.
+    fn action_with(&self, id: KeyId, chord: Chord) -> Option<String> {
+        if !matches!(id, KeyId::Command(_) | KeyId::Prefix) {
+            return None;
+        }
+        let taken = (self.plugin_keys.iter())
+            .find(|taken| taken.key.is_some_and(|key| key.first() == chord))?;
+        Some(format!("the {} plugin's {:?}", taken.plugin, taken.title))
     }
 
     fn keys_or_why(&mut self, rebinding: Result<Rebinding, String>) -> Outcome {
@@ -848,10 +1040,19 @@ impl SettingsView {
         }
     }
 
-    /// Puts pasted text in the setting being typed, if one is.
+    /// Puts pasted text in the setting being typed, or the keys' filter,
+    /// if one is.
     pub fn on_paste(&mut self, text: &str) {
-        if let Some(Editing::Text(input)) = &mut self.editing {
-            input.insert_str(text);
+        match &mut self.editing {
+            Some(Editing::Text(input)) => input.insert_str(text),
+            Some(Editing::Filter) => {
+                if let Some(filter) = &mut self.filter {
+                    filter.insert_str(text);
+                }
+                self.refilter();
+                self.selected = 0;
+            }
+            _ => {}
         }
     }
 
@@ -952,6 +1153,11 @@ impl SettingsView {
                 let lines = next_of(&SCROLLBACK, config.scrollback_lines, forward);
                 number(i64::try_from(lines).unwrap_or(i64::MAX))
             }
+            S::RestoreScreens => on(!config.sessions.restore_screens),
+            S::RemoveEmptied => {
+                let now = config.worktrees.remove_emptied.name();
+                Change::set(setting, next_named(&EmptiedWorktree::CHOICES, now, forward))
+            }
             S::MouseCapture => on(!config.mouse.capture),
             S::CopyOnSelect => on(!config.mouse.copy_on_select),
             S::ScrollLines => {
@@ -1005,7 +1211,7 @@ impl Default for SettingsView {
 }
 
 /// How far PgUp and PgDn move the bar.
-const PAGE: usize = 10;
+const PAGE: isize = 10;
 
 /// The theme for one side of the appearance after `now`, or before it,
 /// going round from the one the theme gives that side, which takes the
@@ -1048,6 +1254,18 @@ fn typed_text(setting: Setting, config: &Config) -> String {
     }
 }
 
+/// Whether `query` finds a key, or a key of the user's own, by its `name`,
+/// what it `does` or its `chords`: each word of it the name's letters, in
+/// order, or in what it does, or one of the keys as the view or the file
+/// writes it. Nothing typed finds every one.
+fn finds(query: &str, name: &str, does: &str, chords: &[Chord]) -> bool {
+    query.split_whitespace().all(|word| {
+        letters_in(word, name).is_some()
+            || does.to_lowercase().contains(&word.to_lowercase())
+            || (chords.iter()).any(|chord| chord.label() == word || chord.config() == word)
+    })
+}
+
 /// The keys while the view is open, for what the bar is on and what it's
 /// in the middle of.
 pub fn hints(view: &SettingsView) -> &'static [(&'static str, &'static str)] {
@@ -1055,7 +1273,9 @@ pub fn hints(view: &SettingsView) -> &'static [(&'static str, &'static str)] {
         Some(Editing::Text(_)) => &[("enter", "save"), ("esc", "leave it")],
         Some(Editing::Capture { .. }) => &[("a key", "give it"), ("esc", "leave it")],
         Some(Editing::Taking { .. }) => &[("enter", "take it"), ("esc", "leave it")],
+        Some(Editing::Filter) => &[("enter", "keep it"), ("↑/↓", "move"), ("esc", "show all")],
         None => match view.row() {
+            None if view.filter.is_some() => &[("/", "filter"), ("esc", "show all")],
             None => &[("tab", "next tab"), ("esc", "close")],
             Some(Row::Hooks(_)) => &[
                 ("space", "put in, update or take out"),
@@ -1063,12 +1283,21 @@ pub fn hints(view: &SettingsView) -> &'static [(&'static str, &'static str)] {
                 ("j/k", "move"),
                 ("esc", "close"),
             ],
+            Some(Row::Key(_)) if view.filter.is_some() => &[
+                ("enter", "press its key"),
+                ("a", "add one"),
+                ("x", "none"),
+                ("del", "default"),
+                ("/", "filter"),
+                ("esc", "show all"),
+            ],
+            // Without `tab`, which the other tabs say, to fit 80 columns.
             Some(Row::Key(_)) => &[
                 ("enter", "press its key"),
                 ("a", "add one"),
                 ("x", "none"),
                 ("del", "default"),
-                ("tab", "next tab"),
+                ("/", "filter"),
                 ("esc", "close"),
             ],
             Some(Row::Setting(Setting::Embeddings)) => &[
@@ -1135,23 +1364,80 @@ fn model_says(status: Option<&Status>, on: bool) -> (String, Option<bool>) {
 /// How wide the mark and the name are, before a row's value.
 const NAME_WIDTH: usize = 24;
 
-/// Draws the view over the middle of `area`, the rest dimmed behind it:
-/// the file and the tabs at its top, what's said of the last thing asked
-/// at its bottom, and the tab's rows between, scrolled to keep the bar in
-/// sight.
-pub fn draw(frame: &mut Frame, view: &SettingsView, theme: &Theme, area: Rect) {
-    frame
-        .buffer_mut()
-        .set_style(area, Style::new().add_modifier(Modifier::DIM));
+/// The lines of a tab's rows and what's around them, with the place of
+/// the row each line is among the tab's, if it's one: what a click on it
+/// picks.
+#[derive(Default)]
+struct Body {
+    lines: Vec<Line<'static>>,
+    rows: Vec<Option<usize>>,
+}
+
+impl Body {
+    /// A line that's no row: a heading, a blank or what's said.
+    fn say(&mut self, line: Line<'static>) {
+        self.lines.push(line);
+        self.rows.push(None);
+    }
+
+    /// The line of the tab's row at `row`.
+    fn row(&mut self, row: usize, line: Line<'static>) {
+        self.lines.push(line);
+        self.rows.push(Some(row));
+    }
+}
+
+/// Where [`draw`] puts the view, and what goes there.
+struct Laid {
+    panel: Rect,
+    head: Vec<Line<'static>>,
+    head_area: Rect,
+    body: Body,
+    body_area: Rect,
+    /// How many of the body's lines are scrolled off its top.
+    scroll: usize,
+    /// The body's line the bar is on.
+    selected: Option<usize>,
+    foot: Vec<Line<'static>>,
+    foot_area: Rect,
+}
+
+/// The head's line of tabs, and the one the keys' filter is on.
+const TABS_LINE: u16 = 1;
+const FILTER_LINE: u16 = 2;
+
+/// What's between two tabs' names.
+const TAB_GAP: &str = "  ";
+
+/// The view's frame, and whether it's drawn: in a theme with no panel
+/// color, a border sets the view apart.
+fn frame_of(theme: &Theme) -> (Block<'static>, bool) {
+    let framed = theme.panel == Color::Reset;
+    let block = if framed {
+        Block::bordered().border_style(Style::new().fg(theme.rule))
+    } else {
+        Block::new()
+    };
+    (
+        block.style(Style::new().bg(theme.panel).fg(theme.text)),
+        framed,
+    )
+}
+
+/// Lays the view out over the middle of `area`: the file and the tabs at
+/// its top, what's said of the last thing asked at its bottom, and the
+/// tab's rows between, scrolled to keep the bar in sight.
+fn lay_out(view: &SettingsView, theme: &Theme, area: Rect) -> Laid {
     let width = area.width.saturating_sub(4).clamp(40.min(area.width), 110);
     let head = head(view, theme);
     let body = body(view, theme);
     // Inside its frame and margins, or its margins alone.
     let foot = foot(view, theme, usize::from(width.saturating_sub(4)));
-    // The row the bar is on is the one drawn as the selection.
-    let selected = body.iter().position(|line| line.style == theme.selection);
-    let tall = head.len() + body.len() + foot.len() + 2;
-    let height = (tall as u16).min(area.height);
+    let selected = view
+        .at()
+        .and_then(|at| body.rows.iter().position(|row| *row == Some(at)));
+    let tall = head.len() + body.lines.len() + foot.len() + 2;
+    let height = u16::try_from(tall).unwrap_or(u16::MAX).min(area.height);
     let top = if area.height > height { 1 } else { 0 };
     let panel = Rect::new(
         area.x + (area.width - width) / 2,
@@ -1159,45 +1445,104 @@ pub fn draw(frame: &mut Frame, view: &SettingsView, theme: &Theme, area: Rect) {
         width,
         height,
     );
-    frame.render_widget(Clear, panel);
-    let framed = theme.panel == Color::Reset;
-    let block = if framed {
-        Block::bordered().border_style(Style::new().fg(theme.rule))
-    } else {
-        Block::new()
-    };
-    let block = block.style(Style::new().bg(theme.panel).fg(theme.text));
+    let (block, framed) = frame_of(theme);
     let inside = block
         .inner(panel)
         .inner(Margin::new(if framed { 1 } else { 2 }, 1));
-    frame.render_widget(block, panel);
     let head_height = (head.len() as u16).min(inside.height);
     let foot_height = (foot.len() as u16).min(inside.height - head_height);
     let room = inside.height - head_height - foot_height;
     let at = |y: u16, height: u16| Rect::new(inside.x, y, inside.width, height);
-    frame.render_widget(Paragraph::new(head), at(inside.y, head_height));
-    let foot_top = inside.y + inside.height - foot_height;
-    frame.render_widget(Paragraph::new(foot), at(foot_top, foot_height));
     // Taller than the room, the rows scroll to keep the one the bar is on
     // in sight, and what's said under it.
     let room_rows = usize::from(room);
     let scroll = selected
         .map_or(0, |at| (at + 3).saturating_sub(room_rows))
-        .min(body.len().saturating_sub(room_rows));
-    let body_area = at(inside.y + head_height, room);
-    let scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
-    frame.render_widget(Paragraph::new(body).scroll((scroll, 0)), body_area);
-    // The cursor, in a setting being typed.
-    if let (Some(Editing::Text(input)), Some(row)) = (&view.editing, selected) {
-        let row = u16::try_from(row).unwrap_or(u16::MAX);
-        let column = NAME_WIDTH + input.cursor();
-        let column = u16::try_from(column).unwrap_or(u16::MAX);
-        if row >= scroll && row - scroll < room && column < body_area.width {
-            let position = Position::new(body_area.x + column, body_area.y + row - scroll);
-            frame.set_cursor_position(position);
-        }
+        .min(body.lines.len().saturating_sub(room_rows));
+    Laid {
+        panel,
+        head,
+        head_area: at(inside.y, head_height),
+        body,
+        body_area: at(inside.y + head_height, room),
+        scroll,
+        selected,
+        foot,
+        foot_area: at(inside.y + inside.height - foot_height, foot_height),
     }
 }
+
+/// Draws the view over the middle of `area`, the rest dimmed behind it.
+pub fn draw(frame: &mut Frame, view: &SettingsView, theme: &Theme, area: Rect) {
+    frame
+        .buffer_mut()
+        .set_style(area, Style::new().add_modifier(Modifier::DIM));
+    let laid = lay_out(view, theme, area);
+    frame.render_widget(Clear, laid.panel);
+    frame.render_widget(frame_of(theme).0, laid.panel);
+    frame.render_widget(Paragraph::new(laid.head), laid.head_area);
+    frame.render_widget(Paragraph::new(laid.foot), laid.foot_area);
+    let scroll = u16::try_from(laid.scroll).unwrap_or(u16::MAX);
+    let body = Paragraph::new(laid.body.lines).scroll((scroll, 0));
+    frame.render_widget(body, laid.body_area);
+    // The cursor, in a setting being typed, or in the keys' filter.
+    let cursor = match &view.editing {
+        Some(Editing::Text(input)) => laid.selected.and_then(|line| {
+            let row = u16::try_from(line.checked_sub(laid.scroll)?).ok()?;
+            Some((laid.body_area, row, NAME_WIDTH + input.cursor()))
+        }),
+        Some(Editing::Filter) => (view.filter.as_ref()).map(|filter| {
+            (
+                laid.head_area,
+                FILTER_LINE,
+                FILTER_PROMPT.len() + filter.cursor(),
+            )
+        }),
+        _ => None,
+    };
+    if let Some((area, row, column)) = cursor
+        && let Ok(column) = u16::try_from(column)
+        && row < area.height
+        && column < area.width
+    {
+        frame.set_cursor_position(Position::new(area.x + column, area.y + row));
+    }
+}
+
+/// What's at `(column, row)` on the screen, with the view drawn over the
+/// middle of `area` as [`draw`] draws it: a tab's name, a row, or
+/// anything else.
+pub fn hit(view: &SettingsView, theme: &Theme, area: Rect, column: u16, row: u16) -> Spot {
+    let laid = lay_out(view, theme, area);
+    let on = Position::new(column, row);
+    if laid.head_area.contains(on) && row - laid.head_area.y == TABS_LINE {
+        let offset = usize::from(column - laid.head_area.x);
+        return tab_at(offset).map_or(Spot::Elsewhere, Spot::Tab);
+    }
+    if laid.body_area.contains(on) {
+        let line = laid.scroll + usize::from(row - laid.body_area.y);
+        if let Some(Some(at)) = laid.body.rows.get(line) {
+            return Spot::Row(*at);
+        }
+    }
+    Spot::Elsewhere
+}
+
+/// The tab whose name is `offset` columns into the line of tabs.
+fn tab_at(offset: usize) -> Option<usize> {
+    let mut start = 0;
+    for (at, tab) in TABS.iter().enumerate() {
+        let end = start + tab.name.chars().count();
+        if (start..end).contains(&offset) {
+            return Some(at);
+        }
+        start = end + TAB_GAP.len();
+    }
+    None
+}
+
+/// What the keys' filter is written after.
+const FILTER_PROMPT: &str = "/ ";
 
 /// The view's top: where the file is, and the tabs, the one in front
 /// marked.
@@ -1210,7 +1555,7 @@ fn head(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
     let mut tabs = Vec::new();
     for (at, tab) in TABS.iter().enumerate() {
         if at > 0 {
-            tabs.push(Span::styled("  ", muted));
+            tabs.push(Span::styled(TAB_GAP, muted));
         }
         let style = match at == view.tab {
             true => Style::new()
@@ -1220,13 +1565,27 @@ fn head(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
         };
         tabs.push(Span::styled(tab.name, style));
     }
-    vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("settings", bold),
             Span::styled(format!("  {path}"), muted),
         ]),
         Line::from(tabs),
-    ]
+    ];
+    // The keys' filter, and how many keys it finds.
+    if let Some(filter) = view.filter.as_ref().filter(|_| view.tab == KEYS_TAB) {
+        let found = view.keys.len();
+        let every = KeyId::all().count();
+        lines.push(Line::from(vec![
+            Span::styled(
+                FILTER_PROMPT,
+                Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(filter.text().to_string(), Style::new().fg(theme.text)),
+            Span::styled(format!("  {found} of {every}"), muted),
+        ]));
+    }
+    lines
 }
 
 /// The view's bottom: what's said of the last thing asked, or what came of
@@ -1234,9 +1593,34 @@ fn head(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
 /// wide.
 fn foot(view: &SettingsView, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let (said, color) = match (&view.editing, &view.problem) {
-        (Some(Editing::Taking { chord, rebinding }), _) => {
-            let from = rebinding.taken_from.map_or("", KeyId::id);
-            let said = format!("{chord} is {from}'s: enter takes it from it, esc leaves it");
+        (
+            Some(Editing::Taking {
+                chord,
+                rebinding,
+                action,
+            }),
+            _,
+        ) => {
+            let given = view.row().map_or("", |row| match row {
+                Row::Key(key) => key.id(),
+                _ => "",
+            });
+            let said = match (rebinding.taken_from, action) {
+                (Some(from), None) => format!(
+                    "{chord} is {}'s: enter takes it from it, esc leaves it",
+                    from.id()
+                ),
+                (Some(from), Some(action)) => format!(
+                    "{chord} is {}'s, and runs {action}, which would run from : alone: \
+                     enter takes it, esc leaves it",
+                    from.id()
+                ),
+                (None, Some(action)) => format!(
+                    "{chord} runs {action}, which would run from : alone once {given} has it: \
+                     enter gives it all the same, esc leaves it"
+                ),
+                (None, None) => String::new(),
+            };
             (said, theme.waiting)
         }
         (_, Some(problem)) => (problem.clone(), theme.failed),
@@ -1498,7 +1882,11 @@ fn shown(setting: Setting, config: &Config) -> Shown {
         ),
         S::Scrollback => choice(
             format!("{} lines", config.scrollback_lines),
-            "kept as they scroll off, from the next session on: ←/→",
+            "kept as they scroll off, by running sessions too: ←/→",
+        ),
+        S::RestoreScreens => switch(
+            config.sessions.restore_screens,
+            "after a crash or a reboot, kept in the database: it may hold secrets",
         ),
         S::WorktreeBase => choice(
             or_none(
@@ -1513,6 +1901,16 @@ fn shown(setting: Setting, config: &Config) -> Shown {
                     directory.display().to_string()
                 }),
             "where new worktrees go, from / or ~: enter",
+        ),
+        S::RemoveEmptied => choice(
+            config.worktrees.remove_emptied.name().to_string(),
+            match config.worktrees.remove_emptied {
+                EmptiedWorktree::Ask => "a linked one its last session is killed from: ←/→",
+                EmptiedWorktree::Always => {
+                    "without asking, unless archived sessions ran there: ←/→"
+                }
+                EmptiedWorktree::Never => "keep it, without asking: ←/→",
+            },
         ),
         S::MouseCapture => switch(
             config.mouse.capture,
@@ -1584,7 +1982,7 @@ fn shown(setting: Setting, config: &Config) -> Shown {
             dim: !memory_on,
             ..switch(
                 config.memory.distill,
-                "a model reads a closed task's work for what it learned",
+                "a model reads what a closed task or an archived session did",
             )
         },
         S::DistillModel => Shown {
@@ -1656,49 +2054,58 @@ fn value_span(value: &str, theme: &Theme) -> Span<'static> {
 
 /// The tab's rows, under their headings, each with what it does or how
 /// it stands.
-fn body(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
+fn body(view: &SettingsView, theme: &Theme) -> Body {
     let muted = Style::new().fg(theme.muted);
+    let mut body = Body::default();
     let Some(current) = &view.current else {
-        return vec![Line::from(""), Line::styled("reading the settings…", muted)];
+        body.say(Line::from(""));
+        body.say(Line::styled("reading the settings…", muted));
+        return body;
     };
     // The agents' own settings, whatever crystal's file says.
     if view.tab == HOOKS_TAB {
-        return hooks_lines(view, theme);
+        hooks_lines(view, theme, &mut body);
+        return body;
     }
     let config = match &current.config {
         Ok(config) => config,
         Err(why) => {
             let said = format!("the file can't be read: {why}");
-            return vec![
-                Line::from(""),
-                Line::styled(said, Style::new().fg(theme.failed)),
-            ];
+            body.say(Line::from(""));
+            body.say(Line::styled(said, Style::new().fg(theme.failed)));
+            return body;
         }
     };
     if view.tab == KEYS_TAB {
-        return key_lines(view, config, theme);
+        key_lines(view, config, theme, &mut body);
+        return body;
     }
     let bold = Style::new().add_modifier(Modifier::BOLD);
-    let mut lines = Vec::new();
+    let at = view.at();
+    let mut row = 0;
     for (heading, settings) in TABS[view.tab].sections {
-        lines.push(Line::from(""));
-        lines.push(Line::styled(*heading, bold));
+        body.say(Line::from(""));
+        body.say(Line::styled(*heading, bold));
         for &setting in *settings {
-            lines.push(setting_line(view, setting, config, theme));
+            let selected = at == Some(row);
+            body.row(row, setting_line(view, setting, config, theme, selected));
+            row += 1;
         }
-        lines.extend(after_section(view, settings, config, theme));
+        for line in after_section(view, settings, config, theme) {
+            body.say(line);
+        }
     }
-    lines
+    body
 }
 
-/// The line of `setting`'s row.
+/// The line of `setting`'s row, with the bar on it or not.
 fn setting_line(
     view: &SettingsView,
     setting: Setting,
     config: &Config,
     theme: &Theme,
+    selected: bool,
 ) -> Line<'static> {
-    let selected = view.row() == Some(Row::Setting(setting));
     let shown = shown(setting, config);
     let mark = match shown.on {
         Some(true) => ("● ", theme.done),
@@ -1783,23 +2190,22 @@ fn after_section(
 
 /// The agents' hooks' tab: each agent installed here that crystal can hook,
 /// with how its hooks stand.
-fn hooks_lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
+fn hooks_lines(view: &SettingsView, theme: &Theme, body: &mut Body) {
     let muted = Style::new().fg(theme.muted);
-    let mut lines = vec![
-        Line::from(""),
-        Line::styled(
-            "crystal's hooks in each agent's own settings, for it to say what it's doing",
-            muted,
-        ),
-        Line::from(""),
-    ];
+    body.say(Line::from(""));
+    body.say(Line::styled(
+        "crystal's hooks in each agent's own settings, for it to say what it's doing",
+        muted,
+    ));
+    body.say(Line::from(""));
     if view.hooked().is_empty() {
-        lines.push(Line::styled(
+        body.say(Line::styled(
             "none of the agents crystal can hook is installed here",
             muted,
         ));
     }
-    for &(agent, standing) in view.hooked() {
+    let at = view.at();
+    for (row, &(agent, standing)) in view.hooked().iter().enumerate() {
         let (mark, about) = match standing {
             Standing::Installed => (
                 ("● ", theme.done),
@@ -1814,24 +2220,17 @@ fn hooks_lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
                 "space puts crystal's hooks in its settings",
             ),
         };
-        let selected = view.row() == Some(Row::Hooks(agent));
         let value = value_span(standing.word(), theme);
-        let flags = (selected, false);
-        lines.push(row_line(
-            theme,
-            mark,
-            agent.name(),
-            value,
-            about.into(),
-            flags,
-        ));
+        let flags = (at == Some(row), false);
+        let line = row_line(theme, mark, agent.name(), value, about.into(), flags);
+        body.row(row, line);
     }
-    lines
 }
 
-/// The keys' tab: every key `[keys]` gives, under the heading of where it
-/// works, then the user's own, which the file changes.
-fn key_lines(view: &SettingsView, config: &Config, theme: &Theme) -> Vec<Line<'static>> {
+/// The keys' tab: every key `[keys]` gives, or those the filter finds,
+/// under the heading of where it works, then the user's own, which the
+/// file changes.
+fn key_lines(view: &SettingsView, config: &Config, theme: &Theme, body: &mut Body) {
     let muted = Style::new().fg(theme.muted);
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let keymap = Keymap::new(&config.keys).unwrap_or_default();
@@ -1848,21 +2247,27 @@ fn key_lines(view: &SettingsView, config: &Config, theme: &Theme) -> Vec<Line<'s
             false => keys.join(" "),
         }
     };
-    let mut lines = vec![
-        Line::from(""),
-        Line::styled(
-            "a key you press for a command is checked as the file's are; • the file gives it",
+    body.say(Line::from(""));
+    body.say(Line::styled(
+        "a key you press for a command is checked as the file's are; • the file gives it",
+        muted,
+    ));
+    if view.keys.is_empty() {
+        body.say(Line::from(""));
+        body.say(Line::styled(
+            "the filter finds no key's command: esc shows them all",
             muted,
-        ),
-    ];
+        ));
+    }
+    let at = view.at();
     let mut heading = "";
-    for key in KeyId::all() {
+    for (row, &key) in view.keys.iter().enumerate() {
         if key_heading(key) != heading {
             heading = key_heading(key);
-            lines.push(Line::from(""));
-            lines.push(Line::styled(heading, bold));
+            body.say(Line::from(""));
+            body.say(Line::styled(heading, bold));
         }
-        let selected = view.row() == Some(Row::Key(key));
+        let selected = at == Some(row);
         let given = config.keys.bindings.contains_key(key.id());
         let mark = match given {
             true => ("• ", theme.accent),
@@ -1892,27 +2297,24 @@ fn key_lines(view: &SettingsView, config: &Config, theme: &Theme) -> Vec<Line<'s
             true => format!("{} (its plugin is off)", key.does()),
             false => key.does().to_string(),
         };
-        lines.push(row_line(
-            theme,
-            mark,
-            key.id(),
-            value,
-            about,
-            (selected, plugin_off),
-        ));
+        let flags = (selected, plugin_off);
+        body.row(row, row_line(theme, mark, key.id(), value, about, flags));
     }
-    if !keymap.custom().is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::styled("Your own, [[keys.command]] in the file", bold));
-        for (command, chords) in keymap.custom() {
-            lines.push(Line::from(vec![
+    let query = view.filter.as_ref().map_or("", |filter| filter.text());
+    let own: Vec<_> = (keymap.custom().iter())
+        .filter(|(command, chords)| finds(query, command.label(), &command.command, chords))
+        .collect();
+    if !own.is_empty() {
+        body.say(Line::from(""));
+        body.say(Line::styled("Your own, [[keys.command]] in the file", bold));
+        for (command, chords) in own {
+            body.say(Line::from(vec![
                 Span::raw(format!("  {:<22}", command.label())),
                 value_span(&written(chords, true), theme),
                 Span::styled(command.kind.name(), muted),
             ]));
         }
     }
-    lines
 }
 
 #[cfg(test)]
@@ -1947,7 +2349,7 @@ mod tests {
         let theme = Theme::new(ThemeName::DARK, true);
         let lines = head(view, &theme)
             .into_iter()
-            .chain(body(view, &theme))
+            .chain(body(view, &theme).lines)
             .chain(foot(view, &theme, 200));
         let lines: Vec<String> = lines.map(|line| line.to_string()).collect();
         lines.join("\n")
@@ -1999,6 +2401,7 @@ mod tests {
             (S::MermaidAscii, true),
             (S::NameFromPrompt, false),
             (S::ResumeReported, false),
+            (S::RestoreScreens, true),
             (S::MouseCapture, false),
             (S::CopyOnSelect, false),
             (S::Scrollbars, false),
@@ -2096,6 +2499,12 @@ mod tests {
         );
         both(
             &mut view,
+            S::RemoveEmptied,
+            change(S::RemoveEmptied, "always"),
+            change(S::RemoveEmptied, "never"),
+        );
+        both(
+            &mut view,
             S::ScrollLines,
             number(S::ScrollLines, 5),
             number(S::ScrollLines, 2),
@@ -2182,7 +2591,7 @@ mod tests {
             }
         }
         let settings: usize = (0..KEYS_TAB).map(|tab| rows(tab, &[]).len()).sum();
-        assert_eq!(settings, 49);
+        assert_eq!(settings, 51);
     }
 
     /// Writes `change` to a config file made of `text`, and reads it back.
@@ -2216,6 +2625,8 @@ mod tests {
         assert_eq!(config.tasks.max_budget_usd, 10.0);
         let config = written("", &Change::set(S::NewCwd, "home"));
         assert_eq!(config.terminal.new_cwd, NewCwd::Home);
+        let config = written("", &Change::set(S::RemoveEmptied, "never"));
+        assert_eq!(config.worktrees.remove_emptied, EmptiedWorktree::Never);
         let config = written(
             "[appearance]\nlight_theme = \"nord\"\n",
             &Change::default(S::LightTheme),
@@ -2306,7 +2717,7 @@ mod tests {
         assert_eq!(view.row(), Some(Row::Setting(S::HideDrafts)));
         press(&mut view, KeyCode::Char('8'));
         press(&mut view, KeyCode::PageDown);
-        assert_eq!(view.row(), Some(rows(KEYS_TAB, &[])[PAGE]));
+        assert_eq!(view.row(), Some(rows(KEYS_TAB, &[])[PAGE as usize]));
         // A tab with no rows has no bar.
         press(&mut view, KeyCode::Char('7'));
         assert_eq!(view.row(), None);
@@ -2418,6 +2829,189 @@ mod tests {
                 taken_from: None,
             })
         );
+    }
+
+    #[test]
+    fn slash_filters_the_keys_and_esc_shows_them_all_again() {
+        let zoom = KeyId::Command(Command::Zoom);
+        let mut view = view_of(Config::default(), None);
+        // Only in the keys' tab.
+        press(&mut view, KeyCode::Char('/'));
+        assert!(!view.takes_keys_as_they_come());
+        press(&mut view, KeyCode::Char('8'));
+        let every = view.rows().len();
+        press(&mut view, KeyCode::Char('/'));
+        assert!(view.takes_keys_as_they_come());
+        for c in "zoom".chars() {
+            press(&mut view, KeyCode::Char(c));
+        }
+        assert_eq!(view.row(), Some(Row::Key(zoom)));
+        assert!(view.rows().len() < every);
+        assert!(!view.rows().contains(&Row::Key(KeyId::Prefix)));
+        let shown = text(&view);
+        let count = format!("/ zoom  {} of {every}", view.rows().len());
+        assert!(shown.contains(&count), "{shown}");
+        assert!(!shown.contains("From a pane"), "{shown}");
+        // Enter keeps it, and the rows' keys work again.
+        press(&mut view, KeyCode::Enter);
+        assert!(!view.takes_keys_as_they_come());
+        assert_eq!(hints(&view)[4], ("/", "filter"));
+        press(&mut view, KeyCode::Enter);
+        assert!(text(&view).contains("press a key…"));
+        press(&mut view, KeyCode::Esc);
+        // Esc shows every key, the bar staying where it was, then closes.
+        assert_eq!(press(&mut view, KeyCode::Esc), Outcome::Stay);
+        assert_eq!(view.rows().len(), every);
+        assert_eq!(view.row(), Some(Row::Key(zoom)));
+        assert!(!text(&view).contains("/ zoom"));
+        assert_eq!(press(&mut view, KeyCode::Esc), Outcome::Close);
+    }
+
+    #[test]
+    fn the_filter_finds_a_key_by_what_it_does_and_its_keys() {
+        let mut view = view_of(Config::default(), None);
+        press(&mut view, KeyCode::Char('8'));
+        press(&mut view, KeyCode::Char('/'));
+        view.on_paste("x");
+        // `x` is kill's key; the names with an x in them are found too.
+        assert!(
+            view.rows()
+                .contains(&Row::Key(KeyId::Command(Command::Kill)))
+        );
+        press(&mut view, KeyCode::Backspace);
+        view.on_paste("editor");
+        assert_eq!(
+            view.rows(),
+            [Row::Key(KeyId::Command(Command::EditHistory))]
+        );
+        view.on_paste("nothing");
+        assert_eq!(view.row(), None);
+        assert!(text(&view).contains("the filter finds no key's command"));
+        // Another tab drops it.
+        press(&mut view, KeyCode::Enter);
+        assert_eq!(hints(&view), [("/", "filter"), ("esc", "show all")]);
+        press(&mut view, KeyCode::Tab);
+        press(&mut view, KeyCode::Char('8'));
+        assert_eq!(view.rows().len(), KeyId::all().count());
+    }
+
+    /// The keys' tab of a view that knows of the notes plugin's action on
+    /// `written`, the bar on `key`.
+    fn with_a_plugins_key(written: &str, key: KeyId) -> SettingsView {
+        let mut view = on_key_row(Config::default(), key);
+        view.set_plugin_keys(vec![PluginKey {
+            key: Some(keymap::Sequence::parse(written).unwrap()),
+            plugin: "notes".into(),
+            action: "add".into(),
+            title: "add a note".into(),
+        }]);
+        view
+    }
+
+    #[test]
+    fn a_key_a_plugins_action_takes_is_given_a_command_only_once_the_user_says() {
+        let new_session = KeyId::Command(Command::NewSession);
+        let mut view = with_a_plugins_key("N", new_session);
+        press(&mut view, KeyCode::Enter);
+        assert_eq!(press(&mut view, KeyCode::Char('N')), Outcome::Stay);
+        let said = "N runs the notes plugin's \"add a note\", which would run from : alone \
+                    once new-session has it: enter gives it all the same, esc leaves it";
+        assert!(text(&view).contains(said), "{}", text(&view));
+        assert_eq!(
+            press(&mut view, KeyCode::Enter),
+            Outcome::Keys(Rebinding {
+                lines: vec![(new_session, Some(Binding::One("N".into())))],
+                taken_from: None,
+            })
+        );
+        // The first of two keys is taken from the action as much.
+        let mut view = with_a_plugins_key("N t", new_session);
+        press(&mut view, KeyCode::Char('a'));
+        press(&mut view, KeyCode::Char('N'));
+        assert!(text(&view).contains("N runs the notes plugin's"));
+        assert_eq!(press(&mut view, KeyCode::Esc), Outcome::Stay);
+        assert!(!view.takes_keys_as_they_come());
+        // A view's key is no sidebar key: the action keeps working.
+        let down = KeyId::Mode(keymap::ModeKey::ViewDown);
+        let mut view = with_a_plugins_key("N", down);
+        press(&mut view, KeyCode::Enter);
+        assert!(matches!(
+            press(&mut view, KeyCode::Char('N')),
+            Outcome::Keys(_)
+        ));
+    }
+
+    /// The rows of the screen with `view` drawn on an 80 by 24 one.
+    fn screen(view: &SettingsView, theme: &Theme) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, view, theme, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..24)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// What the mouse is on where `text` is drawn, at its first character.
+    fn spot_of(view: &SettingsView, theme: &Theme, text: &str) -> Spot {
+        let rows = screen(view, theme);
+        let (row, column) = (rows.iter().enumerate())
+            .find_map(|(row, line)| Some((row, line.find(text)?)))
+            .unwrap_or_else(|| panic!("no {text:?} in {rows:#?}"));
+        let column = rows[row][..column].chars().count();
+        let area = Rect::new(0, 0, 80, 24);
+        hit(view, theme, area, column as u16, row as u16)
+    }
+
+    #[test]
+    fn a_click_picks_a_tab_or_a_row_and_on_the_bars_row_is_enter() {
+        let click = MouseEventKind::Down(MouseButton::Left);
+        for framed in [false, true] {
+            let theme = match framed {
+                true => Theme::new(ThemeName::TERMINAL, false),
+                false => Theme::new(ThemeName::DARK, false),
+            };
+            assert_eq!(theme.panel == Color::Reset, framed);
+            let mut view = view_of(Config::default(), None);
+            assert_eq!(spot_of(&view, &theme, "Mouse"), Spot::Tab(3));
+            assert_eq!(spot_of(&view, &theme, "settings"), Spot::Elsewhere);
+            view.on_mouse(click, spot_of(&view, &theme, "Keys"));
+            let spot = spot_of(&view, &theme, "new-session");
+            let Spot::Row(row) = spot else {
+                panic!("{spot:?}")
+            };
+            assert_eq!(
+                view.rows()[row],
+                Row::Key(KeyId::Command(Command::NewSession))
+            );
+            assert_eq!(view.on_mouse(click, spot), Outcome::Stay);
+            assert_eq!(
+                view.row(),
+                Some(Row::Key(KeyId::Command(Command::NewSession)))
+            );
+            assert!(!view.takes_keys_as_they_come());
+            // Again, it waits for a key, which a click doesn't answer.
+            view.on_mouse(click, spot);
+            assert!(text(&view).contains("press a key…"));
+            view.on_mouse(click, spot_of(&view, &theme, "General"));
+            assert!(view.takes_keys_as_they_come());
+            press(&mut view, KeyCode::Esc);
+            // A heading is no row.
+            assert_eq!(spot_of(&view, &theme, "Sidebar"), Spot::Elsewhere);
+            // The wheel moves the bar.
+            view.on_mouse(MouseEventKind::ScrollDown, Spot::Elsewhere);
+            view.on_mouse(MouseEventKind::ScrollDown, Spot::Elsewhere);
+            view.on_mouse(MouseEventKind::ScrollUp, Spot::Elsewhere);
+            let after = view.rows()[row + 1];
+            assert_eq!(view.row(), Some(after));
+            // On a switch, a second click turns it over.
+            view.on_mouse(click, spot_of(&view, &theme, "General"));
+            let sounds = spot_of(&view, &theme, "sounds");
+            assert_eq!(view.on_mouse(click, sounds), Outcome::Stay);
+            assert_eq!(view.on_mouse(click, sounds), change(S::Sound, false));
+        }
     }
 
     #[test]

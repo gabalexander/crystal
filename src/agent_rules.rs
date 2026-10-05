@@ -174,6 +174,8 @@ impl TestSpec {
 
 /// What a rule says the screen means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "ScreenMeaning"))]
 #[serde(rename_all = "lowercase")]
 pub enum Meaning {
     Working,
@@ -486,6 +488,8 @@ impl Input<'_> {
 /// Why the rules read a screen the way they did: every rule, in the order
 /// they're tried, with whether it matched and why not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "RulesExplained"))]
 pub struct Explained {
     pub agent: String,
     pub name: String,
@@ -504,6 +508,8 @@ pub struct Explained {
 
 /// A rule as it was tried on a screen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "TriedRule"))]
 pub struct Tried {
     pub id: String,
     pub looks: Meaning,

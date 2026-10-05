@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 /// A running session, as much of it as it takes to start it again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SavedSession {
     pub name: String,
     pub command: Vec<String>,
@@ -37,6 +38,25 @@ pub struct SavedSession {
     /// agent is told of each time it starts.
     #[serde(default, skip_serializing_if = "TaskBrief::is_empty")]
     pub about: TaskBrief,
+    /// Whether the user or a script gave it its name, which a rename in
+    /// Claude Code leaves, after a restart as before it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub name_given: bool,
+    /// The worktree it was on its way into when it was written down, which
+    /// its `cwd` is in already: its agent is told it has moved as it
+    /// starts there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved: Option<MovedTo>,
+}
+
+/// The worktree a session moves into: see `crystal worktree move`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct MovedTo {
+    /// The worktree's top directory.
+    pub path: PathBuf,
+    /// The branch it's on, which the agent is told.
+    pub branch: Option<String>,
 }
 
 /// The database of the daemon at `socket`. A server's socket lives in

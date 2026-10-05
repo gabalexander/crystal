@@ -37,13 +37,19 @@ pub const DEFAULT_HISTORY_LINES: usize = 10_000;
 /// The most rows of history the config may ask a screen to keep.
 pub const MAX_HISTORY_LINES: usize = 1_000_000;
 
+/// The line under what a terminal showed before a cold restart, when it's
+/// shown again above the program started again: see
+/// [`Screen::after_restart`].
+const RESTARTED: &str = "\r\n\x1b[2m── crystal restarted: what's above is from before ──\x1b[m\r\n";
+
 /// How many rows of history the screens made from now on keep:
 /// `scrollback_lines` in the config, which each process that makes screens
 /// sets as it reads it.
 static HISTORY_LINES: AtomicUsize = AtomicUsize::new(DEFAULT_HISTORY_LINES);
 
 /// Has the screens made from now on keep `lines` rows of history, at most
-/// [`MAX_HISTORY_LINES`]. A screen made before keeps what it kept.
+/// [`MAX_HISTORY_LINES`]. A screen made before keeps what it kept, until
+/// [`Screen::keep_history`] says otherwise.
 pub fn set_history_lines(lines: usize) {
     HISTORY_LINES.store(lines.min(MAX_HISTORY_LINES), Ordering::Relaxed);
 }
@@ -114,6 +120,8 @@ pub struct Screen {
     /// The progress the program reports, which alacritty_terminal passes
     /// over.
     progress: Progress,
+    /// How many rows of history it keeps.
+    history: usize,
 }
 
 /// Picks the progress a program reports out of its output: OSC 9;4, which
@@ -397,6 +405,19 @@ impl Timeout for Unsynced {
     }
 }
 
+/// How alacritty_terminal is to keep a screen that keeps `history` rows
+/// of history.
+fn options(history: usize) -> Config {
+    Config {
+        scrolling_history: history,
+        kitty_keyboard: true,
+        // A program may put text on the user's clipboard, as in a terminal
+        // of its own, but never read what's there.
+        osc52: Osc52::OnlyCopy,
+        ..Config::default()
+    }
+}
+
 /// A screen's size, the way alacritty_terminal takes it.
 struct Size {
     rows: usize,
@@ -473,14 +494,7 @@ impl Screen {
     /// A screen that keeps `history` rows of history.
     fn keeping(rows: u16, cols: u16, history: usize) -> Screen {
         let heard = Arc::new(Mutex::new(Heard::default()));
-        let config = Config {
-            scrolling_history: history,
-            kitty_keyboard: true,
-            // A program may put text on the user's clipboard, as in a
-            // terminal of its own, but never read what's there.
-            osc52: Osc52::OnlyCopy,
-            ..Config::default()
-        };
+        let config = options(history);
         let term = Term::new(config, &size(rows, cols), Listener(heard.clone()));
         Screen {
             term,
@@ -489,6 +503,24 @@ impl Screen {
             search: None,
             urls: RefCell::default(),
             progress: Progress::default(),
+            history,
+        }
+    }
+
+    /// Has the screen keep `lines` rows of history from now on, at most
+    /// [`MAX_HISTORY_LINES`]: fewer than it has lets the oldest go, and
+    /// copy mode's cursor on one of them comes to the oldest left.
+    pub fn keep_history(&mut self, lines: usize) {
+        let lines = lines.min(MAX_HISTORY_LINES);
+        if lines == self.history {
+            return;
+        }
+        self.history = lines;
+        self.term.set_options(options(lines));
+        let topmost = self.term.topmost_line();
+        let cursor = &mut self.term.vi_mode_cursor.point;
+        if cursor.line < topmost {
+            cursor.line = topmost;
         }
     }
 
@@ -613,24 +645,12 @@ impl Screen {
         if self.alternate_screen() {
             out.push_str("\x1b[?1049h\x1b[H\x1b[2J");
         }
-        // Each row is written out from the top, and a line feed after it
-        // takes the next one down, scrolling the rows before up into the
-        // history. A row that wrapped is written to its end instead, so the
-        // new screen wraps it the same way and knows it for one line.
         let first = if with_history {
             -(grid.history_size() as i32)
         } else {
             0
         };
-        let last = grid.screen_lines() as i32 - 1;
-        for line in first..=last {
-            let row = &grid[Line(line)];
-            let wrapped = row[grid.last_column()].flags.contains(Flags::WRAPLINE);
-            write_row(&mut out, row, grid.columns(), !wrapped);
-            if line != last && !wrapped {
-                out.push_str("\r\n");
-            }
-        }
+        write_rows(&mut out, grid, first, grid.screen_lines() as i32 - 1);
         out.push_str("\x1b[m");
         write_modes(&mut out, mode);
         let cursor = &grid.cursor;
@@ -659,15 +679,8 @@ impl Screen {
     pub fn save(&mut self) -> Saved {
         let output = if self.alternate_screen() {
             let alternate = self.formatted(false);
-            // The main screen, history and all, isn't to be had without
-            // going back to it.
-            self.term.swap_alt();
-            let main = self.formatted(true);
-            // Going to the alternate screen clears it: drawn again.
-            self.term.swap_alt();
-            self.process(alternate.as_bytes());
+            let mut output = self.on_main_screen(|screen| screen.formatted(true));
             // A link left open on the main screen stays there.
-            let mut output = main;
             write_hyperlink(&mut output, None);
             output + &alternate
         } else {
@@ -680,6 +693,67 @@ impl Screen {
             title: self.title(),
             output,
         }
+    }
+
+    /// The main screen and its history as a cold restart shows them again,
+    /// above a new program (see [`Screen::after_restart`]): what's on them
+    /// down to the last row with anything on it, and nothing the program
+    /// set, its modes, its title, its cursor and the alternate screen,
+    /// which are the program's, and it's gone. Leaves the screen as it was.
+    pub fn kept(&mut self) -> Saved {
+        let output = self.on_main_screen(|screen| {
+            let grid = screen.term.grid();
+            let first = -(grid.history_size() as i32);
+            let last = (first..grid.screen_lines() as i32)
+                .rev()
+                .find(|&line| !row_text(grid, Line(line)).is_empty());
+            let mut out = String::new();
+            if let Some(last) = last {
+                write_rows(&mut out, grid, first, last);
+                out.push_str("\x1b[m");
+            }
+            out
+        });
+        let (rows, cols) = self.size();
+        Saved {
+            rows,
+            cols,
+            title: String::new(),
+            output,
+        }
+    }
+
+    /// A screen of `rows` by `cols`, answering, for a program started
+    /// again after a cold restart: what `kept` kept of the one before it,
+    /// laid out as wide as it was, then a line saying crystal restarted,
+    /// and under it, the cursor, where the program starts. A screen with
+    /// nothing kept is a fresh one.
+    pub fn after_restart(kept: &Saved, rows: u16, cols: u16) -> Screen {
+        if kept.output.is_empty() {
+            return Screen::answering(rows, cols);
+        }
+        let mut screen = Screen::answering(kept.rows, kept.cols);
+        screen.process(kept.output.as_bytes());
+        screen.resize(rows, cols);
+        screen.process(RESTARTED.as_bytes());
+        screen.take_replies();
+        screen
+    }
+
+    /// What `read` makes of the main screen, history and all, which on the
+    /// alternate screen isn't to be had without going back to it; the
+    /// alternate screen is drawn again after.
+    fn on_main_screen<T>(&mut self, read: impl FnOnce(&Screen) -> T) -> T {
+        if !self.alternate_screen() {
+            return read(self);
+        }
+        let alternate = self.formatted(false);
+        self.term.swap_alt();
+        let read = read(self);
+        // Going to the alternate screen clears it: drawn again.
+        self.term.swap_alt();
+        self.process(alternate.as_bytes());
+        read
     }
 
     /// The daemon's screen, answering, as the last daemon handed it over.
@@ -1494,6 +1568,21 @@ fn write_row(
     }
 }
 
+/// Writes the rows of `grid` from `first` to `last` from the top, a line
+/// feed after each taking the next one down and scrolling the rows before
+/// up into the history. A row that wrapped is written to its end instead,
+/// so a new screen wraps it the same way and knows it for one line.
+fn write_rows(out: &mut String, grid: &Grid<GridCell>, first: i32, last: i32) {
+    for line in first..=last {
+        let row = &grid[Line(line)];
+        let wrapped = row[grid.last_column()].flags.contains(Flags::WRAPLINE);
+        write_row(out, row, grid.columns(), !wrapped);
+        if line != last && !wrapped {
+            out.push_str("\r\n");
+        }
+    }
+}
+
 /// Writes the OSC 8 sequence that starts `link`, with its id, or with
 /// `None` the one that ends the link before.
 fn write_hyperlink(out: &mut String, link: Option<&Hyperlink>) {
@@ -1794,6 +1883,23 @@ mod tests {
     }
 
     #[test]
+    fn a_screen_told_to_keep_less_history_lets_the_oldest_go() {
+        let mut screen = Screen::keeping(2, 10, 100);
+        screen.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        screen.start_copying();
+        screen.move_copy_cursor(Motion::HistoryTop);
+        assert_eq!(screen.copy_cursor_line(), "one");
+        screen.keep_history(1);
+        assert_eq!(screen.rows(true), ["three", "four", "five"]);
+        // Copy mode's cursor was on a row let go: it's on the oldest left.
+        assert_eq!(screen.copy_cursor_line(), "three");
+        screen.keep_history(10);
+        screen.process(b"\r\nsix\r\nseven");
+        assert_eq!(screen.history(), 3);
+        assert_eq!(screen.rows(true)[0], "three");
+    }
+
+    #[test]
     fn rows_scrolled_out_of_a_region_at_the_top_reach_the_history() {
         // Codex prints inline: a region down to just above its prompt,
         // scrolled up by line feeds and by `CSI S`.
@@ -2060,6 +2166,59 @@ mod tests {
         assert_eq!(restored.rows(true), original.rows(true));
         assert_eq!(restored.cursor(), original.cursor());
         assert!(restored.rows(true).contains(&"line 0".to_string()));
+    }
+
+    #[test]
+    fn a_kept_screen_shows_again_above_a_new_program_without_what_the_old_one_set() {
+        let mut output = shell_output();
+        // A pager on the alternate screen, which asked for the mouse.
+        output.extend(b"\x1b[?1049h\x1b[?1000h\x1b[H\x1b[2Jfull screen");
+        let mut original = screen(5, 20, &output);
+        let before = (original.rows(true), cells(&original), original.cursor());
+        let kept = original.kept();
+        // Keeping it left the screen as it was.
+        assert_eq!(
+            (original.rows(true), cells(&original), original.cursor()),
+            before
+        );
+        assert_eq!((kept.rows, kept.cols), (5, 20));
+
+        // Shown again on a screen of another size, the main screen's lines
+        // are there, history and all, with their colors, and the program's
+        // screen and what it set aren't.
+        let mut again = Screen::after_restart(&kept, 6, 60);
+        assert_eq!(again.size(), (6, 60));
+        assert!(!again.alternate_screen());
+        assert!(!again.bracketed_paste());
+        assert!(!again.input_modes().modes.iter().any(|on| *on));
+        assert_eq!(again.title(), "");
+        let rows = again.rows(true);
+        assert_eq!(rows[0], "green");
+        assert!(rows.contains(&"line 0".to_string()), "{rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("full screen")));
+        let restarted = rows
+            .iter()
+            .position(|row| row.contains("crystal restarted"))
+            .unwrap();
+        assert_eq!(rows[restarted - 1], "$");
+        assert_eq!(cells(&again).len(), 6);
+        // The new program starts on the line under it.
+        let (row, col) = again.cursor().unwrap();
+        assert_eq!(col, 0);
+        let history = rows.len() - 6;
+        assert_eq!(usize::from(row) + history, restarted + 1);
+        again.process(b"$ new prompt");
+        assert_eq!(again.rows(true)[restarted + 1], "$ new prompt");
+    }
+
+    #[test]
+    fn a_screen_with_nothing_on_it_keeps_nothing_to_show_again() {
+        let mut blank = screen(3, 10, b"\x1b[?2004h");
+        let kept = blank.kept();
+        assert!(kept.output.is_empty());
+        let again = Screen::after_restart(&kept, 4, 12);
+        assert_eq!(again.rows(true), ["", "", "", ""]);
+        assert_eq!(again.cursor(), Some((0, 0)));
     }
 
     #[test]

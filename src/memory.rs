@@ -238,6 +238,8 @@ pub fn enabled_now() -> bool {
 
 /// What sort of thing an entry is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "MemoryKind"))]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     /// A choice made, and why.
@@ -327,6 +329,8 @@ fn about_files_sql(at: usize) -> String {
 
 /// Who an entry came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "MemorySource"))]
 #[serde(rename_all = "lowercase")]
 pub enum Source {
     User,
@@ -358,6 +362,8 @@ impl fmt::Display for Source {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "MemoryEntry"))]
 pub struct Entry {
     /// Counts up from 1 in each project, so it's short enough to type.
     pub id: u64,
@@ -426,6 +432,7 @@ impl Added {
 
 /// What a search keeps to besides its words, and the most it gives.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Wanted {
     /// Only entries of this kind.
     pub kind: Option<Kind>,
@@ -1264,6 +1271,7 @@ pub struct Memory {
 /// Whether an entry still holds, by the files it's about. The fresher
 /// sorts first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Freshness {
     /// None of its files has changed since it was said, or it names none.
@@ -1288,6 +1296,8 @@ impl Freshness {
 
 /// An entry, with whether it still holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "MemoryListed"))]
 pub struct Listed {
     pub entry: Entry,
     pub freshness: Freshness,

@@ -1492,6 +1492,15 @@ impl Tui {
             }
         }
         let areas = ui::Areas::of(&self.app, self.screen);
+        // The settings view has the mouse while it's open.
+        if let Some(view) = self.app.settings_view() {
+            let middle = ui::middle(&areas, self.screen);
+            let spot = settings_view::hit(view, &self.theme, middle, mouse.column, mouse.row);
+            if let Some(action) = self.app.settings_mouse(mouse.kind, spot) {
+                self.carry_out(action);
+            }
+            return;
+        }
         let mut hit = ui::hit(&areas, &self.app, mouse.column, mouse.row);
         if self.click_on_link(&mouse, hit) {
             return;
@@ -1544,7 +1553,7 @@ impl Tui {
     /// The mouse moved: with Ctrl held, onto the link to underline.
     /// Returns whether that changes what's drawn.
     fn mouse_moved(&mut self, mouse: &MouseEvent) -> bool {
-        if self.overlay.is_some() {
+        if self.overlay.is_some() || self.app.settings_view().is_some() {
             return false;
         }
         // Over a menu, the bar follows the mouse.
@@ -1941,6 +1950,16 @@ impl Tui {
                 let deleted = profile::delete(&config::path(), &name);
                 self.profiles_changed(deleted, None);
             }
+            Action::ReleaseNotes => {
+                self.read_in_background(|| {
+                    let notes =
+                        update::this_crystals_kept_notes().or_else(update::this_crystals_notes);
+                    match notes {
+                        Some(body) => Event::WhatsNew(body),
+                        None => Event::Notice(update::no_notes()),
+                    }
+                });
+            }
             Action::OpenSettings => {
                 self.poll_settings.store(true, Ordering::Relaxed);
                 self.read_settings_now();
@@ -2111,8 +2130,10 @@ impl Tui {
                 }
             }
             Action::Kill(name) => {
+                let emptied = self.app.take_emptied();
                 client::ask(&self.socket, &Request::Kill { name }, false)?;
                 self.refresh_sessions()?;
+                self.ask_about_emptied(emptied)?;
             }
             Action::ForgetProject(path) => {
                 client::ask(&self.socket, &Request::RemoveProject { dir: path }, false)?;
@@ -2171,6 +2192,7 @@ impl Tui {
                 self.project_command(which, &worktree)?;
             }
             Action::KillAll(names) => {
+                let emptied = self.app.take_emptied();
                 // One that has gone already is no reason to spare the rest.
                 let mut failed = None;
                 for name in names {
@@ -2182,6 +2204,7 @@ impl Tui {
                 if let Some(err) = failed {
                     return Err(err);
                 }
+                self.ask_about_emptied(emptied)?;
             }
             Action::Rename { name, new_name } => {
                 client::rename(&self.socket, &name, &new_name)?;
@@ -2225,6 +2248,15 @@ impl Tui {
                         .map_err(|err| removal_refused(&path, &err));
                     Event::WorktreeRemoved { path, removed }
                 });
+            }
+            Action::RemoveWorktrees(worktrees) => {
+                for (path, branch) in worktrees {
+                    self.perform(Action::RemoveWorktree {
+                        path,
+                        branch,
+                        force: false,
+                    })?;
+                }
             }
             Action::Type { to, key } => {
                 if let Some(pane) = self.pane_in(to)
@@ -2365,8 +2397,8 @@ impl Tui {
                     }
                 });
             }
-            Action::FindPullRequests(projects) => {
-                for project in projects {
+            Action::Find(to_find) => {
+                for project in to_find.pull_requests {
                     self.read_in_background(move || {
                         let asked = Instant::now();
                         let found = list_pull_requests(&project);
@@ -2377,6 +2409,18 @@ impl Tui {
                         }
                     });
                 }
+                for project in to_find.issues {
+                    self.read_in_background(move || {
+                        let asked = Instant::now();
+                        let found = list_issues(&project);
+                        Event::Issues {
+                            project,
+                            found,
+                            asked,
+                        }
+                    });
+                }
+                self.find_backlogs(to_find.backlogs);
             }
             Action::Comment {
                 project,
@@ -2555,7 +2599,12 @@ impl Tui {
             );
         }
         self.app.set_start_dir(start_dir(config));
+        // The panes showing sessions keep as much history as the daemon's
+        // screens come to.
         crate::vt::set_history_lines(config.scrollback_lines);
+        for pane in self.panes.iter_mut().chain(self.overlay.as_mut()) {
+            pane.screen.keep_history(config.scrollback_lines);
+        }
         crate::mermaid::set_ascii(config.mermaid_ascii);
         if config.mouse.capture != self.config.mouse.capture {
             capture_mouse(config.mouse.capture);
@@ -2921,6 +2970,26 @@ impl Tui {
         });
     }
 
+    /// Asks the daemon, off the loop, for the backlogs of the projects
+    /// `dirs` are in, one after the other, done items too, as the backlog
+    /// view does: for `/` to find their items to do.
+    fn find_backlogs(&self, dirs: Vec<PathBuf>) {
+        if dirs.is_empty() {
+            return;
+        }
+        let socket = self.socket.clone();
+        let events = self.events.clone();
+        thread::spawn(move || {
+            for dir in dirs {
+                let found =
+                    client::backlog(&socket, dir.clone(), true).map_err(|err| format!("{err:#}"));
+                if events.send(Event::Backlog { dir, found }).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
     /// Searches the worktree at `dir` for `query` on a thread of its own, a
     /// moment after it's asked for, unless another search has been asked for
     /// by then: that one is what's wanted, and this one stops.
@@ -2961,6 +3030,24 @@ impl Tui {
         self.list_worktrees_again();
         if let Err(err) = self.refresh_sessions() {
             self.app.notify(format!("{err:#}"));
+        }
+    }
+
+    /// Has the user asked whether the worktrees the sessions just killed
+    /// left with nothing in them go too, or has them removed, as the
+    /// settings say, once the daemon has said which archived sessions ran
+    /// in them.
+    fn ask_about_emptied(&mut self, emptied: Vec<Worktree>) -> Result<()> {
+        if emptied.is_empty() {
+            return Ok(());
+        }
+        let archived = match client::ask(&self.socket, &Request::Archived, false)? {
+            Some(Response::Archived { sessions }) => sessions,
+            _ => Vec::new(),
+        };
+        match self.app.ask_about_emptied(emptied, &archived) {
+            Some(removal) => self.perform(removal),
+            None => Ok(()),
         }
     }
 
