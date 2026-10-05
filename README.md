@@ -2556,6 +2556,11 @@ crystal memory distill fixer         # have a model read what a session did, now
 crystal memory embed                 # give every entry its vector, downloading the models first if needed
 crystal memory status                # how search by meaning stands: what makes the vectors, Gemini's key
 crystal memory dedupe                # entries that say what another does, by meaning; --apply merges them
+crystal remember --replaces 3 --why "it flipped" "Idle stop is on by default"   # in place of 3, which no longer holds
+crystal memory retire 3 --by 12      # 3 no longer holds: 12, there already, holds in its place
+crystal memory list --superseded     # what stopped holding, with what holds in its place and why
+crystal memory restore 3             # put one that stopped holding back as it was
+crystal memory reconcile             # what a model reads as no longer holding among entries near one another; --apply
 ```
 
 - `-k` is `decision`, `gotcha`, `command` or `note` (the default). Inside a session, an entry goes to the
@@ -2618,6 +2623,32 @@ crystal memory dedupe                # entries that say what another does, by me
   mean as its own, and the reranker reads them after its text. Each one goes straight into the one kept,
   never through another, so two that only both look like a third stay apart. It needs the models, and takes
   under a minute on a few hundred entries.
+- What's learned later can correct what was learned before: a default that changed, a decision reversed, a
+  command renamed. The entry that no longer holds is superseded: retired, another entry holding in its place,
+  or updated, its text rewritten under its id. Either way it's kept apart, as it was, with when it stopped
+  holding and why, and left out of every search, of what agents starting are shown and of what the
+  distiller is told the memory has. What a retired one said still finds the one in its place, by its words
+  and its meaning, as what's merged finds the one kept: a search for the old claim gives what holds now. `remember --replaces <id>` remembers an entry in place of another
+  (`--why` says why that one no longer holds), `memory retire <id> --by <id>` retires one for another there
+  already, and the [distiller](#the-distiller) says so of the entries it's shown. `list --superseded` lists
+  them, the latest first; `show <id>` gives a retired one as it was, with what holds in its place, and an
+  updated one with what it said before; `restore <id>` puts one back as it was. Said again, in the same
+  words, an entry that stopped holding isn't remembered: `crystal remember` says so, and what holds now.
+- With [search by meaning](#search-by-meaning), an entry remembered near one there already (as alike as 0.80),
+  about the same thing but not saying the same, says so: `near 12: <what 12 says>`, and `crystal memory
+  retire 12 --by 30` if the new one, 30, replaces it. One taken for another said again, `remembered 12 already, in other words`,
+  says `add --replaces 12` if it replaces it instead.
+- `reconcile` looks through what's there for what no longer holds: the entries near one another in meaning,
+  as alike as 0.80, in groups of six (eight once those left out join the group of the one nearest them).
+  Those `dedupe` would merge into another are left out, and it says how many: asked whether one holds in
+  another's place, a model takes the same said twice for that. The distiller's model
+  (`distill_model`, Haiku) reads them, 24 entries a pass, four passes at once, each one `claude -p` as locked
+  down as the distiller's and given five minutes, told what each names that's gone from the code and which
+  was said later, for those another of their group shows no longer hold: each to retire for that one, or to
+  update, with why. It thinks each through, so a pass takes a minute or two. It only lists what it proposes,
+  and keeps it; `--apply` makes that so, passing over any entry changed since, and with nothing kept, asks
+  again and makes what it says so. Every change is undone with `restore`. It needs the models; on crystal's
+  own memory, about 480 entries once deduped, it read 76 in 29 groups for about 20 cents.
 - Whether an entry still holds goes by what it names: the identifiers, paths, commands and flags in its text,
   in backticks or shaped like code (`local_origin`, `TaskRecord`, `Request::Shutdown` as `Shutdown`,
   `src/agent_rules.rs`, `agents/`, `--test-threads`), that are in the worktree's code as it's remembered:
@@ -2786,7 +2817,8 @@ still reads the best of each search: the Gemini API has none.
   higher than with jina, and the reranker scores pairs like that as high as the same said again, so an
   entry is the same as another from 0.92 alike (0.925 at 768), and the reranker is asked only from 0.915
   (0.918): on crystal's memory, `dedupe` finds 22 entries said again in 15 groups, every one rightly,
-  where jina finds 33.
+  where jina finds 33. Entries are near one another, for `reconcile` and the hint as you remember, from
+  0.82 (0.825), below every pair where one corrected the other.
 - **Measured** on crystal's own 512 entries, 97 questions (a right entry among the first five, of 93 that
   have one; the mean reciprocal rank of the first right one among ten):
 
@@ -2827,10 +2859,15 @@ task closed done or failed and it was read then. It's one `claude -p` run on Hai
 - What passes is kept like anything else, `from the distiller, after task <name>`: what's there already, in
   its words or others, is seen again rather than added twice, and what you forgot with `rm` it never adds
   back, in its words or others (you can, by remembering it yourself).
+- What it keeps may correct an entry it was shown: then it says which, why it no longer holds, and how, an
+  update (what it keeps is that entry corrected, and goes in its place under its id) or a retirement (what it
+  keeps is a new entry, and the old one is retired). Only an entry it was shown may be replaced, once, with a
+  reason, by an entry that, when it names anything, names something that's in the checkout; `memory.superseded`
+  says so of each, and `restore` puts one back.
 - It's also shown up to 4 of the stale entries about the files the work touched (those its branch changed
   since it left the default one, and those it edited), with what each names that's gone, and says of each the
   record settles whether it still holds (it's anchored again, to the code as it is), holds once reworded (its
-  text is replaced, under the same id), or no longer holds (it's forgotten, as `rm` forgets). A verdict on an
+  text is replaced, under the same id, as an update is), or no longer holds (it's forgotten, as `rm` forgets). A verdict on an
   entry it wasn't shown is refused, and so is one that keeps an entry, or rewords it, naming only what isn't
   in the checkout.
 - How it went is a line in the daemon's log, `default.log` beside the socket. `crystal memory distill <session>`
@@ -3470,9 +3507,11 @@ runs the action its handlers give a link, to try them.
 | `memory.stale` | all an entry names is gone from the code, or naming nothing to look for, every file it's about, as the daemon finds hourly and as each task closes |
 | `memory.promoted` | an entry is written into the project's CLAUDE.md or AGENTS.md, which its `file` names |
 | `memory.changed` | an entry's kind is changed, by `crystal memory kind`, `c` in the memory view or the distiller |
-| `memory.distilled` | the [distiller](#memory) has read what a session did: its `distill` says how many entries it `added`, found `again`, `rechecked` of those gone stale and `rejected`, and what it cost |
+| `memory.distilled` | the [distiller](#memory) has read what a session did: its `distill` says how many entries it `added`, found `again`, `rechecked` of those gone stale, `superseded` (updated or retired) of those it was shown and `rejected`, and what it cost |
 | `memory.distill_failed` | the distiller couldn't: its `distill`'s `failed` says why |
 | `memory.merged` | `crystal memory dedupe --apply` merged entries that say the same thing into one: `memory` is the one kept, as it is now, and `from` the ids of those that went into it |
+| `memory.superseded` | an entry stopped holding, another said in its place, by `remember --replaces`, `memory retire`, `memory reconcile --apply` or the distiller: `superseded` is it as it was, with `by` the entry that holds in its place (its own id when it was updated) and `why`, and `memory` that entry as it is now |
+| `memory.restored` | `crystal memory restore` put an entry that stopped holding back as it was: `memory` is it |
 | `backlog.added` | an item goes on a project's backlog |
 | `backlog.closed` | an item is marked done |
 | `plugin.paused` | a plugin is paused for failing |

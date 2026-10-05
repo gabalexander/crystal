@@ -160,6 +160,17 @@ const ALIKE_FROM: f32 = 0.87;
 /// said again mostly 0.4 to 0.75.
 const SAME_RERANKED_FROM: f32 = 0.40;
 
+/// How alike two entries' vectors have to be, by this model, to be near
+/// one another: for `crystal memory reconcile` to ask whether one shows the
+/// other no longer holds, and for one being remembered to say which it's
+/// near. On crystal's own notes, once those that say the same were merged,
+/// every pair where one corrected the other (a prompt that pages now, a flag
+/// that survives a restart now) was at least 0.80 alike, and only 5 pairs
+/// were as alike as [`ALIKE_FROM`]. The reranker tells nothing here: an
+/// entry and the one it corrects are about the same thing, which is what it
+/// scores.
+const NEAR_FROM: f32 = 0.80;
+
 /// A model's files at a revision.
 pub struct Spec {
     pub repo: &'static str,
@@ -246,6 +257,13 @@ pub trait Embed {
     /// least [`Embed::alike_from`] alike has to reach to say the same thing.
     fn same_reranked_from(&self) -> f32 {
         SAME_RERANKED_FROM
+    }
+
+    /// How alike two entries' vectors have to be to be near one another,
+    /// for one to be asked whether it shows the other no longer holds, and
+    /// for one being remembered to say it's near the other.
+    fn near_from(&self) -> f32 {
+        NEAR_FROM
     }
 
     /// How many entries with no vector yet to give one between writes to
@@ -518,6 +536,10 @@ impl Embed for Remote {
 
     fn alike_from(&self) -> f32 {
         self.gemini.thresholds().alike_from
+    }
+
+    fn near_from(&self) -> f32 {
+        self.gemini.thresholds().near_from
     }
 
     fn rerank(&self, query: &str, passages: &[&str]) -> Result<Option<Vec<f32>>> {

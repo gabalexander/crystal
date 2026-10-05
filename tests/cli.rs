@@ -14152,7 +14152,8 @@ const ALLOWED_WITH_MEMORY: &str = concat!(
     backlog_and_handoff_rules!(),
     ",Bash(crystal remember:*),Bash(crystal memory),Bash(crystal memory add:*),\
      Bash(crystal memory list:*),Bash(crystal memory search:*),\
-     Bash(crystal memory show:*),mcp__crystal__memory_search,mcp__crystal__memory_show"
+     Bash(crystal memory show:*),Bash(crystal memory retire:*),mcp__crystal__memory_search,\
+     mcp__crystal__memory_show"
 );
 
 #[test]
@@ -14398,6 +14399,170 @@ fn the_distiller_makes_the_notes_it_was_shown_that_are_lessons_lessons() {
         changed.contains("1 (gotcha) The ledger tests need redis up"),
         "{changed}"
     );
+}
+
+#[test]
+fn the_distiller_puts_what_it_keeps_in_place_of_what_no_longer_holds() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    let memory = |args: &[&str]| crystal.ok(&[&["memory", "-C", repo_dir], args].concat());
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "gotcha",
+        "The ledger tests need redis started by hand",
+    ]);
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "command",
+        "make ledger runs the ledger tests",
+    ]);
+    let bin = distilling_claude_answering(
+        crystal.dir.path(),
+        r#"{"entries":[{"kind":"gotcha","text":"The ledger tests start redis themselves","files":[],"replaces":{"id":1,"how":"retire","why":"the tests start redis now"}},{"kind":"command","text":"make test-ledger runs the ledger tests","files":[],"replaces":{"id":2,"how":"update","why":"the target was renamed"}}],"rechecked":[],"kinds":[]}"#,
+    );
+    start_fixer(&crystal, &repo, &bin);
+
+    eventually("the pass is told of", || {
+        crystal
+            .ok(&["events", "-k", "memory.distilled"])
+            .contains("1 added, 2 superseded")
+    });
+    // It was shown them by their ids, to say which it replaces.
+    let message = std::fs::read_to_string(repo.join("distill-message")).unwrap();
+    assert!(
+        message.contains("- 1 (gotcha) The ledger tests need redis started by hand\n"),
+        "{message}"
+    );
+    let listed = memory(&[]);
+    assert!(
+        listed.contains("The ledger tests start redis themselves"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains("make test-ledger runs the ledger tests"),
+        "{listed}"
+    );
+    assert!(!listed.contains("by hand"), "{listed}");
+    let superseded = memory(&["list", "--superseded"]);
+    assert!(
+        superseded.contains("redis started by hand  [→ 3: the tests start redis now]"),
+        "{superseded}"
+    );
+    assert!(
+        superseded.contains("make ledger runs the ledger tests  [updated: the target was renamed]"),
+        "{superseded}"
+    );
+    let told = crystal.ok(&["events", "-k", "memory.superseded"]);
+    assert!(
+        told.contains("1 (gotcha) The ledger tests need redis started by hand → 3"),
+        "{told}"
+    );
+    assert!(
+        told.contains("2 (command) make ledger runs the ledger tests updated"),
+        "{told}"
+    );
+    let shown = memory(&["show", "2"]);
+    assert!(
+        shown.ends_with(
+            "updated just now: the target was renamed; it said before: make ledger runs the \
+             ledger tests\n"
+        ),
+        "{shown}"
+    );
+}
+
+#[test]
+fn an_entry_remembered_in_place_of_another_retires_it_until_it_s_put_back() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    let memory = |args: &[&str]| crystal.ok(&[&["memory", "-C", repo_dir], args].concat());
+    // A daemon to tell what changes, for its log.
+    crystal.ok(&["new", "-d", "-n", "here", "sleep", "30"]);
+    let remember = |args: &[&str]| crystal.ok(&[&["remember", "-C", repo_dir], args].concat());
+    remember(&["-k", "decision", "Idle stop is off by default"]);
+    remember(&["Sessions keep their names"]);
+    assert_eq!(
+        remember(&[
+            "-k",
+            "decision",
+            "--replaces",
+            "1",
+            "--why",
+            "the default flipped",
+            "Idle stop is on by default",
+        ]),
+        "remembered 3, in place of 1\n"
+    );
+    let listed = memory(&[]);
+    assert_eq!(listed.lines().count(), 2, "{listed}");
+    assert!(!listed.contains("off by default"), "{listed}");
+    let superseded = memory(&["list", "--superseded"]);
+    assert!(
+        superseded.contains("Idle stop is off by default  [→ 3: the default flipped]"),
+        "{superseded}"
+    );
+    let shown = memory(&["show", "1"]);
+    assert!(
+        shown.starts_with(
+            "1 · decision · retired just now: the default flipped\n\
+             3 holds in its place: Idle stop is on by default\n"
+        ),
+        "{shown}"
+    );
+    let found = memory(&["search", "idle", "stop"]);
+    assert!(!found.contains("off by default"), "{found}");
+
+    // Said again, it isn't remembered, and says what holds now.
+    let again = crystal.fails(&["remember", "-C", repo_dir, "idle stop is OFF by default"]);
+    assert!(
+        again.contains("entry 1 said that, and it stopped holding just now: the default flipped"),
+        "{again}"
+    );
+    assert!(
+        again.contains("3 holds in its place: Idle stop is on by default"),
+        "{again}"
+    );
+    assert!(again.contains("`crystal memory restore 1`"), "{again}");
+    let told = crystal.ok(&["events", "-k", "memory.superseded"]);
+    assert!(
+        told.contains("1 (decision) Idle stop is off by default → 3: the default flipped"),
+        "{told}"
+    );
+
+    // Retired for one there already, by hand.
+    assert_eq!(
+        memory(&["retire", "2", "--by", "3", "--why", "wrong"]),
+        "retired 2: Sessions keep their names\n3 holds in its place: Idle stop is on by default\n"
+    );
+    let refused = crystal.fails(&["memory", "-C", repo_dir, "retire", "3", "--by", "1"]);
+    assert!(
+        refused.contains("no entry 1 to hold in its place"),
+        "{refused}"
+    );
+
+    // Put back, as it was.
+    assert_eq!(
+        memory(&["restore", "1"]),
+        "put 1 back: Idle stop is off by default\n"
+    );
+    assert!(memory(&[]).contains("1  decision"), "{}", memory(&[]));
+    let restored = crystal.ok(&["events", "-k", "memory.restored"]);
+    assert!(
+        restored.contains("1 (decision) Idle stop is off by default"),
+        "{restored}"
+    );
+    let twice = crystal.fails(&["memory", "-C", repo_dir, "restore", "1"]);
+    assert!(twice.contains("never stopped holding"), "{twice}");
+
+    // Only the models tell which entries are near one another.
+    let refused = crystal.fails(&["memory", "-C", repo_dir, "reconcile"]);
+    assert!(refused.contains("`crystal memory embed`"), "{refused}");
 }
 
 /// A stand-in for Claude as it reads a project's notes for the lessons

@@ -287,10 +287,20 @@ pub enum Request {
     },
     /// Add `entry` to the memory of `project`, a project's main worktree:
     /// the daemon, which keeps the models loaded, finds whether the project
-    /// has it already in other words.
+    /// has it already in other words. With `replaces`, in place of that
+    /// entry, which no longer holds, and is retired.
     Remember {
         project: PathBuf,
         entry: crate::memory::New,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replaces: Option<crate::memory::Replacing>,
+    },
+    /// The entries of the memory of the project `dir` is in near one
+    /// another in meaning, in groups, each with whether it still holds: for
+    /// `crystal memory reconcile` to ask a model whether any of them no
+    /// longer holds.
+    NearMemory {
+        dir: PathBuf,
     },
     /// Find the entries of the memory of the project `dir` is in that say
     /// what another does, by meaning, and with `apply`, merge each group
@@ -831,6 +841,17 @@ pub enum Response {
     },
     /// What adding an entry to a project's memory came to.
     Remembered(crate::memory::Added),
+    /// What adding an entry to a project's memory in place of another came
+    /// to, and the entry it replaced, as it was, retired; `None` when it
+    /// wasn't added, and the other is left as it was.
+    Replaced {
+        added: crate::memory::Added,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retired: Option<Box<crate::memory::Superseded>>,
+    },
+    /// The entries of a project's memory near one another in meaning, in
+    /// groups, and those left out as they say what another does.
+    Near(crate::memory::Near),
     /// The entries of a project's memory that say what another does, each
     /// group with the one it keeps: merged, or with `Request::DedupeMemory`
     /// not told to apply them, as they would be.

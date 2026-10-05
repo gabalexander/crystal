@@ -129,6 +129,11 @@ pub struct Thresholds {
     /// the same said again, many more of them than with jina, so the band
     /// it decides in starts just above the most alike of them.
     pub alike_from: f32,
+    /// As alike as this, two entries are near one another, for one to be
+    /// asked whether it shows the other no longer holds: every pair where
+    /// one corrected the other was at least 0.826 alike (0.832 at 768). Half
+    /// the entries have one that near, where with jina's 0.80 it's 29%.
+    pub near_from: f32,
 }
 
 /// The thresholds at a size of vector: a smaller one's cosines are a
@@ -140,12 +145,14 @@ pub fn thresholds(dimensions: u32) -> Thresholds {
             near_best: 0.08,
             same_from: 0.925,
             alike_from: 0.918,
+            near_from: 0.825,
         },
         _ => Thresholds {
             min_similarity: 0.0,
             near_best: 0.08,
             same_from: 0.92,
             alike_from: 0.915,
+            near_from: 0.82,
         },
     }
 }
@@ -797,10 +804,17 @@ mod tests {
         // On crystal's notes, two different lessons on one subject, the
         // numbers of an eval and the pick they led to, were 0.913 alike at
         // 3072 and 1536, and 0.915 at 768.
-        for (size, apart) in [(3072, 0.913), (1536, 0.913), (768, 0.915)] {
+        // And every pair where one corrected the other was at least 0.826
+        // alike (0.832 at 768), near enough to be asked about.
+        for (size, apart, corrected) in [
+            (3072, 0.913, 0.826),
+            (1536, 0.913, 0.826),
+            (768, 0.915, 0.832),
+        ] {
             let measured = thresholds(size);
             assert!(measured.alike_from > apart, "{size}");
             assert!(measured.same_from > measured.alike_from, "{size}");
+            assert!(measured.near_from < corrected, "{size}");
         }
     }
 

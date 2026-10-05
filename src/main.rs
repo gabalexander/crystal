@@ -1294,6 +1294,15 @@ struct EntryArgs {
     #[arg(long)]
     title: Option<String>,
 
+    /// The entry this one replaces, by its id, which no longer holds: it's
+    /// retired, kept out of searches, and this holds in its place.
+    #[arg(long, value_name = "ID")]
+    replaces: Option<u64>,
+
+    /// Why the entry it replaces no longer holds.
+    #[arg(long, requires = "replaces")]
+    why: Option<String>,
+
     /// What to remember. Several words are joined with spaces. With
     /// --title, it can be left out.
     #[arg(required_unless_present = "title")]
@@ -1317,8 +1326,18 @@ enum MemoryCommand {
 
         /// The entries forgotten instead, the latest first: the distiller
         /// never adds one back, but remembering it again does.
-        #[arg(long, visible_alias = "wrong", conflicts_with_all = ["status", "expired"])]
+        #[arg(
+            long,
+            visible_alias = "wrong",
+            conflicts_with_all = ["status", "expired", "superseded"]
+        )]
         forgotten: bool,
+
+        /// The entries that stopped holding instead, the latest first: each
+        /// retired, another holding in its place, or as it was before it was
+        /// updated, and why. `restore` puts one back.
+        #[arg(long, conflicts_with_all = ["status", "expired"])]
+        superseded: bool,
 
         /// Only the entries that read as progress or status rather than
         /// lessons (merged, pushed, installed, CI passed, a commit's hash, a
@@ -1421,6 +1440,35 @@ enum MemoryCommand {
         /// Don't ask first.
         #[arg(long)]
         yes: bool,
+    },
+    /// Retire an entry that no longer holds: another, there already, holds
+    /// in its place. It's kept out of searches and what agents are shown,
+    /// and `restore` puts it back.
+    Retire {
+        /// The entry that no longer holds.
+        id: u64,
+
+        /// The entry that holds in its place.
+        #[arg(long, value_name = "ID")]
+        by: u64,
+
+        /// Why it no longer holds.
+        #[arg(long)]
+        why: Option<String>,
+    },
+    /// Put an entry that stopped holding back as it was: a retired one back
+    /// in the list, or an updated one's words back in place of its words
+    /// now.
+    Restore { id: u64 },
+    /// Have the distiller's model look through the entries near one another
+    /// for those another shows no longer hold, and list what it proposes:
+    /// each retired, another in its place, or updated. With --apply, make
+    /// what it listed so.
+    Reconcile {
+        /// Make so what the last run listed, or with none, what the model
+        /// proposes now.
+        #[arg(long)]
+        apply: bool,
     },
     /// List the entries that say what another does, each group under the
     /// one it would keep, found by meaning; with --apply, merge each group
@@ -2733,6 +2781,7 @@ fn run(cli: Cli) -> Result<()> {
             Some(MemoryCommand::List {
                 kind,
                 forgotten,
+                superseded,
                 status,
                 expired,
             }) => {
@@ -2741,6 +2790,7 @@ fn run(cli: Cli) -> Result<()> {
                     forgotten,
                     status,
                     expired,
+                    superseded,
                 };
                 memory_cli::list(&socket, dir, listing)?;
             }
@@ -2795,6 +2845,13 @@ fn run(cli: Cli) -> Result<()> {
             Some(MemoryCommand::Embed) => memory_cli::embed(&socket)?,
             Some(MemoryCommand::Status) => memory_cli::status(&socket)?,
             Some(MemoryCommand::Dedupe { apply }) => memory_cli::dedupe(&socket, dir, apply)?,
+            Some(MemoryCommand::Retire { id, by, why }) => {
+                memory_cli::retire(&socket, dir, id, by, why)?;
+            }
+            Some(MemoryCommand::Restore { id }) => memory_cli::restore(&socket, dir, id)?,
+            Some(MemoryCommand::Reconcile { apply }) => {
+                memory_cli::reconcile(&socket, dir, apply)?;
+            }
             Some(MemoryCommand::Promote { id, yes }) => {
                 memory_cli::promote(&socket, dir, id, yes)?;
             }
@@ -3152,9 +3209,15 @@ fn remember(socket: &Path, dir: Option<PathBuf>, entry: EntryArgs) -> Result<()>
         kind,
         files,
         title,
+        replaces,
+        why,
         text,
     } = entry;
-    memory_cli::remember(socket, dir, kind, files, title, &text.join(" "))
+    let replacing = replaces.map(|id| memory::Replacing {
+        id,
+        why: why.unwrap_or_default(),
+    });
+    memory_cli::remember(socket, dir, kind, files, title, &text.join(" "), replacing)
 }
 
 /// `crystal backlog` and its commands, for the project `dir` is in.

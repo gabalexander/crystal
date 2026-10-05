@@ -2647,16 +2647,38 @@ impl Daemon {
                 let entries = memory::Memory::read(&self.socket, &project)?.listed();
                 Ok(Response::Memory { entries })
             }
-            Request::Remember { project, entry } => {
+            Request::Remember {
+                project,
+                entry,
+                replaces,
+            } => {
                 crate::plugins::ensure_enabled(&settings(), "memory")?;
                 let embedder = embed::shared_now();
+                let embedder = embed::as_embed(&embedder);
                 let mut store = memory::Store::open(&self.socket)?;
-                let added = store.add_with(&project, entry, embed::as_embed(&embedder))?;
-                if let memory::Added::New(entry) = &added {
-                    let added = Event::memory(Kind::MemoryAdded, project, entry.clone());
-                    self.events.emit(added);
+                let (added, retired) = match &replaces {
+                    Some(replacing) => {
+                        store.replace(&project, entry, replacing.id, &replacing.why, embedder)?
+                    }
+                    None => (store.add_with(&project, entry, embedder)?, None),
+                };
+                for event in crate::events::remembered(&project, &added, retired.as_ref()) {
+                    self.events.emit(event);
                 }
-                Ok(Response::Remembered(added))
+                Ok(match replaces {
+                    Some(_) => Response::Replaced {
+                        added,
+                        retired: retired.map(Box::new),
+                    },
+                    None => Response::Remembered(added),
+                })
+            }
+            Request::NearMemory { dir } => {
+                crate::plugins::ensure_enabled(&settings(), "memory")?;
+                let project = memory::project_of(&dir);
+                let embedder = embed::shared_now();
+                let near = memory::near(&self.socket, &project, embed::as_embed(&embedder))?;
+                Ok(Response::Near(near))
             }
             Request::DedupeMemory { dir, apply } => {
                 crate::plugins::ensure_enabled(&settings(), "memory")?;
@@ -3736,6 +3758,7 @@ fn distill_about(report: &Result<distill::Report>) -> DistillAbout {
             made_lessons: report.made_lessons.len(),
             rejected: report.rejected.len(),
             rechecked: report.kept.len() + report.reworded.len() + report.forgot.len(),
+            superseded: report.updated.len() + report.retired.len(),
             cost_usd: report.cost_usd,
             failed: None,
         },
@@ -3747,12 +3770,16 @@ fn distill_about(report: &Result<distill::Report>) -> DistillAbout {
 }
 
 /// Tells of the entries the distiller added to the memory of `job`'s
-/// project, and the notes it made lessons, by their ids, and of the stale
-/// ones it forgot.
+/// project, and the notes it made lessons, by their ids, of those it
+/// updated, retired or reworded, and of the stale ones it forgot.
 fn tell_distilled(events: &Bus, job: &Job, report: &distill::Report) {
     for entry in &report.forgot_entries {
         let forgot = Event::memory(Kind::MemoryForgotten, job.project.clone(), entry.clone());
         events.emit(forgot);
+    }
+    for (was, holder) in &report.superseded {
+        let superseded = Event::superseded(job.project.clone(), holder.clone(), was.clone());
+        events.emit(superseded);
     }
     let Ok(mut store) = memory::Store::open(&job.socket) else {
         return;
@@ -4297,6 +4324,7 @@ fn crystal_commands(config: &Config) -> Vec<&'static str> {
             "Bash(crystal memory list:*)",
             "Bash(crystal memory search:*)",
             "Bash(crystal memory show:*)",
+            "Bash(crystal memory retire:*)",
         ]);
     }
     rules
@@ -4883,6 +4911,7 @@ mod tests {
             "Bash(crystal memory search:*)",
             "Bash(crystal memory list:*)",
             "Bash(crystal memory add:*)",
+            "Bash(crystal memory retire:*)",
         ] {
             assert!(rules.contains(&allowed), "{allowed}: {rules:?}");
         }
@@ -4901,6 +4930,8 @@ mod tests {
             "crystal memory rm",
             "crystal memory distill",
             "crystal memory promote",
+            "crystal memory restore",
+            "crystal memory reconcile",
             "crystal kill-server",
         ] {
             let covers = |rule: &&str| {
