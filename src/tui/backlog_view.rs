@@ -139,6 +139,11 @@ impl BacklogView {
             .collect()
     }
 
+    /// Puts the bar on item `number`, once it's listed.
+    pub fn highlight(&mut self, number: u64) {
+        self.highlighted = Some(number);
+    }
+
     pub fn highlighted(&self) -> Option<&BacklogItem> {
         let number = self.highlighted?;
         self.shown().into_iter().find(|item| item.number == number)
