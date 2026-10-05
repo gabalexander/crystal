@@ -2576,6 +2576,12 @@ impl Daemon {
                 let entries = store.find(&project, &query, &wanted, embed::as_embed(&embedder))?;
                 Ok(Response::Memory { entries })
             }
+            Request::ListMemory { dir } => {
+                crate::plugins::ensure_enabled(&settings(), "memory")?;
+                let project = memory::project_of(&dir);
+                let entries = memory::Memory::read(&self.socket, &project)?.listed();
+                Ok(Response::Memory { entries })
+            }
             Request::Remember { project, entry } => {
                 crate::plugins::ensure_enabled(&settings(), "memory")?;
                 let embedder = embed::shared_now();

@@ -259,6 +259,12 @@ pub enum Request {
         #[serde(flatten)]
         wanted: crate::memory::Wanted,
     },
+    /// Every entry of the memory of the project `dir` is in, newest first,
+    /// each with whether it still holds: the daemon keeps each worktree's
+    /// words, which that's told by, from one look to the next.
+    ListMemory {
+        dir: PathBuf,
+    },
     /// Add `entry` to the memory of `project`, a project's main worktree:
     /// the daemon, which keeps the models loaded, finds whether the project
     /// has it already in other words.
