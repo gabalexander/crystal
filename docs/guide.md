@@ -88,5 +88,6 @@ An agent in a session runs these; you can too.
 | Your agent rules | `agents/` beside the config file |
 | Sessions, tabs, tasks, the backlog, events | `crystal.db` in `~/.local/state/crystal` |
 | What sessions learned | `memory.db` beside it; `m` reads it |
+| Screenshots dropped on a task or a reply | `attachments/` beside it, for a week |
 | Notes for the next session in a worktree | `.crystal/handoff.md` at its top |
 | A project's run and open commands, its flows | `.crystal/project.toml` and `.crystal/flows.toml` in it |
