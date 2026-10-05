@@ -61,6 +61,7 @@ use regex::RegexSet;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs;
@@ -107,6 +108,20 @@ const SETTLED: Duration = Duration::from_secs(2);
 
 /// How long the words of a worktree nobody looks at are kept.
 const WORDS_KEPT: Duration = Duration::from_secs(30 * 60);
+
+/// The most entries about a file [`Store::about_file`] gives, of which a
+/// session reading it is shown the first few it hasn't been shown yet.
+const ABOUT_FILE_LIMIT: usize = 12;
+
+/// The most files of a worktree a name may be in for an entry giving it to
+/// be about each of them: past that, it's a name used all over, not what a
+/// file is about.
+const RARE_NAME_FILES: u32 = 2;
+
+/// How long a look at a worktree's words serves for what an agent is
+/// shown as it reads a file, which mustn't wait on listing every file of a
+/// big worktree each time: what's in the code a minute ago is near enough.
+const WORDS_LATELY: Duration = Duration::from_secs(60);
 
 /// The most names an entry is checked by: the first it gives.
 const MAX_NAMES: usize = 16;
@@ -1569,6 +1584,74 @@ impl Store {
         Ok(about.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The entries of `project` about `file`, a path from the top of the
+    /// worktree at `top`, that an agent reading or editing it may be shown,
+    /// each with whether it holds, the first to show first,
+    /// [`ABOUT_FILE_LIMIT`] at most: none stale, expired or a task's
+    /// outcome. Lessons come first; then those about the file, one of their
+    /// files or a path their text names, then those naming something in it
+    /// that no more than [`RARE_NAME_FILES`] files have, then those about a
+    /// directory it's in; then those that have most to do with `asked`, by
+    /// its words; then those said most often, those a person or an agent
+    /// remembered before those crystal kept, those about the fewest files,
+    /// and those said most recently. It's quick: no model, and the code as
+    /// a look in the last [`WORDS_LATELY`] found it.
+    pub fn about_file(
+        &mut self,
+        project: &Path,
+        top: &Path,
+        file: &str,
+        asked: &str,
+    ) -> Result<Vec<Listed>> {
+        let name = self.ready(project)?;
+        let now = seconds_since_epoch(SystemTime::now());
+        // Those that may be about it: naming anything, or about it or a
+        // directory it's in, which `about` tells apart.
+        let mut maybe = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM entries e WHERE e.project = ?1 AND e.kind != ?2 AND {} \
+             AND (e.names != '[]' OR EXISTS (SELECT 1 FROM json_each(e.files) f \
+             WHERE substr(?3 || '/', 1, length(rtrim(f.value, '/')) + 1) \
+             = rtrim(f.value, '/') || '/'))",
+            unexpired_sql(4)
+        ))?;
+        let outcome = Kind::Outcome.to_string();
+        let maybe = maybe.query_map(params![name, outcome, file, now], entry_of)?;
+        let maybe: Vec<Entry> = maybe.collect::<rusqlite::Result<_>>()?;
+        let mut code = Code::lately();
+        let mut in_file = None;
+        let mut found = Vec::new();
+        for entry in maybe {
+            let Some(about) = code.about(&entry, project, top, file, &mut in_file) else {
+                continue;
+            };
+            let item = code.listed(entry, project);
+            if item.freshness != Freshness::Stale {
+                found.push((about, item));
+            }
+        }
+        let ids: Vec<u64> = found.iter().map(|(_, item)| item.entry.id).collect();
+        let by_words = self.ranked_among(&name, asked, &ids)?;
+        let mut found = recall_order(found, &by_words);
+        found.truncate(ABOUT_FILE_LIMIT);
+        Ok(found)
+    }
+
+    /// Those of `ids`, entries of the project called `project`, whose words
+    /// match `text`, by id, the best first, as bm25 ranks them.
+    fn ranked_among(&self, project: &str, text: &str, ids: &[u64]) -> Result<Vec<u64>> {
+        let Some(query) = fts_query(text).filter(|_| !ids.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        let mut found = self.conn.prepare(&format!(
+            "SELECT e.id FROM entries_fts JOIN entries e ON e.n = entries_fts.rowid \
+             WHERE entries_fts MATCH ?2 AND e.project = ?1 \
+             AND e.id IN (SELECT value FROM json_each(?3)) ORDER BY {RANK}, e.id DESC"
+        ))?;
+        let ids = serde_json::to_string(ids)?;
+        let found = found.query_map(params![project, query, ids], |row| row.get(0))?;
+        Ok(found.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The entries of `project` that have to do with `text`, of `kind` if
     /// it's given, the best first. By its words, bm25 ranks those with more
     /// of them, and rarer ones, first, then the ones said most recently. Any
@@ -2596,6 +2679,40 @@ fn lessons_first<T>(found: Vec<T>, asked: &str, kind: impl Fn(&T) -> Kind) -> Ve
     ranked.into_iter().map(|(_, _, item)| item).collect()
 }
 
+/// How an entry is about a file, the surest first: see
+/// [`Store::about_file`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum About {
+    /// The file is one of its files, or its text names the file's path.
+    File,
+    /// Its text names something in the file that few other files have.
+    Name,
+    /// One of its files is a directory the file is in.
+    Directory,
+}
+
+/// `found`, entries about a file, each with how it's about it, in the order
+/// an agent reading the file is shown them: see [`Store::about_file`].
+/// `by_words` is those that have to do with what it was asked, by id, the
+/// best first.
+fn recall_order(mut found: Vec<(About, Listed)>, by_words: &[u64]) -> Vec<Listed> {
+    let rank = |id: u64| by_words.iter().position(|ranked| *ranked == id);
+    found.sort_by_key(|(about, item)| {
+        let entry = &item.entry;
+        (
+            !entry.kind.is_lesson(),
+            *about,
+            rank(entry.id).unwrap_or(usize::MAX),
+            Reverse(entry.seen),
+            entry.source.is_crystal(),
+            entry.files.len().max(1),
+            Reverse(entry.last_seen.max(entry.created)),
+            Reverse(entry.id),
+        )
+    });
+    found.into_iter().map(|(_, item)| item).collect()
+}
+
 /// Whether `asked` is about what was done, by one of its words: see
 /// [`WHAT_WAS_DONE`].
 fn about_what_was_done(asked: &str) -> bool {
@@ -2849,6 +2966,15 @@ pub enum Reader {
     Agent,
 }
 
+/// What [`for_launch`] tells a session as it starts, if anything, and the
+/// entries it shows it, by id, which it isn't shown again as it reads
+/// their files: see [`crate::recall`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Launch {
+    pub text: Option<String>,
+    pub shown: Vec<u64>,
+}
+
 /// What a session is told of its project's memory as it starts: the
 /// entries about files its worktree has changed since its base, `changed`,
 /// then those with most to do with what it was asked, `asked`, or else the
@@ -2866,7 +2992,7 @@ pub fn for_launch(
     changed: &[String],
     reader: Reader,
     embedder: Option<&dyn Embed>,
-) -> Result<Option<String>> {
+) -> Result<Launch> {
     let mut store = Store::open(socket)?;
     let mut code = Code::default();
     let about_changes = store.about_files(project, changed, SEARCH_LIMIT)?;
@@ -2880,7 +3006,11 @@ pub fn for_launch(
     if shown.is_empty() {
         shown = launch_order(vec![store.entries(project)?], asked, project, &mut code);
     }
-    Ok(launch_paragraph(&shown, reader))
+    let lines = fitted(&shown);
+    Ok(Launch {
+        shown: lines.iter().map(|(id, _)| *id).collect(),
+        text: launch_paragraph(lines, reader),
+    })
 }
 
 /// The entries a session may be shown as it starts, from `parts`, the most
@@ -2909,19 +3039,18 @@ fn launch_order(
     shown
 }
 
-/// The paragraph [`for_launch`] tells a session, showing it the first of
-/// `shown` that fit, each by its id, to read in full.
-fn launch_paragraph(shown: &[Listed], reader: Reader) -> Option<String> {
+/// The paragraph [`for_launch`] tells a session, showing it `lines`, the
+/// entries that fit, each by its id, to read in full.
+fn launch_paragraph(lines: Vec<(u64, String)>, reader: Reader) -> Option<String> {
     let how_to_add = "When you learn something a later session here should know, like a \
                       decision, a gotcha or a command that works, keep it with \
                       `crystal remember \"<what>\"` (add `-k decision|gotcha|command|note`, and \
                       `-f <file>` for each file it's about).";
-    let lines = fitted(shown);
     if lines.is_empty() {
         return (reader != Reader::Task).then(|| how_to_add.to_string());
     }
     let mut paragraph = String::from("What this project's earlier sessions learned:");
-    for line in lines {
+    for (_, line) in lines {
         paragraph.push_str("\n- ");
         paragraph.push_str(&line);
     }
@@ -2943,10 +3072,11 @@ fn launch_paragraph(shown: &[Listed], reader: Reader) -> Option<String> {
     Some(paragraph)
 }
 
-/// The lines of the first of `shown` that fit at launch: at most
-/// [`SHOWN_AT_LAUNCH`] of them, in [`LAUNCH_BYTES`]. One too long for the
-/// room left is passed over for a shorter one after it.
-fn fitted(shown: &[Listed]) -> Vec<String> {
+/// The lines of the first of `shown` that fit at launch, each with its
+/// entry's id: at most [`SHOWN_AT_LAUNCH`] of them, in [`LAUNCH_BYTES`].
+/// One too long for the room left is passed over for a shorter one after
+/// it.
+fn fitted(shown: &[Listed]) -> Vec<(u64, String)> {
     let mut room = LAUNCH_BYTES;
     let mut lines = Vec::new();
     for item in shown {
@@ -2958,7 +3088,7 @@ fn fitted(shown: &[Listed]) -> Vec<String> {
         let size = line.len() + 3;
         if size <= room {
             room -= size;
-            lines.push(line);
+            lines.push((item.entry.id, line));
         }
     }
     lines
@@ -3189,9 +3319,21 @@ pub fn newly_stale(socket: &Path) -> Result<Vec<(PathBuf, Entry)>> {
 struct Code {
     hashes: HashMap<PathBuf, Option<String>>,
     words: HashMap<PathBuf, Words>,
+    /// The words of each worktree as a look in the last [`WORDS_LATELY`]
+    /// left them, rather than as they are now.
+    lately: bool,
 }
 
 impl Code {
+    /// Code whose worktrees' words are as a look in the last
+    /// [`WORDS_LATELY`] left them: see [`Words::lately`].
+    fn lately() -> Code {
+        Code {
+            lately: true,
+            ..Code::default()
+        }
+    }
+
     fn hash(&mut self, path: PathBuf) -> Option<&String> {
         self.hashes
             .entry(path)
@@ -3213,9 +3355,59 @@ impl Code {
     }
 
     fn words_of(&mut self, top: &Path) -> &Words {
+        let lately = self.lately;
         self.words
             .entry(top.to_path_buf())
-            .or_insert_with_key(|top| Words::of(top))
+            .or_insert_with_key(|top| match lately {
+                true => Words::lately(top, WORDS_LATELY),
+                false => Words::of(top),
+            })
+    }
+
+    /// How `entry` is about `file`, a path from the top of the worktree at
+    /// `top`, if it is: see [`About`]. What it names is counted among the
+    /// files of the worktree it's looked at in, as [`Code::holds`] looks.
+    /// `in_file` is the file's words, read the first time they're needed.
+    fn about(
+        &mut self,
+        entry: &Entry,
+        project: &Path,
+        top: &Path,
+        file: &str,
+        in_file: &mut Option<HashSet<u64>>,
+    ) -> Option<About> {
+        let it = [file.to_string()];
+        let is_it = |path: &String| path.trim_end_matches('/') == file;
+        if entry.files.iter().any(is_it) || entry.names.iter().any(|name| is_one_of(name, &it)) {
+            return Some(About::File);
+        }
+        // What it names that's no path: an identifier, a word joined by
+        // dashes or a long flag. A path is the file's, or another's.
+        let named: Vec<&String> = (entry.names.iter())
+            .filter(|name| !name.contains(['/', '.']))
+            .collect();
+        if !named.is_empty() {
+            let in_file = in_file.get_or_insert_with(|| {
+                let words = file_words(file, Some(&top.join(file)));
+                words.iter().copied().collect()
+            });
+            let words = self.words_of(checked_in(entry, project));
+            let rare = |name: &&String| words.files_with(name) <= RARE_NAME_FILES;
+            if named
+                .iter()
+                .any(|name| has_word(in_file, name) && rare(name))
+            {
+                return Some(About::Name);
+            }
+        }
+        let under = |dir: &String| {
+            let dir = dir.trim_end_matches('/');
+            !dir.is_empty()
+                && file
+                    .strip_prefix(dir)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        };
+        entry.files.iter().any(under).then_some(About::Directory)
     }
 
     /// Whether `entry` still holds, and what's gone: looked at in the
@@ -3224,11 +3416,7 @@ impl Code {
     /// for in the code; or else its anchored files, each changed or gone
     /// counted, a change making it drifting, and every one gone, stale.
     fn holds(&mut self, entry: &Entry, project: &Path) -> (Freshness, Vec<String>) {
-        let checkout = entry
-            .checkout
-            .as_deref()
-            .filter(|checkout| checkout.is_dir())
-            .unwrap_or(project);
+        let checkout = checked_in(entry, project);
         if !entry.names.is_empty() {
             let words = self.words_of(checkout);
             let gone: Vec<String> = (entry.names.iter())
@@ -3273,6 +3461,14 @@ impl Code {
     }
 }
 
+/// The worktree `entry` is checked in: the one it was said in while it's
+/// there, or else `project`, its project's main one.
+fn checked_in<'a>(entry: &'a Entry, project: &'a Path) -> &'a Path {
+    (entry.checkout.as_deref())
+        .filter(|checkout| checkout.is_dir())
+        .unwrap_or(project)
+}
+
 /// The words of a worktree's code, to look the names entries give up in:
 /// those of every file git lists there, those it tracks and the new ones it
 /// doesn't ignore, or outside git, every file under it but the hidden; the
@@ -3297,6 +3493,32 @@ impl Words {
         Words {
             top: top.to_path_buf(),
             words: kept.counts.clone(),
+        }
+    }
+
+    /// [`Words::of`], but as the last look at it left them when that was
+    /// less than `within` ago, without listing its files again.
+    fn lately(top: &Path, within: Duration) -> Words {
+        {
+            let kept = Kept::of(top);
+            let kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
+            if kept.updated.is_some_and(|at| at.elapsed() < within) {
+                return Words {
+                    top: top.to_path_buf(),
+                    words: kept.counts.clone(),
+                };
+            }
+        }
+        Words::of(top)
+    }
+
+    /// How many files have `name`, an identifier, a word joined by dashes
+    /// or a long flag, as [`Words::has`] looks for it.
+    fn files_with(&self, name: &str) -> u32 {
+        let count = |word: &str| (self.words.get(&word_key(word.as_bytes()))).map_or(0, |n| *n);
+        match name.strip_prefix("--") {
+            Some(flag) => count(flag).max(count(&flag.replace('-', "_"))),
+            None => count(name),
         }
     }
 
@@ -3331,6 +3553,8 @@ impl Words {
 struct Kept {
     files: HashMap<String, KeptFile>,
     counts: Arc<HashMap<u64, u32>>,
+    /// When a look last brought it up to date.
+    updated: Option<Instant>,
 }
 
 /// A file's words as a look read them.
@@ -3391,6 +3615,7 @@ impl Kept {
     /// Brings what's kept up to date with `files`, the worktree's files as
     /// they're listed now, in the order they're read.
     fn update(&mut self, top: &Path, files: &[String]) {
+        self.updated = Some(Instant::now());
         let counts = Arc::make_mut(&mut self.counts);
         let now = SystemTime::now();
         let mut room = MAX_WORDS_READ;
@@ -3469,6 +3694,16 @@ fn word_key(word: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     hasher.write(word);
     hasher.finish()
+}
+
+/// Whether `words`, a file's, have `name`, an identifier, a word joined by
+/// dashes or a long flag, as [`Words::has`] looks for it.
+fn has_word(words: &HashSet<u64>, name: &str) -> bool {
+    let has = |word: &str| words.contains(&word_key(word.as_bytes()));
+    match name.strip_prefix("--") {
+        Some(flag) => has(flag) || has(&flag.replace('-', "_")),
+        None => has(name),
+    }
 }
 
 /// What `text` names, as [`names_in`] finds it, but for the paths of
@@ -5422,7 +5657,7 @@ mod tests {
         asked: &str,
         reader: Reader,
     ) -> Result<Option<String>> {
-        for_launch(socket, project, asked, &[], reader, None)
+        Ok(for_launch(socket, project, asked, &[], reader, None)?.text)
     }
 
     #[test]
@@ -5577,6 +5812,7 @@ mod tests {
             answering,
         )
         .unwrap()
+        .text
         .unwrap();
         assert!(
             paragraph.contains("\n- 1 (gotcha) fees are kept in cents"),
@@ -5669,6 +5905,7 @@ mod tests {
             None,
         )
         .unwrap()
+        .text
         .unwrap();
         let lines: Vec<&str> = paragraph.lines().collect();
         assert_eq!(
@@ -5696,9 +5933,14 @@ mod tests {
         let shown = [long(1), long(2), long(3), short(4)];
         let lines = fitted(&shown);
         // The third doesn't fit after two; the shorter one after it does.
-        let ids: Vec<&str> = lines.iter().map(|line| &line[..1]).collect();
-        assert_eq!(ids, ["1", "2", "4"]);
-        let size: usize = lines.iter().map(|line| line.len() + 3).sum();
+        let ids: Vec<u64> = lines.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, [1, 2, 4]);
+        assert!(
+            lines
+                .iter()
+                .all(|(id, line)| line.starts_with(&format!("{id} ")))
+        );
+        let size: usize = lines.iter().map(|(_, line)| line.len() + 3).sum();
         assert!(size <= LAUNCH_BYTES, "{size}");
 
         let many: Vec<Listed> = (1..=9).map(short).collect();
@@ -6299,6 +6541,106 @@ mod tests {
             ..said(Kind::Note, 99)
         };
         assert!(!used.expired(now));
+    }
+
+    #[test]
+    fn a_file_s_entries_are_those_about_it_then_naming_what_s_in_it_then_its_directory() {
+        let (_dir, socket) = socket();
+        let project = tempfile::tempdir().unwrap();
+        let at = project.path();
+        fs::create_dir(at.join("src")).unwrap();
+        let code = [
+            (
+                "src/ledger.rs",
+                "fn round_cents() {}\nfn old_rate() {}\nfn everywhere() {}",
+            ),
+            ("src/fees.rs", "fn fee() { everywhere() }"),
+            ("src/refund.rs", "fn refund() { everywhere() }"),
+        ];
+        for (file, text) in code {
+            fs::write(at.join(file), text).unwrap();
+        }
+        let said = |kind, text: &str, files: &[&str]| New {
+            kind,
+            text: text.to_string(),
+            files: files.iter().map(|file| file.to_string()).collect(),
+            source: Source::User,
+            checkout: Some(at.to_path_buf()),
+        };
+        let ledger = &["src/ledger.rs"];
+        for new in [
+            said(Kind::Note, "the ledger rounds half up", ledger),
+            said(
+                Kind::Gotcha,
+                "the ledger tests need the database up",
+                ledger,
+            ),
+            said(Kind::Gotcha, "Rounding goes through `round_cents`", &[]),
+            said(
+                Kind::Decision,
+                "everything under src is formatted on save",
+                &["src"],
+            ),
+            said(
+                Kind::Gotcha,
+                "`everywhere` is called from every module",
+                &[],
+            ),
+            said(Kind::Gotcha, "fees are kept in cents", &["src/fees.rs"]),
+            said(
+                Kind::Command,
+                "after changing src/ledger.rs run make ledger",
+                &[],
+            ),
+            said(Kind::Outcome, "fix the ledger: done", ledger),
+            said(Kind::Gotcha, "rates go through `old_rate`", ledger),
+            said(Kind::Note, "the ledger was slow once", ledger),
+        ] {
+            add(&socket, at, new).unwrap();
+        }
+        // 9 names only what's gone since: stale. 10 is a note nobody found
+        // again in 40 days: expired.
+        fs::write(
+            at.join("src/ledger.rs"),
+            "fn round_cents() {}\nfn everywhere() {}",
+        )
+        .unwrap();
+        assert_eq!(holds(&socket, at, 9), Freshness::Stale);
+        let mut store = Store::open(&socket).unwrap();
+        (store.conn)
+            .execute(
+                "UPDATE entries SET created = created - ?1, last_seen = last_seen - ?1 \
+                 WHERE id = 10",
+                params![40 * DAY],
+            )
+            .unwrap();
+
+        let about = |store: &mut Store, asked| {
+            let found = store.about_file(at, at, "src/ledger.rs", asked).unwrap();
+            found.iter().map(|item| item.entry.id).collect::<Vec<_>>()
+        };
+        // Lessons first: those about it, by one of their files or naming
+        // its path, then naming what's in it, then about its directory;
+        // then the note. Not what's in every file, not another file's, nor
+        // an outcome, the stale or the expired.
+        assert_eq!(about(&mut store, ""), [7, 2, 3, 4, 1]);
+        // What it was asked puts what has to do with it first among those
+        // as surely about it.
+        assert_eq!(
+            about(&mut store, "why does the database fail"),
+            [2, 7, 3, 4, 1]
+        );
+        // And then what was said again.
+        let again = said(
+            Kind::Gotcha,
+            "the ledger tests need the database up",
+            ledger,
+        );
+        store.add(at, again).unwrap();
+        assert_eq!(about(&mut store, ""), [2, 7, 3, 4, 1]);
+        // A file nothing is about has nothing.
+        let readme = store.about_file(at, at, "README.md", "ledger").unwrap();
+        assert!(readme.is_empty(), "{readme:?}");
     }
 
     #[test]
