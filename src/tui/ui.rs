@@ -1454,23 +1454,28 @@ fn pane_in<'a>(app: &App, panes: &'a [Pane], slot: Slot) -> Option<&'a Pane> {
     panes.iter().find(|pane| pane.session_id == session.id)
 }
 
-/// The search being typed in copy mode, with the cursor in it.
+/// The search being typed in copy mode, with the cursor in it, and what
+/// it has found so far.
 fn draw_search_prompt(frame: &mut Frame, theme: &Theme, prompt: &SearchPrompt, area: Rect) {
-    let label = if prompt.forward {
-        " search down: "
-    } else {
-        " search up: "
-    };
-    let line = Line::from(vec![
+    let label = prompt.label();
+    let mut spans = vec![
         Span::styled(
             label,
             Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(prompt.input.text().to_string(), Style::new().fg(theme.text)),
-    ]);
-    frame.render_widget(line, area);
+        Span::styled(prompt.text().to_string(), Style::new().fg(theme.text)),
+    ];
+    if let Some(count) = prompt.count() {
+        let color = if prompt.matches() {
+            theme.muted
+        } else {
+            theme.failed
+        };
+        spans.push(Span::styled(format!("  {count}"), Style::new().fg(color)));
+    }
+    frame.render_widget(Line::from(spans), area);
     // The label is plain ASCII, so its length in bytes is its width.
-    let column = area.x + (label.len() + prompt.input.cursor()) as u16;
+    let column = area.x + (label.len() + prompt.cursor()) as u16;
     frame.set_cursor_position((column.min(area.right().saturating_sub(1)), area.y));
 }
 

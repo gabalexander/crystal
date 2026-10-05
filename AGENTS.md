@@ -66,9 +66,15 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/attach.rs`: `crystal attach`: draws a session in your terminal and sends it your keys, your terminal
   asked for what its program asked of them (the wheel's arrows only while it's on the alternate screen, your
   terminal's own put back after), attaching again after a handover, and passes its bell and what its program
-  copies on; with `[mouse] attach_capture`, the mouse taken: SGR reports picked out of the keys (one cut off
-  held a moment for its end), handed to a program that asked, the wheel as arrows for a pager or scrolling the
-  session's history, and back to live as you type
+  copies on; the keys it takes for itself, read out of what your terminal sends with the TUI's keymap: the
+  prefix then copy mode's key or the page keys (the prefix twice the program's, and what can follow it said at
+  the top right while it waits), `Shift+PageUp` and `Shift+PageDown`, a `direct+` one, and every key in copy
+  mode, its search typed on the bottom row, and the releases of those keys kept from the program; with `[mouse]
+  attach_capture`, the mouse taken: SGR reports picked out of the keys (one cut off held a moment for its end),
+  handed to a program that asked, a drag selecting (a word on a double-click, a line on a triple-click, the
+  history scrolling under one held on the top or bottom row), copied as it lets go or held in copy mode, the
+  wheel as arrows for a pager or scrolling the session's history, and back to live as you type; what it does
+  with the keys and the mouse kept apart from I/O, so it's unit-tested
 - `src/bell.rs`: passing a session's terminal bell on to the user's own terminal, at most one every half a
   second
 - `src/viewer.rs`: the client's side of an attach, shared by `crystal attach`, the TUI's pane and the streams,
@@ -87,7 +93,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   refusal of a message that only acknowledges (`ok`, `thanks`, `👍`), and the `agent_blocked:` refusal for an
   agent asking the user something; adapted from docket's
 - `src/keys.rs`: turning keys into the bytes a terminal sends: the TUI's keys, and the names `send-keys` takes;
-  the old way, or in the Kitty keyboard protocol once a program has asked for it
+  the old way, or in the Kitty keyboard protocol once a program has asked for it; and back, what a terminal
+  sends read into keys, either way, pastes and the rest, each with its bytes, for `crystal attach`
 - `src/remote.rs`: `crystal ssh`: finds (or installs) crystal on another machine, then runs it there over ssh
 - `src/update.rs`: `crystal update`: the latest release (where GitHub's `releases/latest` redirects, or
   `CRYSTAL_RELEASES`), downloaded with `curl`, checked against its SHA-256, unpacked, tried, and renamed over
@@ -252,9 +259,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     its tags, the tasks started for it and its body
   - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen, with copy mode
     over it while that's on; what the mouse selects on it, by characters, words or lines (`Clicks` counts
-    them), following the history as a drag scrolls it, kept in copy mode without `copy_on_select`, and its
+    them, for `crystal attach` too), following the history as a drag scrolls it, kept in copy mode without `copy_on_select`, and its
     scrollbar's thumb dragged
-  - `copy_mode.rs`: copy mode (`v`): vi's keys over a pane's screen and history, selecting, searching, the
+  - `copy_mode.rs`: copy mode (`v`, and `crystal attach`'s): vi's keys over a screen and its history,
+    selecting, searching as the search is typed (each key from where it began, `Esc` going back there), the
     text to copy, and `o` for the link under the cursor; works on the screen, kept apart from I/O
   - `screen_widget.rs`: draws a session's screen into ratatui, for the panes and `crystal attach`, with the
     link under the mouse underlined
@@ -427,7 +435,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   text a row or a line at a time, with its colors as SGR codes or not, the modes it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
   up (its hyperlinks included), the cells to draw, the input modes `crystal attach` asks your terminal for, and,
   for a viewer, copy mode's cursor, selection (of characters, words, lines or a block) and search, which are
-  Alacritty's vi mode, and the link on a cell: a hyperlink a program wrote (OSC 8), or a URL in the text across
+  Alacritty's vi mode, where a search being typed began (`vt::Spot`, counted from the top of the history, so
+  output meanwhile doesn't move it), to search from at each key and go back to, and the link on a cell: a hyperlink a program wrote (OSC 8), or a URL in the text across
   the rows it wrapped onto, as `vt::Link`; the
   times the program rang the bell; the text it last asked to copy (OSC 52), a read of the clipboard never
   answered; the progress a program reports (OSC 9;4), picked out of its output, which
@@ -591,8 +600,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   fit, or its build failed) or be switched on, switching one in the config's `[plugins]`, or a project's in
   its `[[project]]` table, with `toml_edit`, the plugins running, the context and environment their commands
   run with, each plugin's settings directory (shared, beside the config) and state directory (each server's),
-  a project's kept apart under the project's name and hash, their logs, pausing one that fails, and the plugin
-  a link goes to
+  a project's kept apart under the project's name and hash, their logs, pausing one that fails, the plugin
+  a link goes to, and starting an action in the background, its output in the plugin's log, for the TUI and
+  `crystal attach`
 - `src/plugin_manifest.rs`: a plugin's `plugin.toml` (build and startup commands, actions, events, panes and where
   each is placed, link handlers, `min_crystal_version`, `platforms` and `timeout_secs`), read and checked,
   whether it fits this crystal and this system, and how event patterns match

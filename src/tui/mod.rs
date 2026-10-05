@@ -15,7 +15,7 @@ mod backlog_view;
 mod command_line;
 mod command_list;
 mod compose;
-mod copy_mode;
+pub(crate) mod copy_mode;
 mod diff;
 mod diff_tree;
 mod diff_view;
@@ -37,7 +37,7 @@ mod menu;
 pub(crate) mod mouse;
 mod needs_you;
 pub(crate) mod page;
-mod pane;
+pub(crate) mod pane;
 mod plugins_view;
 mod preview;
 mod profiles;
@@ -2292,8 +2292,8 @@ impl Tui {
                 }
             }
             Action::CopyPaste { slot, text } => {
-                if let Some(copy) = self.pane_in(slot).and_then(|pane| pane.copy.as_mut()) {
-                    copy.on_paste(&text);
+                if let Some(pane) = self.pane_in(slot) {
+                    pane.copy_paste(&text);
                 }
             }
             Action::SelectFrom { slot, cell } => {
@@ -2634,26 +2634,8 @@ impl Tui {
     /// Runs one of a plugin's actions, off the loop, with what it prints in
     /// the plugin's log, and says how it went at the bottom.
     fn run_plugin(&mut self, plugin: &Id, action: &str, context: Context) -> Result<()> {
-        let (dir, manifest) = installed_plugin(plugin)?;
-        let label = plugin.label();
-        let action = manifest
-            .action(action)
-            .cloned()
-            .with_context(|| format!("{label} has no action {action}"))?;
         let context = placed(context)?;
-        plugins::log(
-            &self.socket,
-            plugin,
-            &format!("{}: {}", action.id, action.command.join(" ")),
-        );
-        let log = plugins::open_log(&self.socket, plugin)?;
-        let mut child = plugins::command(plugin, &dir, &action.command, &self.socket, &context)
-            .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log)
-            .spawn()
-            .with_context(|| format!("couldn't run {}", action.command.join(" ")))?;
-        let what = format!("{label}: {}", action.title);
+        let (mut child, what) = plugins::start_action(&self.socket, plugin, action, &context)?;
         let log = format!("crystal plugin log {}{}", plugin.name, plugin.flag());
         let events = self.events.clone();
         thread::spawn(move || {
@@ -2794,7 +2776,7 @@ impl Tui {
     /// zoomed, or in a tab of its own, the way the layout commands of
     /// `crystal plugin pane open` place it.
     fn open_plugin_pane(&mut self, plugin: &Id, pane: &str, context: Context) -> Result<()> {
-        let (dir, manifest) = installed_plugin(plugin)?;
+        let (dir, manifest) = plugins::ready(plugin)?;
         let label = plugin.label();
         let spec = manifest
             .panes
@@ -3164,28 +3146,6 @@ fn plugin_keys(config: &Config) -> Vec<PluginKey> {
         }
     }
     keys
-}
-
-/// The installed plugin called `name`, when it can run here: its
-/// directory and manifest.
-fn installed_plugin(id: &Id) -> Result<(PathBuf, crate::plugin_manifest::Manifest)> {
-    let label = id.label();
-    if id.project.is_none() {
-        plugins::ensure_enabled(&Config::load()?, &id.name)?;
-    } else if !plugins::is_on(&Config::load()?, id) {
-        bail!(
-            "{label} is off: `crystal plugin enable {} --project` turns it on",
-            id.name
-        );
-    }
-    let plugin = plugins::find_id(id).with_context(|| format!("there's no plugin {label}"))?;
-    if let Some(why) = plugin.blocked() {
-        bail!("{label} can't run: {why}");
-    }
-    let manifest = plugin
-        .manifest
-        .map_err(|why| anyhow::anyhow!("{label}'s plugin.toml: {why}"))?;
-    Ok((plugin.dir, manifest))
 }
 
 /// Refuses to switch on the plugin `id`, saying why, when it can't run

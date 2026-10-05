@@ -482,9 +482,9 @@ pub struct MouseSettings {
     /// clicks, and those it hands the programs in panes that ask. Off, the
     /// terminal it runs in keeps them, for its own selection.
     pub capture: bool,
-    /// Whether what the mouse selects in a pane goes to the clipboard as
-    /// the button comes up. Off, it stays selected in copy mode, for `y` to
-    /// copy.
+    /// Whether what the mouse selects in a pane, or in `crystal attach`
+    /// while it takes the mouse, goes to the clipboard as the button comes
+    /// up. Off, it stays selected in copy mode, for `y` to copy.
     pub copy_on_select: bool,
     /// How many lines a notch of the wheel scrolls a pane through its
     /// history.
@@ -493,10 +493,10 @@ pub struct MouseSettings {
     /// shows where in its history the pane is and drags to scroll it.
     pub scrollbars: bool,
     /// Whether `crystal attach` takes the mouse: the wheel scrolls the
-    /// session's history on its main screen, and a program that asks gets
-    /// the mouse, through any terminal. Off, the terminal keeps it, for its
-    /// own selection, and only sends a program on the alternate screen the
-    /// wheel as arrow keys.
+    /// session's history on its main screen, a drag selects, as in a pane,
+    /// and a program that asks gets the mouse, through any terminal. Off,
+    /// the terminal keeps it, for its own selection, and only sends a
+    /// program on the alternate screen the wheel as arrow keys.
     pub attach_capture: bool,
 }
 

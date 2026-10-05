@@ -262,7 +262,11 @@ you scroll, though that leaves the wheel nothing to do there. With `attach_captu
 attach takes the mouse itself, as the TUI does, which works in a terminal that has no alternate scroll too: a
 program that asks for the mouse gets it, a pager the arrow keys, and anywhere else the wheel scrolls the
 session's history, from before you attached as well, the top right saying how far back (`↑ 120 lines`) until
-you type. Your terminal's own selection then takes a key held, as in the TUI.
+you type. A drag selects as it does in a pane, a double-click a word and a triple-click a line, and held on the
+top or bottom row it scrolls the history under the selection. What it selected goes to your clipboard as you
+let go and stays marked until you type, or with `copy_on_select = false` waits in
+[copy mode](#zoom-copy-mode-and-search) for `y`. Your terminal's own selection then takes a key held, as in the
+TUI.
 
 Beside each pane's screen, in a column of its own, a scrollbar shows where in its history the pane is, once it
 has some: drag its thumb to scroll, or click the track and the thumb jumps there. The wheel over it scrolls the
@@ -282,8 +286,9 @@ underlined. It opens in your browser, with `open` on macOS or `xdg-open` on Linu
 [plugin takes links like it](#link-handlers). Over ssh a browser opened on the other machine would be no use to
 you, so the link goes on your clipboard instead, as copying does. Your terminal has to hand the click to
 crystal: macOS's Terminal keeps `Ctrl`+click for its own menu, and iTerm2 does unless you turn that off in its
-settings. Copy mode's `o` opens the link under its cursor, from the keyboard. In `crystal attach`, links are
-your terminal's to open, as it finds them in the text.
+settings. Copy mode's `o` opens the link under its cursor, from the keyboard. In `crystal attach`, a click on a
+link is your terminal's to open, as it finds them in the text, and copy mode's `o` opens the one under its
+cursor as the TUI does.
 
 A split keeps a session on screen while the selection moves on. `s` splits the selected session off into a
 pane of its own: it stays where it is, and the pane that follows the selection takes the other half, to show
@@ -609,6 +614,13 @@ The first `crystal new` starts the daemon. Sessions keep running after you detac
 `crystal attach` picks up exactly where the screen was. With no name it attaches to the newest session; on a
 session that has ended, it prints the last screen and how the program exited.
 
+In `crystal attach` a few keys are crystal's, as they are in a pane: `Ctrl+\` detaches, and the prefix, `Ctrl+B`,
+then `v` puts the screen in [copy mode](#zoom-copy-mode-and-search), with the search typed on its bottom row and
+what it says at its top right. `PageUp` or `PageDown` after the prefix, or `Shift+PageUp` and `Shift+PageDown`,
+page through the session's history, from before you attached as well, until you type. The prefix twice sends
+the program the prefix, and while it waits, the top right says what can follow it. They're the keys `[keys]`
+gives `prefix`, `copy`, `page-up` and `page-down`, and one written `direct+` works without the prefix.
+
 If the daemon dies without being asked to, because it crashed or the machine rebooted, the next `crystal` starts
 the sessions that were running again, in the same directories and in their places in the list. Claude Code and
 Codex come back in the conversation they were in. Shells and other programs start straight away, and so does
@@ -902,6 +914,7 @@ or not on its own, and stays that way when you open the TUI again.
 `v` puts the selected session's pane in copy mode: a cursor of its own that moves over the screen and back
 through the history with vi's keys, while the program goes on running and its output goes on showing. It
 works on a session that has ended too, on the last it showed. `Ctrl+\` leaves copy mode for the sidebar.
+`crystal attach` has copy mode too: `Ctrl+B` then `v`, and there `Ctrl+\` detaches.
 
 | Key | In copy mode |
 |---|---|
@@ -916,16 +929,19 @@ works on a session that has ended too, on the last it showed. `Ctrl+\` leaves co
 | `v` or `Space` / `V` / `Ctrl+V` | select from here as the cursor moves: characters, whole lines, or a block |
 | `y` or `Enter` | copy the selection, and leave copy mode |
 | `Y` | copy the line the cursor is on, and leave copy mode |
-| `/` / `?` | search down, or up, for what you type next; `Enter` searches |
+| `/` / `?` | search down, or up, as you type: each key goes to the nearest match; `Enter` keeps it, `Esc` goes back |
 | `n` / `N` | the next match the same way, or the other way |
 | `o` | open the link under the cursor, as `Ctrl`+click does, and leave copy mode |
 | `Esc` | drop the selection, then the search, then leave copy mode |
 | `q`, `Ctrl+C` | leave copy mode |
 
 A search finds what you type as it's written, letter for letter, across lines that wrapped, and ignores case
-unless you type a capital. Every match on screen is marked, the one the cursor is on most of all, and the
-footer says which it is: `of: 3 of 12`, counted from the top of the history. A search goes round: down past the
-last match, it starts again at the top.
+unless you type a capital. It searches as you type: at each key the cursor goes to the nearest match from where
+it was when you pressed `/` or `?`, that way, or back there while nothing matches, and every match on screen is
+marked, the one the cursor is on most of all. The search line says which it is, `3 of 12`, counted from the top
+of the history, or `no match`. `Enter` keeps it, and the footer says it again (`of: 3 of 12`); `Esc` goes back
+to where the search began, and to the search before, for `n`. A search goes round: down past the last match,
+it starts again at the top.
 
 What you copy goes to your clipboard. On your own machine crystal hands it to `pbcopy` on macOS, or to
 `wl-copy`, `xclip` or `xsel` on Linux. Over ssh, or with none of those, it asks the terminal you're in to take
@@ -2988,7 +3004,7 @@ that makes no sense is said there too, and the settings stay as they were until 
 | `[window]` | | `title`, what the TUI titles its terminal: [the window](#terminals-the-window-and-the-tab-bar) |
 | `[tab_bar]` | | where the tab bar goes, whether it's left out with one tab, and what it shows at its right: [the tab bar](#terminals-the-window-and-the-tab-bar) |
 | `[appearance]` | | `auto_switch`, the theme following your system's light or dark, and the theme for each: [themes](#themes) |
-| `[mouse]` | | `capture`, whether the TUI takes the mouse from your terminal (`true`); `copy_on_select`, whether a selection is copied as you let go or waits in copy mode for `y` (`true`); `scroll_lines`, how far a notch of the wheel scrolls a pane, up to 100, or how many arrow keys it sends a pager (`3`); `scrollbars`, a scrollbar beside each pane (`true`); `attach_capture`, whether `crystal attach` takes the mouse, for the wheel to scroll a session's history (`false`): [the mouse](#usage) |
+| `[mouse]` | | `capture`, whether the TUI takes the mouse from your terminal (`true`); `copy_on_select`, whether a selection is copied as you let go or waits in copy mode for `y` (`true`); `scroll_lines`, how far a notch of the wheel scrolls a pane, up to 100, or how many arrow keys it sends a pager (`3`); `scrollbars`, a scrollbar beside each pane (`true`); `attach_capture`, whether `crystal attach` takes the mouse, for the wheel to scroll a session's history and a drag to select (`false`): [the mouse](#usage) |
 | `[clipboard]` | | `allow_programs`, whether what a program in a session copies goes on your clipboard (`true`): [copying](#zoom-copy-mode-and-search) |
 | `[update]` | | `check`, whether the TUI looks once a day for a [newer crystal](#updating) (`true`) |
 
@@ -3014,7 +3030,7 @@ each time one starts, `[[project]]` each time a project's commands run,
 `scrollback_lines` as each session starts and `mermaid_ascii` as each session starts and each background task's
 run does, so a change counts straight away (a session already running keeps
 what it had); `crystal new` and the TUI read `[terminal]` each time they start a shell, and `crystal attach`
-reads `[clipboard]` as it attaches; the TUI reads
+reads `[clipboard]`, `[mouse]`, `[keys]` and `scrollback_lines` as it attaches; the TUI reads
 `new_session`, `theme`, `[colors]`, `[appearance]`, `[window]`, `[tab_bar]`, `scrollback_lines`, `mermaid_ascii`,
 `[plugins]`, `[update]`, `[mouse]`, `[clipboard]`, `[forge]`, `confirm_quit`, `show_keys`, the profiles and the
 flows when it starts, again when you save a profile or switch a plugin, and every half a second while the

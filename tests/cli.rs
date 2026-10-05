@@ -951,6 +951,84 @@ fn attach_taking_the_mouse_hands_it_to_a_program_that_asked_written_its_way() {
 }
 
 #[test]
+fn attach_has_copy_mode_after_the_prefix_and_its_search_goes_as_you_type() {
+    let crystal = Crystal::new();
+    let script = "for i in $(seq 1 60); do echo row $i; done; echo the needle is here; \
+                  for i in $(seq 61 120); do echo row $i; done; read line; echo \"got $line\"; \
+                  sleep 30";
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", script]);
+    crystal.ok(&["wait", "printer", "--output", "row 120"]);
+
+    let over_ssh = [("SSH_TTY", "/dev/ttys999")];
+    let mut terminal = crystal.attach_with_env(&["attach", "printer"], &over_ssh);
+    terminal.shows("row 120");
+    terminal.type_keys("\x02");
+    terminal.shows("ctrl+b … v copy mode");
+    terminal.type_keys("v");
+    terminal.shows("copy mode");
+    terminal.hides("ctrl+b …");
+
+    // The search goes to the nearest match as it's typed, and Esc goes
+    // back to where it began.
+    terminal.type_keys("?row 5");
+    terminal.shows("search up: row 5  11 of 11");
+    terminal.shows("copy mode · ↑");
+    terminal.type_keys("\x1b");
+    terminal.hides("search up");
+    terminal.hides("↑");
+    terminal.type_keys("?needle");
+    terminal.shows("search up: needle  1 of 1");
+    terminal.shows("the needle is here");
+    terminal.type_keys("\r");
+    terminal.shows("copy mode · needle: 1 of 1");
+
+    // The search left the cursor on "needle": select to the end of the
+    // line, and copy it, which ends copy mode.
+    terminal.type_keys("v$y");
+    terminal.copies("needle is here");
+    terminal.shows("copied 1 line");
+    terminal.hides("copy mode");
+    // Typing goes to the program again, and brings the screen back.
+    terminal.type_keys("hi\r");
+    terminal.shows("got hi");
+    terminal.hides("copied");
+
+    terminal.type_keys("\x1c");
+    terminal.shows("[detached from printer]");
+}
+
+#[test]
+fn attach_taking_the_mouse_selects_with_a_drag_and_copies_it() {
+    let crystal = Crystal::new();
+    crystal.configure(ATTACH_TAKES_THE_MOUSE);
+    let script = "echo alpha beta gamma; sleep 30";
+    crystal.ok(&["new", "-n", "words", "sh", "-c", script]);
+
+    let over_ssh = [("SSH_TTY", "/dev/ttys999")];
+    let mut terminal = crystal.attach_with_env(&["attach", "words"], &over_ssh);
+    terminal.shows("alpha beta gamma");
+    eventually("the mouse is taken", || terminal.sends_the_mouse());
+    // "beta" is at columns 7 to 10 of the top row, counting from 1 as the
+    // mouse does. Down on its first letter, drag to its last, and let go.
+    terminal.type_keys("\x1b[<0;7;1M\x1b[<32;10;1M\x1b[<0;10;1m");
+    terminal.copies("beta");
+    terminal.shows("copied 1 line");
+    terminal.type_keys("\x1c");
+    terminal.shows("[detached from words]");
+    drop(terminal);
+
+    // Without copy_on_select, what's selected waits in copy mode for y.
+    crystal.configure(&format!("{ATTACH_TAKES_THE_MOUSE}copy_on_select = false\n"));
+    let mut terminal = crystal.attach_with_env(&["attach", "words"], &over_ssh);
+    terminal.shows("alpha beta gamma");
+    eventually("the mouse is taken", || terminal.sends_the_mouse());
+    terminal.type_keys("\x1b[<0;12;1M\x1b[<32;16;1M\x1b[<0;16;1m");
+    terminal.shows("copy mode");
+    terminal.type_keys("y");
+    terminal.copies("gamma");
+}
+
+#[test]
 fn attach_detaches_on_ctrl_backslash_in_the_kitty_keyboard_protocol() {
     let crystal = Crystal::new();
     let script = r"printf '\033[>1ukitty'; sleep 30";
@@ -1939,10 +2017,11 @@ fn copy_mode_finds_text_in_the_history_and_copies_it() {
     tui.shows("row 120");
     tui.type_keys("v");
     tui.shows("copying from printer");
+    // The search goes to what it finds as it's typed, before Enter.
     tui.type_keys("?needle");
-    tui.shows("search up: needle");
-    tui.type_keys("\r");
+    tui.shows("search up: needle  1 of 1");
     tui.shows("the needle is here");
+    tui.type_keys("\r");
     tui.shows("needle: 1 of 1");
 
     // The search left the cursor on "needle": select to the end of the

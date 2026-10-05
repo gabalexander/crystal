@@ -217,9 +217,36 @@ impl Link {
 
 /// A search through the screen and its history.
 struct Search {
+    /// What was searched for, as it was typed.
+    text: String,
     /// Alacritty's search, which keeps a cache as it goes, and so is
     /// borrowed mutably even to draw the matches.
     regex: RefCell<RegexSearch>,
+}
+
+impl Search {
+    fn new(text: &str) -> Option<Search> {
+        let regex = RegexSearch::new(&literal(text)).ok()?;
+        Some(Search {
+            text: text.to_string(),
+            regex: RefCell::new(regex),
+        })
+    }
+}
+
+/// Where copy mode was as a search started being typed, for the search to
+/// start from at each key and to go back to: its cursor and how far back
+/// the view was, each counted from the top of the history, which output
+/// coming meanwhile doesn't move, and the search before.
+#[derive(Debug)]
+pub struct Spot {
+    /// The cursor's row from the top of the history, and its column.
+    cursor: (usize, usize),
+    /// The top row showing, from the top of the history, or `None` while
+    /// the view is live, which it stays as output comes.
+    view: Option<usize>,
+    /// What the search before searched for.
+    search: Option<String>,
 }
 
 /// A move of copy mode's cursor, as vi has it.
@@ -1025,10 +1052,55 @@ impl Screen {
     /// not `forward`, and puts the cursor on what it finds. Upper and
     /// lower case are the same unless `text` has a capital letter.
     pub fn search(&mut self, text: &str, forward: bool) -> Option<Found> {
-        self.search = RegexSearch::new(&literal(text)).ok().map(|regex| Search {
-            regex: RefCell::new(regex),
-        });
+        self.search = Search::new(text);
         self.search_again(forward)
+    }
+
+    /// Where copy mode is, and the search it has, to search from as a
+    /// search is typed and to go back to.
+    pub fn spot(&self) -> Spot {
+        let history = self.history();
+        let point = self.term.vi_mode_cursor.point;
+        let row = (point.line.0 + history as i32).max(0) as usize;
+        let back = self.scrolled_back();
+        Spot {
+            cursor: (row, point.column.0),
+            view: (back > 0).then(|| history.saturating_sub(back)),
+            search: self.search.as_ref().map(|search| search.text.clone()),
+        }
+    }
+
+    /// Puts copy mode's cursor and the view back where they were at
+    /// `spot`, and the search it had.
+    pub fn go_back(&mut self, spot: &Spot) {
+        self.search = spot.search.as_deref().and_then(Search::new);
+        self.go_back_to(spot);
+    }
+
+    /// Searches for `text` as [`Screen::search`] does, from where copy
+    /// mode's cursor was at `spot`: as a search is typed, a key at a time,
+    /// the cursor goes to the match nearest that, or back there when
+    /// nothing matches. With no `text`, it's all as it was at `spot`.
+    pub fn search_from(&mut self, spot: &Spot, text: &str, forward: bool) -> Option<Found> {
+        if text.is_empty() {
+            self.go_back(spot);
+            return None;
+        }
+        self.go_back_to(spot);
+        self.search(text, forward)
+    }
+
+    /// Puts copy mode's cursor and the view back where they were at
+    /// `spot`, leaving the search.
+    fn go_back_to(&mut self, spot: &Spot) {
+        let history = self.history();
+        let back = spot.view.map_or(0, |top| history.saturating_sub(top));
+        let by = back as isize - self.scrolled_back() as isize;
+        self.scroll_back(by);
+        let (row, column) = spot.cursor;
+        let line = Line(row as i32 - history as i32);
+        let point = Point::new(line, Column(column)).grid_clamp(&self.term, Boundary::Grid);
+        self.term.vi_goto_point(point);
     }
 
     /// Finds the next match of the last search past copy mode's cursor,
@@ -1606,14 +1678,15 @@ pub struct InputModes {
 }
 
 impl InputModes {
-    /// These, with the mouse taken for whoever draws the program: presses
-    /// and releases at least, as the program asked for more, written the
-    /// SGR way whichever way it asked for them, to be read and written
-    /// again its way. The wheel never sends the arrow keys itself.
+    /// These, with the mouse taken for whoever draws the program: presses,
+    /// releases and drags at least, to select with, as the program asked
+    /// for more, written the SGR way whichever way it asked for them, to be
+    /// read and written again its way. The wheel never sends the arrow keys
+    /// itself.
     pub fn taking_the_mouse(mut self) -> InputModes {
         for (&mode, on) in INPUT_MODES.iter().zip(&mut self.modes) {
             match mode {
-                mode::MOUSE_NORMAL | mode::MOUSE_SGR => *on = true,
+                mode::MOUSE_NORMAL | mode::MOUSE_BUTTON | mode::MOUSE_SGR => *on = true,
                 mode::MOUSE_UTF8 | mode::ALTERNATE_SCROLL => *on = false,
                 _ => {}
             }
@@ -2106,15 +2179,15 @@ mod tests {
         let changes = taken.changes_from(&none);
         assert_eq!(
             String::from_utf8(changes).unwrap(),
-            "\x1b[?1000h\x1b[?1006h"
+            "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
         );
 
-        // Drags as the program asks for them, but never its UTF-8, nor the
-        // wheel's arrows.
-        screen.process(b"\x1b[?1049h\x1b[?1002h\x1b[?1005h");
+        // Every move as the program asks for them, but never its UTF-8, nor
+        // the wheel's arrows.
+        screen.process(b"\x1b[?1049h\x1b[?1003h\x1b[?1005h");
         let program = screen.input_modes().taking_the_mouse();
         let changes = program.changes_from(&taken);
-        assert_eq!(String::from_utf8(changes).unwrap(), "\x1b[?1002h");
+        assert_eq!(String::from_utf8(changes).unwrap(), "\x1b[?1003h");
     }
 
     #[test]
@@ -2421,6 +2494,57 @@ mod tests {
         assert_eq!(screen.search("Cost", false).map(|f| f.of), Some(1));
         assert_eq!(screen.search("nowhere", false), None);
         assert_eq!(screen.search_again(true), None);
+    }
+
+    #[test]
+    fn a_search_typed_a_key_at_a_time_goes_from_where_it_began_each_time() {
+        let mut screen = copying();
+        let spot = screen.spot();
+        screen.search_from(&spot, "line", false).unwrap();
+        assert_eq!(screen.copy_cursor_line(), "line 9 of ten");
+        let found = screen.search_from(&spot, "line 4", false).unwrap();
+        assert_eq!(found, Found { number: 1, of: 1 });
+        assert_eq!(screen.copy_cursor_line(), "line 4 of ten");
+        assert_eq!(screen.scrolled_back(), 3);
+        // Back to "line", it's line 9 again, the nearest to where the
+        // search began rather than to line 4.
+        screen.search_from(&spot, "line", false).unwrap();
+        assert_eq!(screen.copy_cursor_line(), "line 9 of ten");
+        assert_eq!(screen.search_from(&spot, "line 44", false), None);
+        assert_eq!(screen.copy_cursor_line(), "");
+        assert_eq!(screen.scrolled_back(), 0);
+        assert!(screen.searched(), "no match, but marked as searched");
+        // Nothing typed, it's all as it was.
+        assert_eq!(screen.search_from(&spot, "", false), None);
+        assert!(!screen.searched());
+    }
+
+    #[test]
+    fn going_back_puts_the_cursor_the_view_and_the_search_before_back() {
+        let mut screen = copying();
+        screen.search("of", false).unwrap();
+        screen.page_copy_cursor(2);
+        let spot = screen.spot();
+        let (back, line) = (screen.scrolled_back(), screen.copy_cursor_line());
+        assert_eq!((back, line.as_str()), (2, "line 7 of ten"));
+
+        screen.search_from(&spot, "line 0", false).unwrap();
+        assert_eq!(screen.scrolled_back(), 7);
+        // Output coming while it's typed moves neither back.
+        screen.process(b"line 10 of ten\r\nline 11 of ten\r\n");
+        screen.go_back(&spot);
+        assert_eq!(screen.scrolled_back(), 4, "the same rows, two more below");
+        assert_eq!(screen.copy_cursor_line(), "line 7 of ten");
+        assert_eq!(screen.search_again(false).unwrap().of, 12, "of, again");
+
+        // A view that was live stays live, its cursor on the row it was.
+        screen.move_copy_cursor(Motion::HistoryBottom);
+        let spot = screen.spot();
+        screen.search_from(&spot, "line 1 ", false).unwrap();
+        screen.process(b"line 12 of ten\r\n");
+        screen.go_back(&spot);
+        assert_eq!(screen.scrolled_back(), 0);
+        assert_eq!(screen.copy_cursor_line(), "line 12 of ten");
     }
 
     #[test]
