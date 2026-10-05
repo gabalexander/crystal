@@ -40,7 +40,8 @@ crystal worktree move fix/login
 It takes the project's worktree on that branch, or makes one (a made-up branch with no name given; `--base
 HEAD` to start from your commits). Run it once, then end your turn at once, saying in a line that you're
 moving: crystal stops you when the turn ends and starts you again in the worktree, in this conversation, with
-a prompt to carry on there. If it fails, say why and carry on where you are. `-n <name>` moves another session.
+a prompt to carry on there. If it fails, say why and carry on where you are. `-n <name>` moves another session,
+a background task too, once its run ends.
 
 `crystal worktree list` shows the project's worktrees and the sessions in each; `crystal worktree create
 <branch>` makes one and prints its directory (`--label "what it's for"` names it in the sidebar).
@@ -262,7 +263,9 @@ crystal worktree rm fix/login
 ```
 
 `worktree rm` refuses while a session still runs there, and when the worktree has uncommitted changes.
-`--force` removes it with them, and they're lost: use it only when the user says so.
+`--force` removes it with them, and they're lost: use it only when the user says so. `crystal kill reviewer
+--remove-worktree` takes the worktree it was the last session in with it, the same way; without it, `kill`
+keeps that worktree and says how to remove it.
 
 ## Remember what you learned
 

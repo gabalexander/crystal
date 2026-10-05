@@ -151,6 +151,9 @@ pub struct Session {
     shown: report::Shown,
     /// crystal stopped it after its agent sat idle: see [`Session::idle_for`].
     stopped_idle: bool,
+    /// crystal stopped it to start it again in another worktree: see
+    /// [`Session::stop_to_move`].
+    stopped_to_move: bool,
     /// Tasks that closed of themselves, like a background task whose run
     /// ended, for the daemon to write down.
     closed: Vec<TaskRecord>,
@@ -311,6 +314,7 @@ impl Handed {
             goal: self.goal.clone(),
             resume,
             about: self.about.clone(),
+            moved: None,
         })
     }
 }
@@ -420,6 +424,7 @@ impl Session {
             model,
             shown: report::Shown::default(),
             stopped_idle: false,
+            stopped_to_move: false,
             closed: Vec::new(),
             changes: Vec::new(),
             start_from: None,
@@ -489,6 +494,7 @@ impl Session {
             model: model::Watch::default(),
             shown: report::Shown::default(),
             stopped_idle: false,
+            stopped_to_move: false,
             closed: Vec::new(),
             changes: Vec::new(),
             start_from: None,
@@ -556,6 +562,7 @@ impl Session {
             model: model::Watch::new(&saved.command),
             shown: report::Shown::default(),
             stopped_idle: false,
+            stopped_to_move: false,
             closed: Vec::new(),
             changes: Vec::new(),
             start_from: Some(saved),
@@ -980,6 +987,13 @@ impl Session {
         self.stop();
     }
 
+    /// Stops the session to start it again in another worktree, under its
+    /// id: its task stays open meanwhile, to carry on there.
+    pub fn stop_to_move(&mut self) {
+        self.stopped_to_move = true;
+        self.stop();
+    }
+
     /// Takes what the session's agent says about itself with `crystal
     /// report`, sent by `source` and numbered `seq` when it says so. Its
     /// first report of what it's doing takes the session's status over; a
@@ -1350,8 +1364,9 @@ impl Session {
     fn fail_task_if_ended(&mut self) {
         let open = self.goal.as_ref().is_some_and(TaskInfo::is_open);
         // One yet to start again hasn't ended: its task goes on once it
-        // has.
-        if !open || self.is_running() || self.is_unstarted() || !tasks_on() {
+        // has. Nor has one stopped to start again in another worktree.
+        let ending = !self.is_running() && !self.is_unstarted() && !self.stopped_to_move;
+        if !open || !ending || !tasks_on() {
             return;
         }
         let why = format!("its session ended: {}", self.state.lock().unwrap());
@@ -1639,6 +1654,7 @@ impl Session {
             goal: self.goal.clone(),
             resume,
             about: self.about.clone(),
+            moved: None,
         }
     }
 
@@ -1780,6 +1796,7 @@ impl Session {
             model: handed.model,
             shown: handed.shown,
             stopped_idle: handed.stopped_idle,
+            stopped_to_move: false,
             closed: Vec::new(),
             changes: Vec::new(),
             start_from: None,
@@ -2495,6 +2512,7 @@ mod tests {
             }),
             resume: None,
             about: Default::default(),
+            moved: None,
         }
     }
 

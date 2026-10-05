@@ -133,7 +133,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     resting on one out of sight; the forge's lists, one asked before the one kept dropped, and the issues
     edited in the issues view laid over what was asked before the forge saved them; the worktrees being
     removed, for this TUI and for anyone else, as the daemon lists them; killing the last session in a linked
-    worktree asking whether the worktree goes too; `q` asking first (`confirm_quit`); `D` opening the
+    worktree, or closing a tab with the last in some, asking whether they go too once the event loop has
+    asked the daemon what's archived there, as `[worktrees] remove_emptied` says; the footer's questions
+    waiting their turn; `q` asking first (`confirm_quit`); `D` opening the
     new-session panel like the selected session; `+`'s question, its `Tab` handed to the event loop to finish
     the directory; what crystal's processes take, and where the footer drew its readout of it, for a click;
     no I/O, so it's unit-tested
@@ -330,9 +332,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     being removed listed for anyone who asks, as each TUI does; one in flight handed over with its git still
     running, which the next daemon waits for, then has git try again if the worktree is still there
   - `daemon/moving.rs`: moving a session into another worktree of its project, for `crystal worktree move`:
-    its program stopped once its agent's turn is over (never reminded of its task meanwhile), then started
-    again there in its place, under its name and id, an agent in its conversation and told where it is now,
-    or failed, saying why; the moves still to come handed over
+    its program stopped once its agent's turn is over, or a background task's run (never reminded of its
+    task meanwhile, which stays open), then started again there in its place, under its name and id, an
+    agent in its conversation and told where it is now, a task told with a follow-up, or failed, saying
+    why; the moves still to come handed over, and written down with the sessions as they'll be there, for a
+    cold restart to start them there
 - `src/worktree_hooks.rs`: the worktree hooks, `crystal.worktreeCreateHook` and `crystal.worktreeDeleteHook`
   in git config (adapted from docket's): run on `worktree.created` and `worktree.removed` from the daemon's
   bus, one at a time, as they're named with the main worktree and the worktree, their output in a log, stopped
@@ -477,7 +481,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/state.rs`: where the daemon's state is: a server's directory in the state dir (the default server's is
   the state dir itself), or beside a socket given by its path; the database, the directory of the files each
   task kept, and the files kept before the database (the sessions, the flow runs, each project's directory); a
-  running session as it's written down to start it again
+  running session as it's written down to start it again, and the worktree it was on its way into
 - `src/server_cli.rs`: `crystal server`: every server with whether it's running and how many sessions it has,
   stopping one, and deleting a stopped one's state
 - `src/db.rs`: the SQLite database the daemon and the TUI keep their state in (WAL, `synchronous=NORMAL`,
@@ -513,7 +517,12 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   task started for one is asked; its markdown export and reading a markdown list of checkboxes back, and
   `enabled`, the one gate everything the backlog adds goes through
 - `src/worktree_cli.rs`: `crystal worktree list`, `create`, `open` (finding the worktree; `main.rs` starts the
-  session), `label` and `move`, which makes the worktree a session moves into when there's none
+  session), `label` and `move`, which makes the worktree a session moves into when there's none; and `crystal
+  kill`, which asks at the terminal whether the worktree it empties goes too, says how to remove it with
+  nobody there to ask, or does as `--remove-worktree`, `--keep-worktree` or the settings say
+- `src/emptied.rs`: the linked worktrees killing sessions leaves with nothing in them, the archived sessions
+  that ran in each, the question whether they go too, and what `[worktrees] remove_emptied` makes of it,
+  for the TUI and `crystal kill`; pure, so it's unit-tested
 - `src/work.rs`: `crystal done` (with `--artifact`), `handoff`, `tasks` and its commands (`new`, `start`, `show`,
   `cancel`, `log`, `terminal`), reading what a new task carries (`--accept`, and `--pr` and `--issue` from the
   forge, a pull request's worktree found or made), and `backlog` with its commands, an item's card with the
@@ -523,7 +532,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   names, the colors `[colors]` takes, what the mouse does (`[mouse]`) and whether programs' copies go on the
   clipboard (`[clipboard]`); what background tasks may spend and do unasked (`[tasks]`); the shell a new terminal runs
   (`[terminal]`, `-l` for a login shell) and where the TUI starts one, the window's title, the tab bar and
-  the appearance; where new worktrees start and go (`[worktrees]`); and the settings view's edits to the
+  the appearance; where new worktrees start and go, and what's done with one emptied (`[worktrees]`); and the
+  settings view's edits to the
   file (`apply`), several at once, a line set or taken out for its default, the rest of the file as the user
   wrote it, written only if what they come to is read
 - `src/memory.rs`: what a project's sessions learned: the SQLite store in the state directory with its FTS5

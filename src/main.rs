@@ -23,6 +23,7 @@ mod db;
 mod distill;
 mod drive;
 mod embed;
+mod emptied;
 mod env;
 mod event_log;
 mod events;
@@ -682,8 +683,23 @@ enum Command {
     /// that couldn't start again after a restart tries again.
     Respawn { name: String },
     /// Stop a session and remove it from the list. An archived one is
-    /// taken out of the archive.
-    Kill { name: String },
+    /// taken out of the archive. Killing the last session in a linked
+    /// worktree asks at the terminal whether the worktree goes too, unless
+    /// `[worktrees] remove_emptied` says otherwise.
+    Kill {
+        name: String,
+
+        /// Remove the linked worktree it was the last session in, without
+        /// asking: not one with changes not committed, unless you say so at
+        /// the terminal.
+        #[arg(long, conflicts_with = "keep_worktree")]
+        remove_worktree: bool,
+
+        /// Keep the linked worktree it was the last session in, without
+        /// asking.
+        #[arg(long)]
+        keep_worktree: bool,
+    },
     /// Stop sessions and keep them in the archive, out of the list, to
     /// start again where they were with `unarchive`: an agent in its
     /// conversation. `ls --archived` lists them.
@@ -1673,8 +1689,9 @@ enum WorktreeCommand {
     },
     /// Move a session into a worktree of its project: its program stops
     /// and starts again there, an agent in its conversation, told where it
-    /// is now. One in the middle of a turn moves once the turn ends, so an
-    /// agent asked to work in a worktree runs this and ends its turn.
+    /// is now, a background task with a follow-up. One in the middle of a
+    /// turn, or a run, moves once it ends, so an agent asked to work in a
+    /// worktree runs this and ends its turn.
     Move {
         /// The worktree on this branch, made if there's none [default: a
         /// new one, on a branch with a made-up name]
@@ -2373,10 +2390,17 @@ fn run(cli: Cli) -> Result<()> {
             };
             attach_or_print(&socket, &name, detached)?;
         }
-        Command::Kill { name } => {
-            if client::ask(&socket, &Request::Kill { name }, false)?.is_none() {
-                no_daemon(&socket)?;
-            }
+        Command::Kill {
+            name,
+            remove_worktree,
+            keep_worktree,
+        } => {
+            let remove = match (remove_worktree, keep_worktree) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
+            worktree_cli::kill(&socket, &name, remove)?;
         }
         Command::KillServer => {
             if !client::stop_daemon(&socket, false)? {

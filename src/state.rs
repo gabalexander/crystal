@@ -37,6 +37,20 @@ pub struct SavedSession {
     /// agent is told of each time it starts.
     #[serde(default, skip_serializing_if = "TaskBrief::is_empty")]
     pub about: TaskBrief,
+    /// The worktree it was on its way into when it was written down, which
+    /// its `cwd` is in already: its agent is told it has moved as it
+    /// starts there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved: Option<MovedTo>,
+}
+
+/// The worktree a session moves into: see `crystal worktree move`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MovedTo {
+    /// The worktree's top directory.
+    pub path: PathBuf,
+    /// The branch it's on, which the agent is told.
+    pub branch: Option<String>,
 }
 
 /// The database of the daemon at `socket`. A server's socket lives in

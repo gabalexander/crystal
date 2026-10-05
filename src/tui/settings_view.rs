@@ -20,7 +20,8 @@ use super::keymap::{self, Binding, Chord, KeyId, Keymap, Mode, Rebinding};
 use super::text_input::TextInput;
 use super::theme::{self, Theme};
 use crate::config::{
-    self, BarPosition, Config, Fold, NewCwd, SessionSettings, ShellMode, TaskSettings, ThemeName,
+    self, BarPosition, Config, EmptiedWorktree, Fold, NewCwd, SessionSettings, ShellMode,
+    TaskSettings, ThemeName,
 };
 use crate::embed::Status;
 use crate::integration::{self, Standing};
@@ -83,6 +84,7 @@ pub enum Setting {
     Scrollback,
     WorktreeBase,
     WorktreeDirectory,
+    RemoveEmptied,
     MouseCapture,
     CopyOnSelect,
     ScrollLines,
@@ -138,6 +140,7 @@ impl Setting {
             Setting::Scrollback => &["scrollback_lines"],
             Setting::WorktreeBase => &["worktrees", "base"],
             Setting::WorktreeDirectory => &["worktrees", "directory"],
+            Setting::RemoveEmptied => &["worktrees", "remove_emptied"],
             Setting::MouseCapture => &["mouse", "capture"],
             Setting::CopyOnSelect => &["mouse", "copy_on_select"],
             Setting::ScrollLines => &["mouse", "scroll_lines"],
@@ -193,6 +196,7 @@ impl Setting {
             Setting::Scrollback => "scrollback",
             Setting::WorktreeBase => "base branch",
             Setting::WorktreeDirectory => "directory",
+            Setting::RemoveEmptied => "remove once emptied",
             Setting::MouseCapture => "take the mouse",
             Setting::CopyOnSelect => "copy on select",
             Setting::ScrollLines => "wheel scrolls",
@@ -485,7 +489,10 @@ const TABS: [Tab; 8] = [
                 "Terminals",
                 &[S::Shell, S::ShellMode, S::NewCwd, S::Scrollback],
             ),
-            ("Worktrees", &[S::WorktreeBase, S::WorktreeDirectory]),
+            (
+                "Worktrees",
+                &[S::WorktreeBase, S::WorktreeDirectory, S::RemoveEmptied],
+            ),
         ],
     },
     Tab {
@@ -951,6 +958,10 @@ impl SettingsView {
             S::Scrollback => {
                 let lines = next_of(&SCROLLBACK, config.scrollback_lines, forward);
                 number(i64::try_from(lines).unwrap_or(i64::MAX))
+            }
+            S::RemoveEmptied => {
+                let now = config.worktrees.remove_emptied.name();
+                Change::set(setting, next_named(&EmptiedWorktree::CHOICES, now, forward))
             }
             S::MouseCapture => on(!config.mouse.capture),
             S::CopyOnSelect => on(!config.mouse.copy_on_select),
@@ -1513,6 +1524,16 @@ fn shown(setting: Setting, config: &Config) -> Shown {
                     directory.display().to_string()
                 }),
             "where new worktrees go, from / or ~: enter",
+        ),
+        S::RemoveEmptied => choice(
+            config.worktrees.remove_emptied.name().to_string(),
+            match config.worktrees.remove_emptied {
+                EmptiedWorktree::Ask => "a linked one its last session is killed from: ←/→",
+                EmptiedWorktree::Always => {
+                    "without asking, unless archived sessions ran there: ←/→"
+                }
+                EmptiedWorktree::Never => "keep it, without asking: ←/→",
+            },
         ),
         S::MouseCapture => switch(
             config.mouse.capture,
@@ -2095,6 +2116,12 @@ mod tests {
         );
         both(
             &mut view,
+            S::RemoveEmptied,
+            change(S::RemoveEmptied, "always"),
+            change(S::RemoveEmptied, "never"),
+        );
+        both(
+            &mut view,
             S::ScrollLines,
             number(S::ScrollLines, 5),
             number(S::ScrollLines, 2),
@@ -2181,7 +2208,7 @@ mod tests {
             }
         }
         let settings: usize = (0..KEYS_TAB).map(|tab| rows(tab, &[]).len()).sum();
-        assert_eq!(settings, 49);
+        assert_eq!(settings, 50);
     }
 
     /// Writes `change` to a config file made of `text`, and reads it back.
@@ -2215,6 +2242,8 @@ mod tests {
         assert_eq!(config.tasks.max_budget_usd, 10.0);
         let config = written("", &Change::set(S::NewCwd, "home"));
         assert_eq!(config.terminal.new_cwd, NewCwd::Home);
+        let config = written("", &Change::set(S::RemoveEmptied, "never"));
+        assert_eq!(config.worktrees.remove_emptied, EmptiedWorktree::Never);
         let config = written(
             "[appearance]\nlight_theme = \"nord\"\n",
             &Change::default(S::LightTheme),

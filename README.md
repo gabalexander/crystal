@@ -330,8 +330,15 @@ The sidebar groups sessions by project, then by worktree: `⌂` marks a reposito
 linked one, each named by its branch, or by the label it was given (`crystal worktree create --label`), then
 its branch. Sessions outside any repository come last, under their directory. `w` makes its worktree in the
 selected session's project, or in the repository you started `crystal` in. Killing the last session in a
-linked worktree with `x` asks next whether the worktree goes too: `y` removes it, as `W` would, and any other
-key keeps it.
+linked worktree with `x`, or closing a tab with the last sessions in some (`&`), asks next whether the
+worktree goes too, one question for all of them: `y` removes it, as `W` would, and any other key keeps it.
+Archived sessions that ran there are counted in the question (`nothing else is in worktree fix but 2 archived
+sessions, which won't start there again`): they stay in the archive, but couldn't start there again.
+`crystal kill` asks the same at your terminal; with nobody there to ask, it keeps the worktree and says how to
+remove it, and `--remove-worktree` or `--keep-worktree` answers for it. `remove_emptied` under `[worktrees]`
+in the [settings](#settings) skips the question: `"always"` removes the worktree without asking, unless
+archived sessions ran there, and `"never"` keeps it. A worktree with changes you haven't committed is asked
+about again before they're lost, either way. The main worktree and Claude Code's own are never asked about.
 
 A linked worktree with no sessions left stays at the end of its project, with a `· no sessions` row under it,
 until it's removed: it's still on disk, maybe with work in it. Select it, and `n` or `Enter` starts something
@@ -497,7 +504,7 @@ crystal observe review                      # its terminal as JSON lines, for a 
 crystal api snapshot                        # everything at once, as JSON, for a client of your own
 crystal rename review reviewer              # give a session another name
 crystal respawn reviewer                    # run an ended session again; an agent in its conversation
-crystal kill review                         # stop one session
+crystal kill review                         # stop one session; asks if its emptied worktree goes too
 crystal archive review                      # stop it and keep it in the archive, out of the list
 crystal unarchive review                    # start it again where it was, in its conversation
 crystal ls --archived                       # the archived sessions
@@ -560,8 +567,11 @@ worktree of its project: the one on that branch, or else a new one, made as `cre
 stops and starts again there, under its name, an agent in its conversation (Claude Code and Codex are told
 where they are now, and to carry on). An agent in the middle of a turn moves once the turn ends, so an agent
 can run it about itself: Claude Code is told to, when you ask it to work in a worktree, rather than make one
-of its own, then end its turn. What it changed and didn't commit stays where it was. A background task can't
-move, and a move still to come is carried over `crystal restart-server`, but not a cold restart.
+of its own, then end its turn. Its task stays open meanwhile. A [background task](#background-tasks) moves
+once its run ends: its `claude` starts again there in its conversation, and is told where it is now as a
+follow-up, which carries it on. What it changed and didn't commit stays where it was. A move still to come is
+carried over `crystal restart-server`, and it's written down with the sessions, so after a crash or a reboot
+the session starts again in the worktree it was on its way to, told it has moved.
 
 `crystal worktree rm` (or `W` in the TUI) takes the worktree's directory or its branch, refuses while a
 session is still running in it, and leaves the rest to `git worktree remove`, which keeps a worktree with
@@ -2126,6 +2136,9 @@ crystal tasks terminal docs                                          # carry on 
   under its number: one still open is closed with `crystal done` from then on, as an agent's in a terminal
   is. There's no way back to the background. It's refused while a run is going on: `crystal wait` for it, or
   `crystal interrupt` it, first.
+- `crystal worktree move <branch> -n <task>`, or the task itself running it in a run, moves it into another
+  worktree of its project once its run ends: its `claude` starts again there in its conversation, and is told
+  where it is now as a follow-up, which carries it on (see [usage](#usage)).
 - After a restart, a task comes back at rest rather than running its prompt again: its pane is drawn again
   from the transcript Claude Code keeps of its conversation (`~/.claude/projects/…/<id>.jsonl`, in
   `CLAUDE_CONFIG_DIR` when that's set), the last 512 KiB of it: the prompts, what Claude said, each tool it
@@ -2978,7 +2991,7 @@ that makes no sense is said there too, and the settings stay as they were until 
 | `[tasks]` | | what [background tasks](#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none); and what they may do without asking: `permission_mode` (`"default"`), `allowed_tools` (none) and `allow_bypass` (`false`) |
 | `[events]` | | `keep_days`, how long the [event log](#events) keeps what happened: 30 days, or `0` for ever |
 | `[handoff]` | | `in_git`, the projects, by their main worktree, whose [handoff notes](#the-handoff-file) go in git |
-| `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set; `directory`, where new worktrees [go](#usage), each project's in a directory of its own, from `/` or `~`: beside the project, in `<repo>.worktrees`, unless set |
+| `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set; `directory`, where new worktrees [go](#usage), each project's in a directory of its own, from `/` or `~`: beside the project, in `<repo>.worktrees`, unless set; `remove_emptied`, what's done with a linked worktree once [its last session is killed](#usage): `"ask"` (the default), `"always"` removes it without asking, unless archived sessions ran there, and `"never"` keeps it |
 | `[forge]` | | `hide_draft_prs`, leave draft pull requests out of [the pull requests](#pull-requests), the tab bar's count and `/` (`false`) |
 | `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"`; `restart_spacing_ms`, how far apart the agents a [crash or a reboot](#usage) starts again start (`250`, or `0` for all at once) |
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's, and the [plugins it ships](#a-projects-own-plugins) that are on for it, `plugins` |
@@ -3192,7 +3205,7 @@ and `[`) go from one to the next, and `1` to `8` straight to one.
 |---|---|
 | General | [notifications](#usage): whether, after how long, only while you're away, and a command of your own in place of them; sounds; whether `q` asks before it quits; looking for a [newer crystal](#updating); how long the [event log](#events) keeps what happened; and whether [draft pull requests](#pull-requests) are hidden |
 | Look | the [theme](#themes), whether it follows your system's appearance (the row says which theme each side is) and the theme for each side; the [tab bar](#terminals-the-window-and-the-tab-bar)'s place, whether it's left out with one tab, and its separator; the window's title; the [sidebar](#the-sidebar)'s width, whether it starts folded, what folding keeps, whether what needs you is pinned, and how narrow a terminal shows [one column](#on-a-phone); whether keys pressed show at the footer (`show_keys`), and whether [mermaid diagrams](#the-file-finder-and-the-tree-browser) are drawn in ASCII |
-| Sessions | what the [new-session panel](#starting-a-session) offers first, naming sessions for their prompt, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents start again after a [crash or a reboot](#usage) and whether one resumes as it said; a new terminal's shell, whether it's a login shell and where it starts; how much a session's history keeps; and the branch new worktrees start from and where they go |
+| Sessions | what the [new-session panel](#starting-a-session) offers first, naming sessions for their prompt, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents start again after a [crash or a reboot](#usage) and whether one resumes as it said; a new terminal's shell, whether it's a login shell and where it starts; how much a session's history keeps; and the branch new worktrees start from, where they go and whether one its last session is killed from is removed |
 | Mouse | [the mouse](#usage), and whether programs' copies go on [your clipboard](#zoom-copy-mode-and-search) |
 | Tasks | the permission mode [background tasks](#background-tasks) start in, and what a run and a day may spend |
 | Memory | how memory learns ([the distiller](#the-distiller), its model and what it may spend) and whether it searches [by meaning](#search-by-meaning) and reranks |
