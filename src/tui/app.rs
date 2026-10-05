@@ -30,6 +30,7 @@ use super::layouts::{self, Layouts, LayoutsView, Program, Programs, Which};
 use super::memory_view::MemoryView;
 use super::menu::{self, Item, Menu};
 use super::needs_you::{self, NeedsYouView};
+use super::opened_view::OpenedView;
 use super::page::Page;
 use super::plugins_view::{self, PluginsView};
 use super::preview::Content;
@@ -179,7 +180,8 @@ pub struct Grab {
 
 /// Something that takes the place of the sidebar and the panes until it's
 /// closed: the diff of a worktree, the file finder, the tree browser, find
-/// in files, the branch switcher, or a project's memory.
+/// in files, the branch switcher, a project's memory, a session's handoff
+/// notes, or the files `crystal open` shows.
 pub enum View {
     Diff(DiffView),
     Files(Finder),
@@ -188,6 +190,7 @@ pub enum View {
     Branches(Switcher),
     Memory(MemoryView),
     Handoff(HandoffView),
+    Opened(OpenedView),
 }
 
 /// What an open view's key asks for.
@@ -1973,6 +1976,7 @@ impl App {
             Some(View::Files(finder)) => finder.preview_read(dir, path, read),
             Some(View::Tree(tree)) => tree.preview_read(dir, path, read),
             Some(View::Handoff(view)) => view.preview_read(dir, path, read),
+            Some(View::Opened(view)) => view.preview_read(dir, path, read),
             _ => {}
         }
     }
@@ -2086,6 +2090,7 @@ impl App {
             Some(View::Branches(switcher)) => switcher.set_size(list),
             Some(View::Memory(memory)) => memory.set_size(list),
             Some(View::Handoff(view)) => view.set_size(content),
+            Some(View::Opened(view)) => view.set_size(content),
             None => {}
         }
     }
@@ -3980,6 +3985,7 @@ impl App {
                 View::Branches(switcher) => switcher.on_mouse(kind, hit),
                 View::Memory(memory) => memory.on_mouse(kind, hit),
                 View::Handoff(view) => view.on_mouse(kind, hit),
+                View::Opened(view) => view.on_mouse(kind, hit),
             };
             return self.follow(outcome);
         }
@@ -5139,7 +5145,7 @@ impl App {
                 View::Diff(diff) => diff.typing(),
                 View::Memory(memory) => memory.typing(),
                 View::Files(_) | View::Tree(_) | View::Grep(_) | View::Branches(_) => true,
-                View::Handoff(_) => false,
+                View::Handoff(_) | View::Opened(_) => false,
             };
             return Some((typing, false));
         }
@@ -5206,6 +5212,7 @@ impl App {
             View::Branches(switcher) => switcher.on_key(key),
             View::Memory(memory) => memory.on_key(key),
             View::Handoff(view) => view.on_key(key),
+            View::Opened(view) => view.on_key(key),
         };
         self.follow(outcome)
     }
@@ -5235,6 +5242,7 @@ impl App {
                     View::Grep(grep) => grep.dir,
                     View::Memory(memory) => memory.file_to_open()?.0,
                     View::Handoff(view) => view.selected()?.dir.clone(),
+                    View::Opened(view) => view.selected()?.dir.clone(),
                     _ => return None,
                 };
                 let name = self.free_name(&edit_name(&path));

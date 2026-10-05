@@ -24,6 +24,7 @@ use super::layouts::{self, LayoutsView};
 use super::memory_view;
 use super::menu;
 use super::needs_you;
+use super::opened_view;
 use super::page;
 use super::pane::Pane;
 use super::plugins_view;
@@ -216,6 +217,7 @@ pub fn view_areas(view: &View, area: Rect) -> ViewAreas {
         View::Branches(_) => switcher::list_width(area.width),
         View::Memory(_) => memory_view::list_width(area.width),
         View::Handoff(_) => handoff_view::list_width(area.width),
+        View::Opened(opened) => opened_view::list_width(opened, area.width),
     };
     let [header, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     let [list, rule, content] = Layout::horizontal([
@@ -389,6 +391,7 @@ pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
                 View::Branches(switcher) => switcher::list_hit(switcher, parts.list, row),
                 View::Memory(memory) => memory_view::list_hit(memory, parts.list, row),
                 View::Handoff(handoff) => handoff_view::list_hit(handoff, parts.list, row),
+                View::Opened(opened) => opened_view::list_hit(opened, parts.list, row),
             };
         }
         if at(parts.content) {
@@ -511,8 +514,12 @@ fn draw_everything(
             View::Branches(switcher) => switcher::draw(frame, switcher, look, &parts),
             View::Memory(memory) => memory_view::draw(frame, memory, look, &parts),
             View::Handoff(handoff) => handoff_view::draw(frame, handoff, look, &parts),
+            View::Opened(opened) => opened_view::draw(frame, opened, look, &parts),
         }
         draw_view_footer(frame, app, view, look, areas.footer);
+        // A plugin's pane is over everything, a view too: `crystal open`
+        // can bring one up under it.
+        draw_plugin_pane_over(frame, app, overlay, look, &areas);
         return;
     }
     sidebar::draw(frame, app, look, areas.sidebar);
@@ -592,10 +599,7 @@ fn draw_everything(
     if let Some(view) = app.settings_view() {
         settings_view::draw(frame, view, look.theme, middle);
     }
-    if let (Some(open), Some(pane)) = (app.plugin_pane(), overlay) {
-        let hand_back = app.keymap().hand_back().hint();
-        draw_plugin_pane(frame, open, pane, look, &areas, &hand_back);
-    }
+    draw_plugin_pane_over(frame, app, overlay, look, &areas);
     if let Some(list) = app.command_list() {
         command_list::draw(frame, list, look.theme, middle);
     }
@@ -653,6 +657,20 @@ fn plugin_pane_area(areas: &Areas, popup: Option<&Popup>) -> Rect {
 /// inside its frame.
 pub fn plugin_pane_screen(areas: &Areas, popup: Option<&Popup>) -> Rect {
     Block::bordered().inner(plugin_pane_area(areas, popup))
+}
+
+/// Draws a plugin's pane, `overlay`, over what's drawn, while one is open.
+fn draw_plugin_pane_over(
+    frame: &mut Frame,
+    app: &App,
+    overlay: Option<&Pane>,
+    look: &Look,
+    areas: &Areas,
+) {
+    if let (Some(open), Some(pane)) = (app.plugin_pane(), overlay) {
+        let hand_back = app.keymap().hand_back().hint();
+        draw_plugin_pane(frame, open, pane, look, areas, &hand_back);
+    }
 }
 
 /// A plugin's pane: its program's screen in a frame, its title on top and
@@ -1532,6 +1550,7 @@ fn draw_view_footer(frame: &mut Frame, app: &App, view: &View, look: &Look, area
         View::Branches(switcher) => owned(switcher::hints(switcher)),
         View::Memory(memory) => memory_view::hints(memory),
         View::Handoff(handoff) => owned(handoff_view::hints(handoff)),
+        View::Opened(opened) => owned(opened_view::hints(opened)),
     };
     let mut spans = vec![Span::raw(" ")];
     for (key, does) in hints {

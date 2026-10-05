@@ -518,6 +518,7 @@ crystal attach review                       # show a session; Ctrl+\ hands your 
 crystal send review "check the diff"        # type into a session and press Enter
 crystal send-keys review 1                  # press keys: an answer, Enter, Escape, C-c, Up…
 crystal wait review                         # block until its agent stops working; print how it ended
+crystal wait t12                            # block until task t12 closes; print done, failed or cancelled
 crystal read review --lines 20              # print the last 20 rows of its screen
 crystal read review --history               # and what scrolled off it before
 crystal read review --since 10m             # only what it wrote in the last ten minutes
@@ -549,6 +550,7 @@ crystal profile show review                 # what a profile runs, and where it 
 crystal pane split review                   # show a session in a pane beside yours in the TUI (see below)
 crystal tab new review                      # a new tab in the TUI, in front
 crystal title set "deploying"               # the title of the TUI's terminal, until `crystal title clear`
+crystal open docs/plan.md                   # show a file in the TUI, a markdown file as its page (see below)
 crystal layout                              # the TUI's tabs and how each splits its panes
 crystal layout apply dev.json               # lay them out as a file says, starting what isn't there
 crystal skill --install                     # teach Claude Code to drive crystal (see below)
@@ -740,8 +742,8 @@ everywhere else. `[keys]` names them the same way:
 | `view-close` | `q` | in a view: close it, or step back out of what's open in it |
 
 A view is any of the lists that take the keyboard: the diff, the file finder, the tree browser, find in files,
-the branch switcher, memory, the handoff notes, the backlog, layouts, the archive, the plugins, the settings,
-what needs you, RAM, the timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
+the branch switcher, memory, the handoff notes, the files `crystal open` shows, the backlog, layouts, the
+archive, the plugins, the settings, what needs you, RAM, the timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
 one of them for the key they all take for it, `↓`, `↑`, `PgDn`, `PgUp`, `Enter` or `Esc`, which go on working
 whatever you give; the defaults you leave it without do nothing. While a view is taking what you type, like
 the file finder's query or a filter, a letter is typed rather than standing for anything, so a key there is
@@ -1371,6 +1373,48 @@ $ printf 'sequenceDiagram\n  Alice->>Bob: hello\n  Bob-->>Alice: hi\n' | crystal
     │         │
 ```
 
+### Files an agent shows you
+
+Ask an agent to show you a file, "open it" or "show me the plan", and it runs `crystal open <file>...`: the
+files come up in the TUI you used last, in a view of their own over the tabs, rather than pasted into its
+answer. They're listed on the left, each by its path from the worktree they were opened in, and the one selected
+is read on the right, highlighted as the [file finder](#the-file-finder-and-the-tree-browser) shows it, a
+markdown file as its page with its mermaid diagrams drawn. That makes it the place to read an explanation an
+agent writes you: a markdown page with a diagram for each flow, which it opens once it's written.
+
+| Key | In the files shown |
+|---|---|
+| `↑` / `↓`, `Tab` / `Shift+Tab` | the file above or below; `Tab` goes round |
+| `Space` / `Shift+Space`, `PageDown` / `PageUp` | page through the preview |
+| `Home` / `End`, `Shift+↑` / `Shift+↓` | the top or end of the preview; a line up or down |
+| `Ctrl+R` | a markdown file's source, or its page again |
+| `Enter` | open the file in your `$EDITOR` (or `vi`) as a session of its own, as the finder's `Enter` does |
+| `Esc` | close it |
+
+A click picks a file, and the wheel scrolls the preview. The files take the place of any view that was open,
+like the diff, and files opened again take the place of those shown, read afresh; what else was open, like the
+new-session panel with what you'd typed in it, is there again once they're closed.
+
+A [profile](#profiles) can ask for a page every time, like docket's explainer:
+
+```toml
+[[profile]]
+name = "explainer"
+description = "Writes you a page on part of the code"
+agent = "claude"
+prompt = "Explain this part of the codebase:"
+postfix = """Change no code. Write the explanation to a markdown file: a summary, then the flow with \
+file and function names, a mermaid diagram for each flow or structure. Then crystal open it, \
+and keep your answer here short."""
+launch = "session"
+```
+
+Claude Code is told to open a file only when you ask, in a prompt or a profile like that one, since it takes
+your screen: a file it wrote or changed is no reason, and it names the path instead. `crystal open` takes text
+files only, from the directory it runs in or absolute, and refuses anything else, an image, a PDF or another
+binary, before anything is shown, so the agent names that path too. With no TUI open, nothing is shown and it
+fails, saying so. You can run it yourself, from any shell.
+
 ### Find in files
 
 `G` searches the files of the selected session's worktree for what you type, with `git grep`: the files git
@@ -1696,12 +1740,30 @@ crystal send-keys reviewer 1 --wait                       # answer a question: t
 
 `send` types the way a person does: the text first, marked as a paste when the program asks for that, then
 Enter on its own, so an agent takes it as a prompt and not as pasted text. `-` as the text reads it from
-standard input: `git diff | crystal send reviewer -`. `--wait` waits for the turn the text starts, not one that
-ended before it. `wait` returns once the agent isn't working: `done`, `waiting` when it asks something,
-`idle`, or how its program exited. It takes a `--timeout` in seconds, and gives up when that runs out, with
-exit status 2; anything else that goes wrong, a mistyped flag included, is 1, so 2 always means "not yet".
-`--quiet` (`-q`) prints nothing once it's there. `send --wait`, `send-keys --wait`, `task --wait` and `flow
-wait` give up the same way. A program that doesn't say what it's doing counts as busy until it ends.
+standard input: `git diff | crystal send reviewer -`. `wait` returns once the agent isn't working: `done`,
+`waiting` when it asks something, `idle`, or how its program exited. It takes a `--timeout` in seconds, and
+gives up when that runs out, with exit status 2; anything else that goes wrong, a mistyped flag included, is
+1, so 2 always means "not yet". `--quiet` (`-q`) prints nothing once it's there. `send --wait`, `send-keys
+--wait`, `task --wait` and `flow wait` give up the same way. A program that doesn't say what it's doing counts
+as busy until it ends.
+
+`send --wait` waits for the turn the text starts, never one that ended before it: it listens to the session
+from before the text goes. An agent that wasn't working has five seconds from then to be seen starting on it,
+working, asking something, or its program ending; if it isn't, the prompt has stalled, and `send` fails with an
+error that starts `agent_prompt_stalled:`, with exit status 3, rather than taking what the agent said about its
+turn before for an answer. A stall doesn't prove the agent never got the text, which a turn too short to see
+can take, so `read` it before sending the text again. An agent working already takes the text once its turn
+is over, and that turn's end may be what ends the wait. A program that doesn't say what it's doing is waited on
+until it's seen starting or it ends, with no five seconds. `send-keys --wait` waits the five seconds for the
+turn the keys start too, then goes on either way: keys can start nothing to see, or carry on a turn its agent
+doesn't say it's working on, like an answer to a permission.
+
+| Exit status | `wait`, `send --wait`, `send-keys --wait`, `task --wait`, `flow wait` |
+|---|---|
+| 0 | it got there, and printed where |
+| 1 | anything else went wrong: no such session, it ended or was killed first, a mistyped flag |
+| 2 | `--timeout` ran out first: not yet |
+| 3 | `send --wait` only: the agent was never seen starting on what it was sent (`agent_prompt_stalled:`) |
 
 An agent asking you something takes nothing `send` types, since the text would land in its question: `send`
 refuses with an error that starts `agent_blocked:`, saying what it asks and how to answer it, with `crystal
@@ -1728,8 +1790,10 @@ terminal is stopped by its own key, which crystal doesn't press for another sess
 
 ```sh
 crystal wait reviewer --until waiting         # until it asks something; prints waiting
-crystal wait reviewer --until done,idle       # any of them: working, waiting, done, idle, ended
+crystal wait reviewer --until done,idle       # any of them: working, waiting, done, idle, ended, closed
 crystal wait server --output 'listening on'   # until a line on its screen matches; prints the line
+crystal wait t12                              # until task t12 closes; prints done, failed or cancelled
+crystal wait t12 --until waiting,closed       # until its agent asks something, or the task closes
 ```
 
 `--until` returns at once if the session is there already, and catches a state it's in only a moment, like
@@ -1739,6 +1803,14 @@ what it waits for, is an error. `--output` takes a regular expression, matched a
 screen and the 200 rows above it, so output already there counts. Both take `--timeout`. Waits listen to the
 daemon's [events](#events) rather than asking it again and again, and `--output` looks each time the program
 writes.
+
+`wait` takes a [task](#tasks)'s number, like `t12`, where it takes a session's name, and waits until the task
+closes, printing how it went: `done`, `failed` or `cancelled`. It follows the task whichever session works on
+it, from a task made to start later to one whose session has gone, and returns at once for one that's closed
+already. `--until closed` waits for a session's task to close the same way; a session with no task is refused.
+Beside other states, as in `--until waiting,closed`, those are about the session working on the task. A
+session that ends, or is killed, with its task open closes it, failed or cancelled, which the wait prints
+rather than failing. A closed task isn't always over: a follow-up opens a background task again.
 
 `send-keys` presses keys instead, the way tmux's does: key names like `Enter`, `Escape`, `Tab`, `Up`, `Down`,
 `BSpace`, `C-c` or `M-x`, and any other word typed as keys. That's what answers an agent's question, since
@@ -1964,7 +2036,9 @@ The install script installs it when it finds Claude Code (its `claude` command, 
 Every Claude Code session crystal starts is also told, on top of its system prompt, to work on several things
 at once as sessions of crystal's, one `crystal new -d -w <branch>` each, rather than in worktrees or subagents
 of its own: a session shows in the sidebar with its status, its diff and its screen, where you can step in,
-while a worktree Claude Code makes for itself shows only once it's left behind.
+while a worktree Claude Code makes for itself shows only once it's left behind. It's told too to show you a
+file you ask to see with [`crystal open`](#files-an-agent-shows-you), rather than paste it into its answer, and
+never to open one unasked.
 
 `--install` won't write over a skill file you've changed; `--force` does. The skill lives in
 [`skill/SKILL.md`](skill/SKILL.md), and each crystal carries its own copy. After an upgrade, the daemon brings
@@ -2178,7 +2252,7 @@ crystal tasks terminal docs                                          # carry on 
 - Every Claude Code session crystal starts, a task or in a terminal, may run the crystal commands it's told
   to without asking, so one driving others doesn't stop at every step:
   - starting and driving sessions: `ls`, `new`, `send`, `wait`, `read`, `result`, `interrupt`, `events`,
-    `rename`, `report`, `notify`, `layout` and `layout export`, `pane split` and `pane close`
+    `rename`, `report`, `notify`, `layout` and `layout export`, `pane split` and `pane close`, and `open`
   - with tasks on, `done`, `task`, and `tasks` with `show`, `log`, `new` and `start`; with flows on, `flow`
     with `run`, `wait`, `show`, `defs` and `retry`
   - with the backlog on, reading it and `add`, `list`, `show`, `edit`, `export`, `done`, `reopen` and
@@ -2438,6 +2512,7 @@ crystal tasks new --issue 7                         # to fix issue 7
 crystal tasks new --no-launch "Tidy the README"     # made now, started later: prints t13
 crystal tasks start t13                             # start it; prints its session's name
 crystal tasks show t12                              # how it stands, its session, what it asks for and costs
+crystal wait t12                                    # until it closes; prints done, failed or cancelled
 crystal tasks cancel t12                            # cancel it, and stop its session
 crystal tasks log t12                               # how it stands, then its session's transcript
 crystal tasks terminal t12                          # a background task, opened in a terminal
