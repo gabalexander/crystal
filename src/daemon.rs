@@ -1728,7 +1728,7 @@ impl Daemon {
                     for why in &report.rejected {
                         errln!("crystal daemon:   rejected {why}");
                     }
-                    tell_distilled(&events, &job, &report.added);
+                    tell_distilled(&events, &job, report);
                 }
                 Err(err) => errln!("crystal daemon: couldn't distill {name}: {err:#}"),
             }
@@ -1865,7 +1865,7 @@ impl Daemon {
         let report = distill::run(&job);
         drop(reading);
         if let Ok(report) = &report {
-            tell_distilled(&self.events, &job, &report.added);
+            tell_distilled(&self.events, &job, report);
         }
         self.events
             .emit(Event::distilled(&info, distill_about(&report)));
@@ -3620,6 +3620,7 @@ fn distill_about(report: &Result<distill::Report>) -> DistillAbout {
         Ok(report) => DistillAbout {
             added: report.added.len(),
             again: report.again.len(),
+            made_lessons: report.made_lessons.len(),
             rejected: report.rejected.len(),
             cost_usd: report.cost_usd,
             failed: None,
@@ -3632,14 +3633,20 @@ fn distill_about(report: &Result<distill::Report>) -> DistillAbout {
 }
 
 /// Tells of the entries the distiller added to the memory of `job`'s
-/// project, by their ids.
-fn tell_distilled(events: &Bus, job: &Job, added: &[u64]) {
+/// project, and the notes it made lessons, as `report` says.
+fn tell_distilled(events: &Bus, job: &Job, report: &distill::Report) {
     let Ok(mut store) = memory::Store::open(&job.socket) else {
         return;
     };
-    for &id in added {
-        if let Ok(Some(entry)) = store.get(&job.project, id) {
-            events.emit(Event::memory(Kind::MemoryAdded, job.project.clone(), entry));
+    let told = [
+        (Kind::MemoryAdded, &report.added),
+        (Kind::MemoryChanged, &report.made_lessons),
+    ];
+    for (kind, ids) in told {
+        for &id in ids {
+            if let Ok(Some(entry)) = store.get(&job.project, id) {
+                events.emit(Event::memory(kind, job.project.clone(), entry));
+            }
         }
     }
 }

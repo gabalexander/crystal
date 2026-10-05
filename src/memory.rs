@@ -255,6 +255,12 @@ const USED: &str = "
 ALTER TABLE entries ADD COLUMN used INTEGER;
 ";
 
+/// When each entry's time to expire counts from, when that's later than
+/// when it was last said: see [`count_from_now`].
+const COUNTED_FROM: &str = "
+ALTER TABLE entries ADD COLUMN counted_from INTEGER;
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
@@ -266,11 +272,12 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     |conn| Ok(conn.execute_batch(FORGOTTEN_ENTRIES)?),
     shorten_outcomes,
     |conn| Ok(conn.execute_batch(USED)?),
+    count_from_now,
 ];
 
 /// The columns [`entry_of`] reads, in its order.
 const COLUMNS: &str = "e.id, e.kind, e.text, e.files, e.source, e.created, e.seen, e.last_seen, \
-                       e.anchors, e.checkout, e.used";
+                       e.anchors, e.checkout, e.used, e.counted_from";
 
 /// Whether memory is on, the `memory` plugin: the one gate for everything
 /// it adds, from the launch paragraph to the TUI's view and the commands.
@@ -410,7 +417,8 @@ fn unexpired_sql(at: usize) -> String {
         .collect();
     format!(
         "(?{at} IS NULL OR e.seen > 1 OR e.used IS NOT NULL \
-         OR coalesce(max(e.created, e.last_seen) + CASE e.kind{ages} END > ?{at}, 1))"
+         OR coalesce(max(e.created, e.last_seen, coalesce(e.counted_from, 0)) \
+         + CASE e.kind{ages} END > ?{at}, 1))"
     )
 }
 
@@ -480,18 +488,25 @@ pub struct Entry {
     /// When an agent last read it in full, in seconds since the Unix epoch.
     #[serde(default)]
     pub used: Option<u64>,
+    /// When its time to expire counts from, when that's later than when it
+    /// was last said: when crystal started telling whether an entry is
+    /// found again, for one from before then, or when it was made a note.
+    #[serde(default)]
+    pub counted_from: Option<u64>,
 }
 
 impl Entry {
     /// Whether it's expired at `now`: a note or a task's outcome that
     /// nobody has found again, said again or read in full by an agent,
-    /// since it was said, longer ago than its kind lasts. Searches and
-    /// agents starting leave it out; it's kept, and the list marks it.
+    /// since it was said, or since its time began to count, longer ago than
+    /// its kind lasts. Searches and agents starting leave it out; it's
+    /// kept, and the list marks it.
     pub fn expired(&self, now: u64) -> bool {
         let Some(age) = self.kind.expires_after() else {
             return false;
         };
         let said = self.created.max(self.last_seen);
+        let said = said.max(self.counted_from.unwrap_or(0));
         self.seen <= 1 && self.used.is_none() && now >= said.saturating_add(age.as_secs())
     }
 }
@@ -687,6 +702,7 @@ impl Store {
             last_seen: now,
             checkout: new.checkout,
             used: None,
+            counted_from: None,
         };
         insert(&tx, &name, &entry)?;
         tx.commit()?;
@@ -778,6 +794,24 @@ impl Store {
             params![name, id, seconds_since_epoch(SystemTime::now())],
         )?;
         get(&self.conn, &name, id)
+    }
+
+    /// Makes entry `id` of `project` one of `kind`, and gives it back: what
+    /// it says stays as it is, and so do its vector and its place in the
+    /// index. Made a note, its time to expire counts from now.
+    pub fn set_kind(&mut self, project: &Path, id: u64, kind: Kind) -> Result<Entry> {
+        let name = self.ready(project)?;
+        let now = seconds_since_epoch(SystemTime::now());
+        let from = kind.expires_after().map(|_| now);
+        let changed = self.conn.execute(
+            "UPDATE entries SET kind = ?3, counted_from = coalesce(?4, counted_from) \
+             WHERE project = ?1 AND id = ?2",
+            params![name, id, kind.to_string(), from],
+        )?;
+        if changed == 0 {
+            bail!("there's no entry {id}");
+        }
+        get(&self.conn, &name, id)?.context("the entry just changed is gone")
     }
 
     /// Every project's entries that are anchored to files, each with its
@@ -1137,6 +1171,8 @@ impl Store {
                 }
                 let said = entry.last_seen.max(entry.created);
                 entry.anchors = anchors_from_before(&entry.files, said, project);
+                // Brought in now, it has as long as any other to be found.
+                entry.counted_from = Some(seconds_since_epoch(SystemTime::now()));
                 insert(&tx, &name, &entry)?;
             }
         }
@@ -1309,6 +1345,19 @@ fn sentence_end(line: &str) -> Option<usize> {
     })
 }
 
+/// Adds [`COUNTED_FROM`], and starts the time of every entry there to
+/// expire now: before, crystal didn't tell whether an entry was found
+/// again, so one said a month ago would expire the day it upgraded,
+/// however much it was read.
+fn count_from_now(conn: &Connection) -> Result<()> {
+    conn.execute_batch(COUNTED_FROM)?;
+    conn.execute(
+        "UPDATE entries SET counted_from = ?1",
+        params![seconds_since_epoch(SystemTime::now())],
+    )?;
+    Ok(())
+}
+
 fn get(conn: &Connection, project: &str, id: u64) -> Result<Option<Entry>> {
     Ok(conn
         .query_row(
@@ -1322,7 +1371,8 @@ fn get(conn: &Connection, project: &str, id: u64) -> Result<Option<Entry>> {
 fn insert(conn: &Connection, project: &str, entry: &Entry) -> Result<()> {
     conn.execute(
         "INSERT INTO entries (project, id, kind, text, key, files, source, created, seen, \
-         last_seen, anchors, checkout) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         last_seen, anchors, checkout, counted_from) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             project,
             entry.id,
@@ -1336,6 +1386,7 @@ fn insert(conn: &Connection, project: &str, entry: &Entry) -> Result<()> {
             entry.last_seen,
             serde_json::to_string(&entry.anchors)?,
             path_text(&entry.checkout),
+            entry.counted_from,
         ],
     )?;
     Ok(())
@@ -1368,6 +1419,7 @@ fn entry_of(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
         anchors: serde_json::from_str(&anchors).unwrap_or_default(),
         checkout: checkout.map(PathBuf::from),
         used: row.get(10)?,
+        counted_from: row.get(11)?,
     })
 }
 
@@ -2135,6 +2187,7 @@ mod tests {
             anchors: BTreeMap::new(),
             checkout: None,
             used: None,
+            counted_from: None,
         }
     }
 

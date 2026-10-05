@@ -715,6 +715,12 @@ pub enum Action {
         dir: PathBuf,
         id: u64,
     },
+    /// Make entry `id` of the memory of the project at `dir` one of `kind`.
+    SetMemoryKind {
+        dir: PathBuf,
+        id: u64,
+        kind: crate::memory::Kind,
+    },
     /// Write `profile` to the config file, in place of the profile called
     /// `replacing`, or as a new one.
     SaveProfile {
@@ -12843,6 +12849,7 @@ mod tests {
             anchors: Default::default(),
             checkout: None,
             used: None,
+            counted_from: None,
         };
         let listed = crate::memory::Listed {
             entry,

@@ -24,7 +24,7 @@
 use crate::config::MemorySettings;
 use crate::embed;
 use crate::handover::HELPERS;
-use crate::memory::{self, Added, Kind, New, Source, Store};
+use crate::memory::{self, Added, Entry, Kind, New, Source, Store};
 use crate::protocol::TaskRecord;
 use crate::secrets;
 use crate::session::signal_group;
@@ -69,8 +69,12 @@ const MAX_LINE: usize = 2_000;
 
 /// How many of the entries the project has already the model is shown, the
 /// ones with most to do with the task, so it doesn't give them again in
-/// other words.
+/// other words, and can tell which of the notes among them are lessons.
 const KNOWN_SHOWN: usize = 20;
+
+/// How many notes one pass over notes alone reads: few enough that it
+/// weighs each.
+const NOTES_AT_ONCE: usize = 40;
 
 /// The kinds the distiller may give an entry: how a task turned out is the
 /// task's own to say.
@@ -129,9 +133,11 @@ Never guess: everything you keep must be supported by the record. Never say what
 decided, wants or prefers unless the record shows the user saying it (a USER: line); what the \
 assistant proposed or did is not the user's decision, and never turn a question into an \
 answer. Quote names exactly as the record gives them (files, functions, tests, commands, \
-settings), and give no line numbers. The message lists what the project's memory has already: \
-never give any of that again, even in other words, and keep an entry only when it adds \
-something new.\n\n\
+settings), and give no line numbers. The message lists what the project's memory has already, \
+each by its id and kind: never give any of that again, even in other words, and keep an entry \
+only when it adds something new. When one of those that is a note is in fact a lesson, give its \
+id in kinds with the kind it should have (decision, gotcha or command), and leave out every \
+other.\n\n\
 Each entry has: a kind (decision, gotcha or command for a lesson; note only for a lasting \
 fact that is none of those, and notes nobody finds again expire); a text, one self-contained \
 statement of at most 300 characters that states the claim itself, with why when that matters; \
@@ -141,13 +147,58 @@ the most useful first. Return an empty list when nothing qualifies: an empty lis
 than a weak entry. You have no tools; do not try to read files or run commands: everything you \
 may use is in the message. Answer only through the structured output.";
 
+/// What the model is told as it reads a project's notes alone, for the
+/// lessons among them: see [`lessons_among`]. Told only to look for
+/// lessons, it took descriptions of the code and progress for them too,
+/// and called any instruction a command, so it's told what is neither.
+pub const NOTES_PROMPT: &str = "You are crystal's memory distiller. You are given notes from \
+a software project's memory, each after its id. Some are lessons kept as notes by mistake. A \
+lesson tells a later session something it would otherwise get wrong, and couldn't see by \
+reading the code:\n\
+- a decision: a choice made and why, where another would look as good (\"Fees are kept in \
+cents, since a float lost a cent in a refund\");\n\
+- a gotcha: a trap or a surprise, something that fails or misleads unless you know it (\"The \
+ledger tests fail unless the database is up\");\n\
+- a command: a command line to run that does something useful here (\"make db starts the \
+database the tests need\").\n\
+These are not lessons, and stay notes: what the code does or where something lives (\"The \
+sidebar's width is kept in the ui table\"), what was changed or added (\"Text boxes now share \
+one editing module\"), progress or status, measurements and how something was found, and \
+anything only true when it was written.\n\n\
+Say which notes are lessons, each by its id with the kind it should have. When unsure, leave \
+it out: a note left a note loses nothing. You have no tools; do not try to read files or run \
+commands: everything you may use is in the message. Answer only through the structured output.";
+
+/// The kinds a note that's a lesson may be given.
+const LESSONS: [Kind; 3] = [Kind::Decision, Kind::Gotcha, Kind::Command];
+
+/// The shape of a note made a lesson in an answer: its id, and its kind.
+fn lesson_schema() -> Value {
+    let kinds: Vec<String> = LESSONS.iter().map(Kind::to_string).collect();
+    json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "integer" },
+            "kind": { "type": "string", "enum": kinds }
+        },
+        "required": ["id", "kind"],
+        "additionalProperties": false
+    })
+}
+
 /// The shape of the answer, for `--json-schema`: an object holding the
-/// entries, since structured output wants an object at the top.
+/// entries, since structured output wants an object at the top, and the
+/// notes it was shown that are lessons.
 pub fn schema() -> Value {
     let kinds: Vec<String> = KINDS.iter().map(Kind::to_string).collect();
     json!({
         "type": "object",
         "properties": {
+            "kinds": {
+                "type": "array",
+                "maxItems": KNOWN_SHOWN,
+                "items": lesson_schema()
+            },
             "entries": {
                 "type": "array",
                 "maxItems": MAX_DISTILLED,
@@ -167,7 +218,23 @@ pub fn schema() -> Value {
                 }
             }
         },
-        "required": ["entries"],
+        "required": ["entries", "kinds"],
+        "additionalProperties": false
+    })
+}
+
+/// The shape of the answer of a pass over notes alone.
+pub fn notes_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "lessons": {
+                "type": "array",
+                "maxItems": NOTES_AT_ONCE,
+                "items": lesson_schema()
+            }
+        },
+        "required": ["lessons"],
         "additionalProperties": false
     })
 }
@@ -177,6 +244,12 @@ pub fn schema() -> Value {
 /// environment, never the checkout's, and nothing it does is kept as a
 /// conversation.
 pub fn args(settings: &MemorySettings) -> Vec<String> {
+    pass_args(settings, SYSTEM_PROMPT, &schema())
+}
+
+/// [`args`], for a pass told `prompt` and answering in the shape of
+/// `schema`.
+fn pass_args(settings: &MemorySettings, prompt: &str, schema: &Value) -> Vec<String> {
     let mut args: Vec<String> = ["-p", "--output-format", "json", "--model"]
         .iter()
         .map(|arg| arg.to_string())
@@ -184,9 +257,9 @@ pub fn args(settings: &MemorySettings) -> Vec<String> {
     args.push(settings.distill_model.clone());
     args.extend([
         "--system-prompt".to_string(),
-        SYSTEM_PROMPT.to_string(),
+        prompt.to_string(),
         "--json-schema".to_string(),
-        schema().to_string(),
+        schema.to_string(),
         "--tools".to_string(),
         String::new(),
         "--disallowedTools".to_string(),
@@ -407,6 +480,9 @@ pub struct Report {
     pub rejected: Vec<String>,
     /// What the pass cost, in US dollars, as Claude counts it.
     pub cost_usd: f64,
+    /// The ids of the notes it was shown that it made lessons.
+    #[serde(default)]
+    pub made_lessons: Vec<u64>,
 }
 
 impl Report {
@@ -422,6 +498,11 @@ impl Report {
         if self.forgotten > 0 {
             line.push_str(&format!(", {} forgotten before", self.forgotten));
         }
+        match self.made_lessons.len() {
+            0 => {}
+            1 => line.push_str(", 1 note made a lesson"),
+            n => line.push_str(&format!(", {n} notes made lessons")),
+        }
         if !self.rejected.is_empty() {
             line.push_str(&format!(", {} rejected", self.rejected.len()));
         }
@@ -431,7 +512,8 @@ impl Report {
 }
 
 /// Runs a pass, start to end: reads what was done, asks Claude, checks its
-/// answer and keeps what passes.
+/// answer and keeps what passes, and gives the notes it was shown that it
+/// says are lessons their kinds.
 pub fn run(job: &Job) -> Result<Report> {
     let record = job.material.read(&job.env)?;
     if record.is_empty() {
@@ -441,12 +523,21 @@ pub fn run(job: &Job) -> Result<Report> {
     let embedder = embed::shared(&job.settings);
     let embedder = embed::as_embed(&embedder);
     let known = store.search(&job.project, &job.about, None, KNOWN_SHOWN, embedder)?;
+    // A note that reads as status is no lesson: `list --status` has it.
+    let notes: Vec<u64> = known
+        .iter()
+        .filter(|entry| entry.kind == Kind::Note && !memory::reads_as_status(&entry.text))
+        .map(|entry| entry.id)
+        .collect();
     let known: Vec<String> = known
         .iter()
-        .map(|entry| format!("({}) {}", entry.kind, memory::one_line(&entry.text)))
+        .map(|entry| {
+            let text = memory::one_line(&entry.text);
+            format!("{} ({}) {text}", entry.id, entry.kind)
+        })
         .collect();
     let (answer, cost_usd) = ask_claude(job, &message(&job.header, &known, &record.text()))?;
-    let checked = check(&answer, &job.checkout)?;
+    let checked = check(&answer, &job.checkout, &notes)?;
     let mut report = Report {
         rejected: checked.rejected,
         cost_usd,
@@ -463,6 +554,13 @@ pub fn run(job: &Job) -> Result<Report> {
             Added::Refused => report.forgotten += 1,
         }
     }
+    for (id, kind) in checked.lessons {
+        // Someone may have changed it since it was read.
+        if store.get(&job.project, id)?.is_some_and(|entry| entry.kind == Kind::Note) {
+            store.set_kind(&job.project, id, kind)?;
+            report.made_lessons.push(id);
+        }
+    }
     Ok(report)
 }
 
@@ -476,7 +574,9 @@ pub fn message(header: &str, known: &[String], record: &str) -> String {
     if known.is_empty() {
         message.push_str(": nothing on this yet.");
     } else {
-        message.push_str(" (never give any of it again, even in other words):\n");
+        message.push_str(
+            ", each by its id and kind (never give any of it again, even in other words):\n",
+        );
         for entry in known {
             message.push_str(&format!("- {}\n", secrets::redact(entry)));
         }
@@ -489,17 +589,28 @@ pub fn message(header: &str, known: &[String], record: &str) -> String {
     message
 }
 
-/// Runs Claude on `message`, and gives back its answer, the structured
-/// output, and what it cost.
+/// Runs Claude on `message` for `job`, and gives back its answer, the
+/// structured output, and what it cost.
 fn ask_claude(job: &Job, message: &str) -> Result<(Value, f64)> {
-    let mut env = job.env.clone();
+    ask(&args(&job.settings), &job.checkout, &job.env, message)
+}
+
+/// Runs Claude with `args` in `cwd`, with `env`, on `message`, and gives
+/// back its answer and what it cost.
+fn ask(
+    args: &[String],
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    message: &str,
+) -> Result<(Value, f64)> {
+    let mut env = env.clone();
     // It isn't a session, and its hooks are off anyway.
     for key in ["CRYSTAL_SESSION", "CRYSTAL_SESSION_ID"] {
         env.remove(key);
     }
     let mut child = Command::new("claude")
-        .args(args(&job.settings))
-        .current_dir(&job.checkout)
+        .args(args)
+        .current_dir(cwd)
         .env_clear()
         .envs(&env)
         .stdin(Stdio::piped())
@@ -579,10 +690,12 @@ fn answer_of(out: &str) -> Result<(Value, f64)> {
     Ok((answer, cost))
 }
 
-/// The model's entries that passed, and why each that didn't, didn't.
+/// The model's entries that passed, the notes it was shown that it says
+/// are lessons, with their kinds, and why each that didn't pass, didn't.
 #[derive(Debug, Default, PartialEq)]
 pub struct Checked {
     pub entries: Vec<New>,
+    pub lessons: Vec<(u64, Kind)>,
     pub rejected: Vec<String>,
 }
 
@@ -590,8 +703,9 @@ pub struct Checked {
 /// bare or as `entries`, at most [`MAX_DISTILLED`]; each of a kind the
 /// distiller may give, with a text that isn't empty or too long, naming
 /// files that are in `checkout`. An entry that fails any of it is dropped
-/// whole, with why.
-pub fn check(answer: &Value, checkout: &Path) -> Result<Checked> {
+/// whole, with why. Its `kinds` are kept for those of `notes`, the notes it
+/// was shown, alone, as [`lessons_in`] keeps them.
+pub fn check(answer: &Value, checkout: &Path, notes: &[u64]) -> Result<Checked> {
     let items = match answer {
         Value::Array(items) => items,
         Value::Object(object) => match object.get("entries") {
@@ -614,7 +728,81 @@ pub fn check(answer: &Value, checkout: &Path) -> Result<Checked> {
             Err(why) => checked.rejected.push(format!("entry {number}: {why}")),
         }
     }
+    checked.lessons = lessons_in(&answer["kinds"], notes, &mut checked.rejected);
     Ok(checked)
+}
+
+/// The notes `given`, an answer's list of ids with kinds, says are lessons:
+/// only those of `notes`, the notes the model was shown, each once, and a
+/// kind a lesson has; why each other isn't kept goes into `rejected`.
+fn lessons_in(given: &Value, notes: &[u64], rejected: &mut Vec<String>) -> Vec<(u64, Kind)> {
+    let given = given.as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut lessons: Vec<(u64, Kind)> = Vec::new();
+    for item in given {
+        let Some(id) = item["id"].as_u64() else {
+            rejected.push(format!("a note made a lesson with no id: {item}"));
+            continue;
+        };
+        let kind = item["kind"].as_str().unwrap_or_default();
+        let Some(kind) = Kind::parse(kind).filter(|kind| LESSONS.contains(kind)) else {
+            rejected.push(format!("note {id}: {kind:?} isn't a lesson's kind"));
+            continue;
+        };
+        if !notes.contains(&id) {
+            rejected.push(format!("note {id}: not a note it was shown"));
+        } else if !lessons.iter().any(|(seen, _)| *seen == id) {
+            lessons.push((id, kind));
+        }
+    }
+    lessons
+}
+
+/// What a pass over notes alone came to: the notes it says are lessons,
+/// with their kinds, why each it gave that didn't pass didn't, and what it
+/// cost.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Lessons {
+    pub lessons: Vec<(u64, Kind)>,
+    pub rejected: Vec<String>,
+    pub cost_usd: f64,
+}
+
+/// Which of `notes` are lessons kept as notes, and the kind each should
+/// have, as the distiller's model reads them, [`NOTES_AT_ONCE`] at a time:
+/// one locked-down `claude -p` a batch, as a pass is, run in `cwd` with
+/// `env`. It changes nothing: what's done with the answer is the caller's.
+pub fn lessons_among(
+    notes: &[Entry],
+    settings: &MemorySettings,
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<Lessons> {
+    let args = pass_args(settings, NOTES_PROMPT, &notes_schema());
+    let mut found = Lessons::default();
+    for batch in notes.chunks(NOTES_AT_ONCE) {
+        let (answer, cost) = ask(&args, cwd, env, &notes_message(batch))?;
+        found.cost_usd += cost;
+        let ids: Vec<u64> = batch.iter().map(|note| note.id).collect();
+        let lessons = lessons_in(&answer["lessons"], &ids, &mut found.rejected);
+        found.lessons.extend(lessons);
+    }
+    Ok(found)
+}
+
+/// The message a pass over notes alone sends: each note on a line, after
+/// its id, with the files it's about. Credentials are taken out first.
+pub fn notes_message(notes: &[Entry]) -> String {
+    let mut message = String::from("The notes, each after its id:\n");
+    for note in notes {
+        let text = memory::one_line(&note.text);
+        message.push_str(&format!("- {}: {}", note.id, secrets::redact(&text)));
+        if !note.files.is_empty() {
+            message.push_str(&format!(" [{}]", note.files.join(", ")));
+        }
+        message.push('\n');
+    }
+    message.push_str("\nReturn the notes that are lessons, each with its kind.");
+    message
 }
 
 fn entry(item: &Value, checkout: &Path) -> Result<New, String> {

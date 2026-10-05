@@ -1362,6 +1362,29 @@ enum MemoryCommand {
         #[arg(long, requires = "status")]
         yes: bool,
     },
+    /// Change entries' kind, by their ids: say a note that's a lesson to a
+    /// gotcha. What they say, and how they're found, stay as they are. Or
+    /// with --notes, have the distiller's model read the notes and say which
+    /// are lessons, and of what kind, given it once --yes says so.
+    Kind {
+        /// The kind to give them.
+        #[arg(value_enum, required_unless_present = "notes")]
+        kind: Option<memory::Kind>,
+
+        /// The entries, by their ids.
+        #[arg(required_unless_present = "notes")]
+        ids: Vec<u64>,
+
+        /// Have the distiller's model (`distill_model` under `[memory]`) read
+        /// every note and list the lessons among it, with the kind it gives
+        /// each: only listed, as what would change, without --yes.
+        #[arg(long, conflicts_with_all = ["kind", "ids"])]
+        notes: bool,
+
+        /// With --notes, give each the kind it says.
+        #[arg(long, requires = "notes")]
+        yes: bool,
+    },
     /// Write an entry into the project's CLAUDE.md, or its AGENTS.md, under
     /// a "Notes" heading, for every session to read.
     Promote {
@@ -2711,6 +2734,20 @@ fn run(cli: Cli) -> Result<()> {
                 memory_cli::remove(&socket, dir, forgetting)?;
             }
             Some(MemoryCommand::Distill { name }) => memory_cli::distill(&socket, &name)?,
+            Some(MemoryCommand::Kind {
+                kind,
+                ids,
+                notes,
+                yes,
+            }) => {
+                let kinding = memory_cli::Kinding {
+                    kind,
+                    ids,
+                    notes,
+                    yes,
+                };
+                memory_cli::kind(&socket, dir, kinding)?;
+            }
             Some(MemoryCommand::Embed) => memory_cli::embed(&socket)?,
             Some(MemoryCommand::Promote { id, yes }) => {
                 memory_cli::promote(&socket, dir, id, yes)?;

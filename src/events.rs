@@ -75,6 +75,7 @@ pub enum Kind {
     MemoryForgotten,
     MemoryStale,
     MemoryPromoted,
+    MemoryChanged,
     MemoryDistilled,
     MemoryDistillFailed,
     BacklogAdded,
@@ -96,7 +97,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 63] = [
+    pub const ALL: [Kind; 64] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -142,6 +143,7 @@ impl Kind {
         Kind::MemoryForgotten,
         Kind::MemoryStale,
         Kind::MemoryPromoted,
+        Kind::MemoryChanged,
         Kind::MemoryDistilled,
         Kind::MemoryDistillFailed,
         Kind::BacklogAdded,
@@ -210,6 +212,7 @@ impl Kind {
             Kind::MemoryForgotten => "memory.forgotten",
             Kind::MemoryStale => "memory.stale",
             Kind::MemoryPromoted => "memory.promoted",
+            Kind::MemoryChanged => "memory.changed",
             Kind::MemoryDistilled => "memory.distilled",
             Kind::MemoryDistillFailed => "memory.distill_failed",
             Kind::BacklogAdded => "backlog.added",
@@ -283,6 +286,7 @@ impl Kind {
             Kind::MemoryForgotten => "an entry is forgotten",
             Kind::MemoryStale => "every file an entry is about has changed since it was said",
             Kind::MemoryPromoted => "an entry is written into the project's CLAUDE.md or AGENTS.md",
+            Kind::MemoryChanged => "an entry's kind is changed, by you or by the distiller",
             Kind::MemoryDistilled => "the distiller has read what a session did",
             Kind::MemoryDistillFailed => "the distiller couldn't read what a session did",
             Kind::BacklogAdded => "an item goes on a project's backlog",
@@ -572,6 +576,9 @@ pub struct ToolUse {
 pub struct DistillAbout {
     pub added: usize,
     pub again: usize,
+    /// How many of the notes it was shown it made lessons.
+    #[serde(default)]
+    pub made_lessons: usize,
     pub rejected: usize,
     pub cost_usd: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -588,6 +595,9 @@ impl DistillAbout {
         let mut line = format!("{} added", self.added);
         if self.again > 0 {
             line.push_str(&format!(", {} seen again", self.again));
+        }
+        if self.made_lessons > 0 {
+            line.push_str(&format!(", {} made lessons", self.made_lessons));
         }
         if self.rejected > 0 {
             line.push_str(&format!(", {} rejected", self.rejected));
@@ -1254,7 +1264,8 @@ impl Event {
             Kind::MemoryAdded
             | Kind::MemoryForgotten
             | Kind::MemoryStale
-            | Kind::MemoryPromoted => self.memory.as_ref().map_or(String::new(), |entry| {
+            | Kind::MemoryPromoted
+            | Kind::MemoryChanged => self.memory.as_ref().map_or(String::new(), |entry| {
                 let into = self
                     .file
                     .as_ref()
@@ -1450,6 +1461,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
         anchors: Default::default(),
         checkout: None,
         used: None,
+        counted_from: None,
     };
     let item = BacklogItem {
         number: 1,
@@ -1593,7 +1605,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             let why = "the worktree create hook exited with exit status: 1";
             Event::worktree_hook_failed(&worktree, why)
         }
-        Kind::MemoryAdded | Kind::MemoryForgotten | Kind::MemoryStale => {
+        Kind::MemoryAdded | Kind::MemoryForgotten | Kind::MemoryStale | Kind::MemoryChanged => {
             Event::memory(kind, project::of(dir).path, entry)
         }
         Kind::MemoryPromoted => {
@@ -1606,6 +1618,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             let distill = DistillAbout {
                 added: 2,
                 again: 1,
+                made_lessons: 0,
                 rejected: 0,
                 cost_usd: 0.0012,
                 failed,
