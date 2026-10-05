@@ -976,6 +976,7 @@ fn state_word(session: &SessionInfo) -> &'static str {
         Status::Waiting => "waiting",
         Status::Working => "working",
         Status::Done => "done",
+        Status::Open => "open",
         Status::Running if groups::is_terminal(session) => "running",
         Status::Running => "idle",
         Status::Ended => "ended",

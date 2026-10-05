@@ -134,8 +134,10 @@ crystal done "Wrote the plan" --artifact docs/plan.md
   refuses the close and says why; the task stays open, so fix the call and run it again.
 - `crystal done` refuses while your worktree is in the middle of a rebase or a merge, stopped on conflicts
   say: the work isn't done then. Finish it or abort it, then close the task; `--failed` closes it anyway.
-- End a turn with your task still open and crystal reminds you, once. Close it then if you're through;
-  if you're waiting on the user, leave it open and end your turn.
+- End a turn with your task still open without saying why and crystal reminds you, once. Close it if you're
+  through. If you need the user, ask them your question plainly: only a question pins your session for them.
+  If you're waiting on work of your own, a command in the background, a Monitor (say on CI) or a subagent, say
+  what and end your turn: crystal shows you working until it wakes you, and doesn't remind you.
 - An agent you start with a prompt (`crystal new -d claude "…"`, or `-t "…"` for any command) is given a task.
   `crystal ls --json` shows it: `task.id`, `task.goal`, and once closed, `task.outcome` with `failed`,
   `cancelled` and `summary`.
