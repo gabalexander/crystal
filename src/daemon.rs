@@ -55,7 +55,7 @@ use crate::typing;
 use crate::vt;
 use crate::worktree_hooks;
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use moving::Move;
+use moving::{Move, written_down};
 use regex::Regex;
 use removal::Removal;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -574,7 +574,9 @@ impl Daemon {
     /// new one, and gives back its name: an agent in its conversation, a
     /// task at rest, any other program from the start, below `before`, what
     /// its terminal showed before (see [`start_as`]). It comes back with its
-    /// task as it was, closed or not.
+    /// task as it was, closed or not. One written down on its way into
+    /// another worktree, which it starts in, is told it has moved: an agent
+    /// as it starts, a task with a follow-up, which carries it on there.
     fn start_saved(
         &self,
         sessions: &mut Vec<Session>,
@@ -584,6 +586,7 @@ impl Daemon {
         before: Option<vt::Saved>,
     ) -> Result<String> {
         let id = id.unwrap_or_else(new_id);
+        let moved = saved.moved.as_ref().map(moving::notice);
         let goal = saved.goal.clone();
         let backlog = goal.as_ref().and_then(|goal| goal.backlog);
         let brief = brief_of(&saved);
@@ -628,19 +631,23 @@ impl Daemon {
                     new,
                     saved.conversation,
                     saved.resume,
-                    None,
+                    moved.as_deref(),
                     before,
                 )?
             }
         };
-        if let Some(session) = sessions.last_mut() {
-            if let Some(goal) = goal {
-                session.give_task(goal);
-            }
-            // A name the user or a script gave stays theirs.
-            if name_given {
-                session.keep_given_name();
-            }
+        let session = sessions.last_mut().expect("start added a session");
+        if let Some(goal) = goal {
+            session.give_task(goal);
+        }
+        // A name the user or a script gave stays theirs.
+        if name_given {
+            session.keep_given_name();
+        }
+        if let Some(notice) = moved.filter(|_| session.is_task())
+            && let Err(err) = session.prompt(&notice)
+        {
+            eprintln!("crystal daemon: couldn't tell {name} it has moved: {err:#}");
         }
         Ok(name)
     }
@@ -809,7 +816,7 @@ impl Daemon {
             self.list_projects_of(&sessions);
             // Written while the list is still locked, so that an older list
             // can never be written after a shutdown has emptied it.
-            let saved: Vec<SavedSession> = sessions.iter().filter_map(Session::saved).collect();
+            let saved = written_down(&sessions, &self.moves.lock().unwrap());
             if saved != last_saved {
                 match self.db.lock().unwrap().save_sessions(&saved) {
                     Ok(()) => last_saved = saved,
@@ -1065,7 +1072,7 @@ impl Daemon {
         }
         // Written down first: whatever goes wrong from here, the next
         // daemon starts them again, as after any restart.
-        let saved: Vec<SavedSession> = sessions.iter().filter_map(Session::saved).collect();
+        let saved = written_down(&sessions, &moves);
         {
             let mut db = self.db.lock().unwrap();
             db.save_sessions(&saved)?;
@@ -4421,6 +4428,7 @@ mod tests {
             resume: None,
             about: TaskBrief::default(),
             name_given: false,
+            moved: None,
         };
         assert!(shows_again(&shell));
         // An agent whose conversation is there to pick up shows its own.

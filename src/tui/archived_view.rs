@@ -243,6 +243,7 @@ mod tests {
                 resume: None,
                 about: Default::default(),
                 name_given: false,
+                moved: None,
             },
             worktree: None,
             archived: 10,

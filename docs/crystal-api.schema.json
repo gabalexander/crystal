@@ -2500,6 +2500,26 @@
       },
       "description": "What `crystal report --line` and `--model` put on a session's row."
     },
+    "MovedTo": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "The worktree's top directory."
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The branch it's on, which the agent is told."
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "description": "The worktree a session moves into: see `crystal worktree move`."
+    },
     "NewItem": {
       "type": "object",
       "properties": {
@@ -5524,6 +5544,17 @@
         "name_given": {
           "type": "boolean",
           "description": "Whether the user or a script gave it its name, which a rename in Claude Code leaves, after a restart as before it."
+        },
+        "moved": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MovedTo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The worktree it was on its way into when it was written down, which its `cwd` is in already: its agent is told it has moved as it starts there."
         }
       },
       "required": [

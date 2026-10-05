@@ -728,6 +728,37 @@ pub struct WorktreeSettings {
     /// home directory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub directory: Option<PathBuf>,
+    /// What's done with a linked worktree once the last session in it is
+    /// killed: see [`crate::emptied`].
+    pub remove_emptied: EmptiedWorktree,
+}
+
+/// What's done with a linked worktree the last session in it was killed
+/// from, by `x`, by closing its tab with its sessions or by `crystal kill`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EmptiedWorktree {
+    /// Ask whether it goes too.
+    #[default]
+    Ask,
+    /// Remove it without asking, unless archived sessions ran there, which
+    /// couldn't start there again once it's gone: those are asked about.
+    Always,
+    /// Keep it, without asking.
+    Never,
+}
+
+impl EmptiedWorktree {
+    /// Each, as the file writes it.
+    pub const CHOICES: [&str; 3] = ["ask", "always", "never"];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            EmptiedWorktree::Ask => Self::CHOICES[0],
+            EmptiedWorktree::Always => Self::CHOICES[1],
+            EmptiedWorktree::Never => Self::CHOICES[2],
+        }
+    }
 }
 
 impl WorktreeSettings {
@@ -1827,6 +1858,24 @@ back_to = "build"
     }
 
     #[test]
+    fn an_emptied_worktree_is_asked_about_unless_the_settings_say() {
+        assert_eq!(
+            Config::default().worktrees.remove_emptied,
+            EmptiedWorktree::Ask
+        );
+        for (written, read) in [
+            ("ask", EmptiedWorktree::Ask),
+            ("always", EmptiedWorktree::Always),
+            ("never", EmptiedWorktree::Never),
+        ] {
+            let config = parse(&format!("[worktrees]\nremove_emptied = \"{written}\"\n")).unwrap();
+            assert_eq!(config.worktrees.remove_emptied, read);
+            assert_eq!(read.name(), written);
+        }
+        assert!(parse("[worktrees]\nremove_emptied = true\n").is_err());
+    }
+
+    #[test]
     fn drafts_show_unless_the_forge_settings_hide_them() {
         assert!(!parse("").unwrap().forge.hide_draft_prs);
         let config = parse("[forge]\nhide_draft_prs = true\n").unwrap();
@@ -2078,6 +2127,7 @@ back_to = "build"
             worktrees: WorktreeSettings {
                 base: Some("develop".into()),
                 directory: Some(PathBuf::from("~/worktrees")),
+                remove_emptied: EmptiedWorktree::Always,
             },
             forge: ForgeSettings {
                 hide_draft_prs: true,

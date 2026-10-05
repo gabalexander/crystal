@@ -7510,6 +7510,93 @@ fn killing_the_last_session_in_a_worktree_can_take_the_worktree_with_it() {
     assert!(crystal.row("planner").is_some());
 }
 
+#[test]
+fn closing_a_tab_with_its_sessions_asks_about_the_worktrees_it_empties() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+    crystal.ok(&[
+        "new", "-n", "fixer", "-c", repo_arg, "-w", "fix", "sleep", "30",
+    ]);
+    crystal.ok(&[
+        "new", "-n", "spiker", "-c", repo_arg, "-w", "spike", "sleep", "30",
+    ]);
+    crystal.ok(&["tab", "new", "fixing"]);
+    crystal.ok(&["tab", "move", "fixer", "fixing"]);
+    crystal.ok(&["tab", "move", "spiker", "fixing"]);
+    let trees = crystal.dir.path().join("app.worktrees");
+
+    let mut tui = crystal.tui();
+    tui.shows(" 2 fixing ");
+    tui.type_keys("&");
+    tui.shows("close tab 2 and kill its 2 sessions? y/n");
+    tui.type_keys("y");
+    tui.shows("nothing else is in worktrees fix and spike: remove them too? y/n");
+    tui.type_keys("y");
+    eventually("both worktrees are gone", || {
+        !trees.join("fix").exists() && !trees.join("spike").exists()
+    });
+    assert!(crystal.row("planner").is_some());
+}
+
+#[test]
+fn crystal_kill_removes_the_worktree_it_empties_as_told_or_says_how() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    let named = [
+        ("a", "one"),
+        ("b", "two"),
+        ("c", "three"),
+        ("d", "four"),
+        ("e", "five"),
+    ];
+    for (name, branch) in named {
+        crystal.ok(&[
+            "new", "-d", "-n", name, "-c", repo_arg, "-w", branch, "sleep", "30",
+        ]);
+    }
+    let trees = crystal.dir.path().join("app.worktrees");
+
+    // Nobody at a terminal to ask: it stays, and how to remove it is said.
+    let out = crystal.run(&["kill", "a"]);
+    assert!(out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("nothing else is in worktree one: `crystal worktree rm"),
+        "{said}"
+    );
+    assert!(trees.join("one").is_dir());
+
+    // Told to, it goes without asking; told not to, it stays, saying nothing.
+    let removed = crystal.ok(&["kill", "b", "--remove-worktree"]);
+    assert_eq!(removed, "removed worktree two\n");
+    assert!(!trees.join("two").exists());
+    let out = crystal.run(&["kill", "c", "--keep-worktree"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    assert!(trees.join("three").is_dir());
+
+    // The settings can say to remove it without asking.
+    let config = std::fs::read_to_string(crystal.config_file()).unwrap();
+    crystal.configure(&format!(
+        "{config}\n[worktrees]\nremove_emptied = \"always\"\n"
+    ));
+    std::fs::write(trees.join("four/notes.txt"), "not committed\n").unwrap();
+    // But not one with changes not committed, with nobody to say so.
+    let out = crystal.run(&["kill", "d"]);
+    assert!(out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("has uncommitted changes, so it stays"),
+        "{said}"
+    );
+    assert!(trees.join("four").is_dir());
+    assert_eq!(crystal.ok(&["kill", "e"]), "removed worktree five\n");
+    assert!(!trees.join("five").exists());
+}
+
 /// The config of a test whose new worktrees go in `directory`.
 fn worktrees_in(directory: &Path) -> String {
     format!(
@@ -7723,6 +7810,8 @@ fn worktree_move_starts_a_session_again_in_the_worktree() {
         "here",
         "-c",
         repo_arg,
+        "-t",
+        "tidy up",
         "sh",
         "-c",
         "pwd > where; exec sleep 30",
@@ -7741,6 +7830,9 @@ fn worktree_move_starts_a_session_again_in_the_worktree() {
     eventually("it runs on the worktree's branch", || {
         crystal.row("here").is_some_and(|row| row[4] == "fix")
     });
+    // Its task stays open, stopped though its program was.
+    let card = crystal.ok(&["tasks", "show", "here"]);
+    assert!(card.starts_with("t1  running  tidy up"), "{card}");
 
     // Moved again to where it is, nothing happens.
     let said = crystal.ok(&["worktree", "move", "fix", "-n", "here"]);
@@ -7823,6 +7915,117 @@ fn an_agent_moved_mid_turn_moves_once_the_turn_ends_and_carries_on_there() {
     let row = crystal.row("agent").unwrap();
     assert_eq!(row[4], "fix");
     assert_ne!(crystal.pid("agent"), pid);
+}
+
+#[test]
+fn a_move_still_to_come_is_carried_out_by_a_cold_restart() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    let bin = fake_claude(crystal.dir.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = crystal
+        .command(&["new", "-n", "agent", "-c", repo_arg, "claude"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // In a conversation, in the middle of a turn, it's asked to move.
+    let args = written(&repo.join("args"));
+    let settings: serde_json::Value = claude_settings(&args);
+    let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    let transcript = crystal.dir.path().join("abc-123.jsonl");
+    std::fs::write(&transcript, "{}\n").unwrap();
+    let prompted = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "abc-123",
+        "transcript_path": transcript,
+    });
+    run_hook(&crystal, "agent", hook, &prompted.to_string());
+    eventually("the agent is working", || {
+        crystal.row("agent").is_some_and(|row| row[1] == "working")
+    });
+    let said = crystal.ok(&["worktree", "move", "fix", "-n", "agent"]);
+    assert!(said.contains("once its agent's turn ends"), "{said}");
+    let fix = crystal.dir.path().join("app.worktrees/fix");
+
+    // Written down on its way, it starts there after a crash or a reboot,
+    // in its conversation, told it has moved.
+    eventually("the session is written down with its move", || {
+        crystal
+            .query("SELECT group_concat(moved) FROM sessions")
+            .is_some_and(|moved| moved.contains("app.worktrees/fix"))
+    });
+    let out = crystal
+        .command(&["restart-server", "--cold"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let args = written(&fix.join("args"));
+    let args: Vec<&str> = args.lines().collect();
+    let resume = args.iter().position(|arg| *arg == "--resume").unwrap();
+    assert_eq!(args[resume + 1], "abc-123");
+    let told = args.last().unwrap();
+    assert!(
+        told.starts_with("[crystal] This session has moved"),
+        "{told}"
+    );
+    eventually("it runs on the worktree's branch", || {
+        crystal.row("agent").is_some_and(|row| row[4] == "fix")
+    });
+    // Started there, it's written down as it is.
+    eventually("the move is done with", || {
+        let moved = "SELECT CAST(count(moved) AS TEXT) FROM sessions";
+        crystal.query(moved).as_deref() == Some("0")
+    });
+}
+
+#[test]
+fn a_background_task_moves_once_its_run_ends_and_carries_on_there() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = git_repo(dir, "app");
+    let repo_arg = repo.to_str().unwrap();
+    let path = path_with(&print_claude(dir));
+    let out = crystal
+        .command(&["task", "-n", "fixer", "-c", repo_arg, "fix", "the", "tests"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    runs(&repo, 1);
+
+    let out = crystal
+        .command(&["worktree", "move", "fix", "-n", "fixer"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains("fixer moves into"), "{said}");
+    assert!(said.contains("once its run ends"), "{said}");
+    let fix = dir.join("app.worktrees/fix");
+    thread::sleep(Duration::from_millis(600));
+    assert!(!fix.join("runs").exists(), "it waits for its run to end");
+
+    finish_run(&repo, 1);
+    let moved = runs(&fix, 1);
+    assert!(moved[0].contains("--resume conv-1"), "{moved:?}");
+    assert!(
+        moved[0]
+            .contains(" -- [crystal] This session has moved into the worktree on the branch `fix`"),
+        "{moved:?}"
+    );
+    eventually("it runs on the worktree's branch", || {
+        crystal.row("fixer").is_some_and(|row| row[4] == "fix")
+    });
 }
 
 #[test]
@@ -13189,9 +13392,9 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
     );
     tui.shows("couldn't get them ready");
 
-    // A setting typed in, one up from the last of the sessions' tab, and
+    // A setting typed in, two up from the last of the sessions' tab, and
     // its default put back.
-    tui.type_keys("3Gk\r");
+    tui.type_keys("3Gkk\r");
     tui.type_keys("develop\r");
     eventually("the base branch is written down", || {
         config().contains("[worktrees]\nbase = \"develop\"")

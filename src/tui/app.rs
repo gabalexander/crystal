@@ -51,8 +51,10 @@ use super::tree_browser::TreeBrowser;
 use crate::catalog::{self, Agent};
 use crate::client::Purpose;
 use crate::config::{
-    BarPosition, Config, Fold, MouseSettings, SIDEBAR_WIDTHS, SidebarSettings, TabBarSettings,
+    BarPosition, Config, EmptiedWorktree, Fold, MouseSettings, SIDEBAR_WIDTHS, SidebarSettings,
+    TabBarSettings,
 };
+use crate::emptied::{self, Emptied};
 use crate::events::{Event, Scope};
 use crate::flow_run::{FlowRun, RunState};
 use crate::flows::{self, Flow};
@@ -70,7 +72,7 @@ use crate::{backlog, handoff, names, plugins, project, tasks};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use std::cell::Cell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -297,12 +299,9 @@ pub enum Confirm {
         branch: String,
         force: bool,
     },
-    /// Remove the linked worktree at `path`, called `name`, which the
-    /// session just killed was the last in.
-    RemoveEmptied {
-        path: PathBuf,
-        name: String,
-    },
+    /// Remove these linked worktrees, which the sessions just killed were
+    /// the last in.
+    RemoveEmptied(Vec<Emptied>),
     /// Close the tab in front, tab `number`, and kill the sessions in it.
     CloseTab {
         number: usize,
@@ -343,9 +342,7 @@ impl Confirm {
                 force: true,
                 ..
             } => format!("{branch} has uncommitted changes: remove it and lose them? y/n"),
-            Confirm::RemoveEmptied { name, .. } => {
-                format!("nothing else is in worktree {name}: remove it too? y/n")
-            }
+            Confirm::RemoveEmptied(emptied) => format!("{} y/n", emptied::question(emptied)),
             Confirm::CloseTab { number, sessions } => {
                 let count = sessions.len();
                 let noun = if count == 1 { "session" } else { "sessions" };
@@ -382,11 +379,12 @@ impl Confirm {
                 branch,
                 force,
             },
-            Confirm::RemoveEmptied { path, name } => Action::RemoveWorktree {
-                path,
-                branch: name,
-                force: false,
-            },
+            Confirm::RemoveEmptied(emptied) => Action::RemoveWorktrees(
+                emptied
+                    .into_iter()
+                    .map(|emptied| (emptied.path, emptied.name))
+                    .collect(),
+            ),
             Confirm::CloseTab { sessions, .. } => Action::KillAll(sessions),
             Confirm::ForgetProject { path, .. } => Action::ForgetProject(path),
             Confirm::Quit => Action::Quit,
@@ -517,6 +515,9 @@ pub enum Action {
         branch: String,
         force: bool,
     },
+    /// Remove each linked worktree at a path, called the name beside it, as
+    /// [`Action::RemoveWorktree`] does without `force`.
+    RemoveWorktrees(Vec<(PathBuf, String)>),
     /// Send the key to the session in the pane at `to`.
     Type {
         to: Slot,
@@ -1005,6 +1006,17 @@ pub struct App {
     codex_models: Option<Vec<String>>,
     /// A yes-or-no question on the footer line, until it's answered.
     confirm: Option<Confirm>,
+    /// The questions to ask once the one on the footer line is answered,
+    /// the first first: whether to lose the changes of each of several
+    /// worktrees being removed, say.
+    later: VecDeque<Confirm>,
+    /// The linked worktrees the sessions just killed left with nothing in
+    /// them, to ask about once the daemon has said which archived sessions
+    /// ran in them: see [`App::ask_about_emptied`].
+    emptied: Vec<Worktree>,
+    /// What's done with a worktree killing sessions empties: see
+    /// [`EmptiedWorktree`].
+    remove_emptied: EmptiedWorktree,
     /// The tabs, each with its own sessions and its own panes, and which
     /// one is in front. The sidebar shows only the sessions of the tab in
     /// front. A split stays on its session while the selection moves.
@@ -1282,6 +1294,9 @@ impl App {
             memory: Memory::default(),
             codex_models: None,
             confirm: None,
+            later: VecDeque::new(),
+            emptied: Vec::new(),
+            remove_emptied: EmptiedWorktree::default(),
             tabs: Tabs::default(),
             tiles: Rect::new(29, 1, 51, 22),
             resizing: false,
@@ -1522,6 +1537,7 @@ impl App {
         self.hide_draft_prs = config.forge.hide_draft_prs;
         self.flows_on = flows::enabled(config);
         self.worktree_directory = config.worktrees.directory();
+        self.remove_emptied = config.worktrees.remove_emptied;
         self.show_keys = config.show_keys;
         self.phone_width = config.sidebar.phone_width;
     }
@@ -2677,11 +2693,12 @@ impl App {
     }
 
     /// Asks again before removing the worktree at `path`, on `branch`,
-    /// which git found changes not committed in: a yes forces it, and they
-    /// go with it. Until then, nothing is removing it.
+    /// which git found changes not committed in, once the question on the
+    /// footer line now, if any, is answered: a yes forces it, and they go
+    /// with it. Until then, nothing is removing it.
     pub fn ask_to_force_removal(&mut self, path: PathBuf, branch: String) {
         self.removing.remove(&path);
-        self.confirm = Some(Confirm::RemoveWorktree {
+        self.ask_after(Confirm::RemoveWorktree {
             path,
             branch,
             force: true,
@@ -3844,29 +3861,14 @@ impl App {
             };
             return None;
         }
-        // Only `y` says yes; any other key says no.
+        // Only `y` says yes; any other key says no. Then the next question
+        // waiting is asked.
         if let Some(confirm) = self.confirm.take() {
-            if key.code != KeyCode::Char('y') {
-                return None;
+            let action = (key.code == KeyCode::Char('y')).then(|| self.say_yes(confirm));
+            if self.confirm.is_none() {
+                self.confirm = self.later.pop_front();
             }
-            // The tab is the TUI's to close; its sessions, the daemon's to
-            // kill.
-            if matches!(confirm, Confirm::CloseTab { .. }) {
-                self.close_tab_in_front();
-            }
-            // The daemon removes a worktree; its line says so until the
-            // daemon says it's done.
-            if let Confirm::RemoveWorktree { path, .. } | Confirm::RemoveEmptied { path, .. } =
-                &confirm
-            {
-                self.removing.insert(path.clone());
-            }
-            // Killing the last session in a worktree leaves it with nothing
-            // in it: the next question is whether it goes too.
-            if let Confirm::Kill(name) = &confirm {
-                self.confirm = self.emptied_by_killing(name);
-            }
-            return Some(confirm.action());
+            return action;
         }
         // A digit or `t` says which tab the session goes to; any other key
         // leaves it where it is.
@@ -5317,37 +5319,94 @@ impl App {
         }
     }
 
-    /// What to ask about the worktree killing the session called `name`
-    /// leaves with nothing in it, if it does: a linked worktree, not one
-    /// Claude Code made for itself, with no other session in it, in any
-    /// tab, running or not, that the daemon isn't removing already.
-    fn emptied_by_killing(&self, name: &str) -> Option<Confirm> {
-        let killed = self.sessions.iter().find(|session| session.name == name)?;
-        let worktree = killed.worktree.as_ref()?;
-        if worktree.main || worktree.claude_codes_own() || self.removing(&worktree.path) {
+    /// Says yes to `confirm`, and gives back what that asks for.
+    fn say_yes(&mut self, confirm: Confirm) -> Action {
+        match &confirm {
+            // Killing the last sessions in a worktree leaves it with
+            // nothing in it: whether it goes too is asked once the daemon
+            // has said which archived sessions ran there.
+            Confirm::Kill(name) => {
+                self.emptied = self.emptied_by_killing(std::slice::from_ref(name))
+            }
+            // The tab is the TUI's to close; its sessions, the daemon's to
+            // kill.
+            Confirm::CloseTab { sessions, .. } => {
+                self.emptied = self.emptied_by_killing(sessions);
+                self.close_tab_in_front();
+            }
+            // The daemon removes a worktree; its line says so until the
+            // daemon says it's done.
+            Confirm::RemoveWorktree { path, .. } => {
+                self.removing.insert(path.clone());
+            }
+            Confirm::RemoveEmptied(emptied) => {
+                let paths = emptied.iter().map(|emptied| emptied.path.clone());
+                self.removing.extend(paths);
+            }
+            _ => {}
+        }
+        confirm.action()
+    }
+
+    /// Asks `confirm` on the footer line, or once the question there now is
+    /// answered.
+    fn ask_after(&mut self, confirm: Confirm) {
+        match self.confirm {
+            None => self.confirm = Some(confirm),
+            Some(_) => self.later.push_back(confirm),
+        }
+    }
+
+    /// The linked worktrees killing the sessions called `names` leaves with
+    /// nothing in them, in any tab, running or not, that the daemon isn't
+    /// removing already (see [`emptied::by_killing`]); none when the
+    /// settings keep them without asking.
+    fn emptied_by_killing(&self, names: &[String]) -> Vec<Worktree> {
+        if self.remove_emptied == EmptiedWorktree::Never {
+            return Vec::new();
+        }
+        let mut emptied = emptied::by_killing(names, &self.sessions);
+        emptied.retain(|worktree| !self.removing(&worktree.path));
+        emptied
+    }
+
+    /// Takes the worktrees the sessions just killed left with nothing in
+    /// them, for the event loop to ask the daemon which archived sessions
+    /// ran in each, then [`App::ask_about_emptied`].
+    pub fn take_emptied(&mut self) -> Vec<Worktree> {
+        std::mem::take(&mut self.emptied)
+    }
+
+    /// Asks whether the worktrees in `emptied` go too, or has them removed
+    /// without asking, as `[worktrees] remove_emptied` says, counting the
+    /// `archived` sessions that ran in each: one they ran in is asked about
+    /// all the same. Gives back the removal, for the event loop to carry
+    /// out.
+    pub fn ask_about_emptied(
+        &mut self,
+        emptied: Vec<Worktree>,
+        archived: &[ArchivedSession],
+    ) -> Option<Action> {
+        let emptied = emptied
+            .into_iter()
+            .filter(|worktree| !self.removing(&worktree.path))
+            .map(|worktree| Emptied {
+                name: emptied::name(&worktree, self.label_of(&worktree.path)),
+                archived: emptied::archived_in(&worktree.path, archived),
+                path: worktree.path,
+            })
+            .collect();
+        let plan = emptied::plan(emptied, self.remove_emptied);
+        if !plan.ask.is_empty() {
+            self.ask_after(Confirm::RemoveEmptied(plan.ask));
+        }
+        if plan.remove.is_empty() {
             return None;
         }
-        let others = self.sessions.iter().any(|session| {
-            session.name != name
-                && session
-                    .worktree
-                    .as_ref()
-                    .is_some_and(|w| w.path == worktree.path)
-        });
-        if others {
-            return None;
-        }
-        let name = match self.label_of(&worktree.path) {
-            Some(label) => label.to_string(),
-            None => worktree
-                .branch
-                .clone()
-                .unwrap_or_else(|| "(detached)".to_string()),
-        };
-        Some(Confirm::RemoveEmptied {
-            path: worktree.path.clone(),
-            name,
-        })
+        let paths = plan.remove.iter().map(|emptied| emptied.path.clone());
+        self.removing.extend(paths);
+        let removals = (plan.remove.into_iter()).map(|emptied| (emptied.path, emptied.name));
+        Some(Action::RemoveWorktrees(removals.collect()))
     }
 
     /// Asks before removing the worktree at `path`, on `branch`, unless the
@@ -8533,6 +8592,50 @@ mod tests {
         assert_eq!(app.confirm(), None);
     }
 
+    /// What the event loop does once the sessions are killed: asks the
+    /// daemon which archived sessions ran where, here `archived`, and has
+    /// the App ask about the worktrees they emptied.
+    fn killed(app: &mut App, archived: &[ArchivedSession]) -> Option<Action> {
+        let emptied = app.take_emptied();
+        app.ask_about_emptied(emptied, archived)
+    }
+
+    /// The removal of the emptied worktrees on these branches.
+    fn removals_of(branches: &[&str]) -> Action {
+        let removal = |branch: &&str| {
+            let path = PathBuf::from(format!("/code/app.worktrees/{branch}"));
+            (path, branch.to_string())
+        };
+        Action::RemoveWorktrees(branches.iter().map(removal).collect())
+    }
+
+    /// A session archived from the worktree on `branch`.
+    fn archived_from(name: &str, branch: &str) -> ArchivedSession {
+        ArchivedSession {
+            id: name.into(),
+            session: crate::state::SavedSession {
+                name: name.into(),
+                command: vec!["claude".into()],
+                cwd: PathBuf::from(format!("/code/app.worktrees/{branch}")),
+                conversation: None,
+                task: None,
+                goal: None,
+                resume: None,
+                about: TaskBrief::default(),
+                name_given: false,
+                moved: None,
+            },
+            worktree: in_worktree(name, branch, State::Running).worktree,
+            archived: 1,
+        }
+    }
+
+    fn worktree_setting(app: &mut App, remove_emptied: EmptiedWorktree) {
+        let mut config = Config::default();
+        config.worktrees.remove_emptied = remove_emptied;
+        app.set_features(&config);
+    }
+
     #[test]
     fn killing_the_last_session_in_a_worktree_asks_whether_it_goes_too() {
         let mut app = App::new(None);
@@ -8546,13 +8649,15 @@ mod tests {
             press(&mut app, KeyCode::Char('y')),
             Some(Action::Kill("fixer".into()))
         );
+        assert_eq!(app.confirm(), None, "not before the daemon has answered");
+        assert_eq!(killed(&mut app, &[]), None);
         assert_eq!(
             app.confirm().map(Confirm::question).as_deref(),
             Some("nothing else is in worktree fix: remove it too? y/n")
         );
         assert_eq!(
             press(&mut app, KeyCode::Char('y')),
-            Some(removal_of("fix", false))
+            Some(removals_of(&["fix"]))
         );
         assert!(app.removing(Path::new("/code/app.worktrees/fix")));
     }
@@ -8564,6 +8669,7 @@ mod tests {
         app.select("fixer");
         press(&mut app, KeyCode::Char('x'));
         press(&mut app, KeyCode::Char('y'));
+        killed(&mut app, &[]);
         assert_eq!(press(&mut app, KeyCode::Char('n')), None);
         assert_eq!(app.confirm(), None);
         assert!(!app.removing(Path::new("/code/app.worktrees/fix")));
@@ -8584,8 +8690,111 @@ mod tests {
                 press(&mut app, KeyCode::Char('y')),
                 Some(Action::Kill(name.into()))
             );
-            assert_eq!(app.confirm(), None, "{name}");
+            assert!(app.take_emptied().is_empty(), "{name}");
         }
+    }
+
+    #[test]
+    fn the_question_counts_the_archived_sessions_that_ran_in_the_worktree() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_worktree("fixer", "fix", State::Running)]);
+        app.select("fixer");
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+        let archived = [
+            archived_from("old", "fix"),
+            archived_from("older", "fix"),
+            archived_from("elsewhere", "spike"),
+        ];
+        killed(&mut app, &archived);
+        assert_eq!(
+            app.confirm().map(Confirm::question).as_deref(),
+            Some(
+                "nothing else is in worktree fix but 2 archived sessions, which won't start \
+                 there again: remove it too? y/n"
+            )
+        );
+    }
+
+    #[test]
+    fn closing_a_tab_with_its_sessions_asks_about_every_worktree_it_empties() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('t'));
+        app.set_sessions(vec![
+            session("a"),
+            in_worktree("fixer", "fix", State::Running),
+            in_worktree("spiker", "spike", State::Exited { code: 0 }),
+        ]);
+        app.select("fixer");
+        press(&mut app, KeyCode::Char('&'));
+        let action = press(&mut app, KeyCode::Char('y'));
+        let names = vec!["fixer".to_string(), "spiker".to_string()];
+        assert_eq!(action, Some(Action::KillAll(names)));
+        killed(&mut app, &[]);
+        assert_eq!(
+            app.confirm().map(Confirm::question).as_deref(),
+            Some("nothing else is in worktrees fix and spike: remove them too? y/n")
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(removals_of(&["fix", "spike"]))
+        );
+
+        // A tab closed from the command line asks nothing.
+        assert!(app.take_emptied().is_empty());
+    }
+
+    #[test]
+    fn the_settings_can_remove_an_emptied_worktree_without_asking_or_keep_it() {
+        let mut app = App::new(None);
+        worktree_setting(&mut app, EmptiedWorktree::Always);
+        app.set_sessions(vec![in_worktree("fixer", "fix", State::Running)]);
+        app.select("fixer");
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(killed(&mut app, &[]), Some(removals_of(&["fix"])));
+        assert_eq!(app.confirm(), None);
+        assert!(app.removing(Path::new("/code/app.worktrees/fix")));
+
+        // Archived sessions that ran there are asked about all the same.
+        let mut app = App::new(None);
+        worktree_setting(&mut app, EmptiedWorktree::Always);
+        app.set_sessions(vec![in_worktree("fixer", "fix", State::Running)]);
+        app.select("fixer");
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(killed(&mut app, &[archived_from("old", "fix")]), None);
+        let question = app.confirm().map(Confirm::question).unwrap();
+        assert!(question.contains("an archived session"), "{question}");
+
+        let mut app = App::new(None);
+        worktree_setting(&mut app, EmptiedWorktree::Never);
+        app.set_sessions(vec![in_worktree("fixer", "fix", State::Running)]);
+        app.select("fixer");
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.take_emptied().is_empty());
+    }
+
+    #[test]
+    fn each_worktree_with_changes_is_asked_about_in_turn() {
+        let mut app = App::new(None);
+        app.ask_to_force_removal("/code/app.worktrees/fix".into(), "fix".into());
+        app.ask_to_force_removal("/code/app.worktrees/spike".into(), "spike".into());
+        assert_eq!(
+            app.confirm().map(Confirm::question).as_deref(),
+            Some("fix has uncommitted changes: remove it and lose them? y/n")
+        );
+        assert_eq!(press(&mut app, KeyCode::Char('n')), None);
+        assert_eq!(
+            app.confirm().map(Confirm::question).as_deref(),
+            Some("spike has uncommitted changes: remove it and lose them? y/n")
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(removal_of("spike", true))
+        );
+        assert_eq!(app.confirm(), None);
     }
 
     #[test]

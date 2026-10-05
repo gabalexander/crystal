@@ -2111,8 +2111,10 @@ impl Tui {
                 }
             }
             Action::Kill(name) => {
+                let emptied = self.app.take_emptied();
                 client::ask(&self.socket, &Request::Kill { name }, false)?;
                 self.refresh_sessions()?;
+                self.ask_about_emptied(emptied)?;
             }
             Action::ForgetProject(path) => {
                 client::ask(&self.socket, &Request::RemoveProject { dir: path }, false)?;
@@ -2171,6 +2173,7 @@ impl Tui {
                 self.project_command(which, &worktree)?;
             }
             Action::KillAll(names) => {
+                let emptied = self.app.take_emptied();
                 // One that has gone already is no reason to spare the rest.
                 let mut failed = None;
                 for name in names {
@@ -2182,6 +2185,7 @@ impl Tui {
                 if let Some(err) = failed {
                     return Err(err);
                 }
+                self.ask_about_emptied(emptied)?;
             }
             Action::Rename { name, new_name } => {
                 client::rename(&self.socket, &name, &new_name)?;
@@ -2225,6 +2229,15 @@ impl Tui {
                         .map_err(|err| removal_refused(&path, &err));
                     Event::WorktreeRemoved { path, removed }
                 });
+            }
+            Action::RemoveWorktrees(worktrees) => {
+                for (path, branch) in worktrees {
+                    self.perform(Action::RemoveWorktree {
+                        path,
+                        branch,
+                        force: false,
+                    })?;
+                }
             }
             Action::Type { to, key } => {
                 if let Some(pane) = self.pane_in(to)
@@ -3011,6 +3024,24 @@ impl Tui {
         self.list_worktrees_again();
         if let Err(err) = self.refresh_sessions() {
             self.app.notify(format!("{err:#}"));
+        }
+    }
+
+    /// Has the user asked whether the worktrees the sessions just killed
+    /// left with nothing in them go too, or has them removed, as the
+    /// settings say, once the daemon has said which archived sessions ran
+    /// in them.
+    fn ask_about_emptied(&mut self, emptied: Vec<Worktree>) -> Result<()> {
+        if emptied.is_empty() {
+            return Ok(());
+        }
+        let archived = match client::ask(&self.socket, &Request::Archived, false)? {
+            Some(Response::Archived { sessions }) => sessions,
+            _ => Vec::new(),
+        };
+        match self.app.ask_about_emptied(emptied, &archived) {
+            Some(removal) => self.perform(removal),
+            None => Ok(()),
         }
     }
 

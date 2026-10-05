@@ -266,6 +266,15 @@ CREATE TABLE screens (
 );
 ";
 
+/// The worktree a session was on its way into when it was written down, as
+/// JSON (see [`crate::state::MovedTo`]): it starts again there after a
+/// restart, its agent told it has moved. `NULL` for one staying where it
+/// is.
+const MOVED: &str = "
+ALTER TABLE sessions ADD COLUMN moved TEXT;
+ALTER TABLE archived ADD COLUMN moved TEXT;
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
@@ -282,13 +291,14 @@ const MIGRATIONS: &[&str] = &[
     ABOUT,
     NAME_GIVEN,
     SCREENS,
+    MOVED,
 ];
 
 /// The file each project kept its backlog in before the database.
 const OLD_BACKLOG: &str = "backlog.json";
 
 const SESSION_COLUMNS: &str =
-    "name, command, cwd, conversation, task, goal, resume, about, name_given";
+    "name, command, cwd, conversation, task, goal, resume, about, name_given, moved";
 const RUN_COLUMNS: &str =
     "name, flow, profiles, goal, cwd, worktree, round, feedback, steps, started";
 const TASK_COLUMNS: &str = "project_name, goal, session, branch, background, backlog, failed, \
@@ -391,7 +401,7 @@ impl Db {
         self.conn.execute(
             &format!(
                 "INSERT OR REPLACE INTO archived (id, {SESSION_COLUMNS}, worktree, archived) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
             ),
             params![
                 archived.id,
@@ -404,6 +414,7 @@ impl Db {
                 json_or_null(&session.resume)?,
                 brief_json(&session.about)?,
                 session.name_given,
+                json_or_null(&session.moved)?,
                 json_or_null(&archived.worktree)?,
                 archived.archived as i64,
             ],
@@ -935,7 +946,7 @@ fn write_sessions(conn: &Connection, sessions: &[SavedSession]) -> Result<()> {
         conn.execute(
             &format!(
                 "INSERT INTO sessions (position, {SESSION_COLUMNS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
             ),
             params![
                 position as i64,
@@ -948,6 +959,7 @@ fn write_sessions(conn: &Connection, sessions: &[SavedSession]) -> Result<()> {
                 json_or_null(&session.resume)?,
                 brief_json(&session.about)?,
                 session.name_given,
+                json_or_null(&session.moved)?,
             ],
         )?;
     }
@@ -969,15 +981,16 @@ fn session_of(row: &Row) -> Result<SavedSession> {
         resume: from_json_or_null(row.get(6)?)?,
         about: from_json_or_null(row.get(7)?)?.unwrap_or_default(),
         name_given: row.get(8)?,
+        moved: from_json_or_null(row.get(9)?)?,
     })
 }
 
 fn archived_of(row: &Row) -> Result<ArchivedSession> {
     Ok(ArchivedSession {
         session: session_of(row)?,
-        id: row.get(9)?,
-        worktree: from_json_or_null(row.get(10)?)?,
-        archived: row.get::<_, i64>(11)? as u64,
+        id: row.get(10)?,
+        worktree: from_json_or_null(row.get(11)?)?,
+        archived: row.get::<_, i64>(12)? as u64,
     })
 }
 
@@ -1260,6 +1273,7 @@ mod tests {
             resume: None,
             about: Default::default(),
             name_given: false,
+            moved: None,
         }
     }
 
@@ -1366,7 +1380,14 @@ mod tests {
             name_given: true,
             ..saved("a")
         };
-        let sessions = vec![reported, task, named];
+        // One on its way into another worktree goes with where to.
+        let mut moving = saved("b");
+        moving.cwd = PathBuf::from("/code/app.worktrees/fix");
+        moving.moved = Some(crate::state::MovedTo {
+            path: PathBuf::from("/code/app.worktrees/fix"),
+            branch: Some("fix".into()),
+        });
+        let sessions = vec![reported, task, named, moving];
         db.save_sessions(&sessions).unwrap();
         assert_eq!(db.sessions().unwrap(), sessions);
 
