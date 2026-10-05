@@ -2762,13 +2762,9 @@ impl Daemon {
         let id = tasks::parse_id(handle).with_context(|| {
             format!("there's no task or session called {handle}: give a task's number, like t12")
         })?;
-        let pending = {
-            let db = self.db.lock().unwrap();
-            let pending = db.pending_task(id)?;
-            let pending = pending.with_context(|| format!("there's no open task t{id}"))?;
-            db.remove_pending_task(id)?;
-            pending
-        };
+        let pending = self.db.lock().unwrap().pending_task(id)?;
+        let pending = pending.with_context(|| format!("there's no open task t{id}"))?;
+        let project = project::of(&pending.cwd).path;
         let closed = now_seconds();
         let cancelled = TaskRecord {
             outcome: Some(TaskOutcome::new(
@@ -2779,7 +2775,18 @@ impl Daemon {
             pending: false,
             ..tasks::pending_record(&pending)
         };
-        self.write_down(&pending.cwd, None, &cancelled);
+        {
+            // Closed as it stops waiting to start, in one go, so that
+            // whoever looks for it meanwhile finds it one way or the other;
+            // and once, though it's cancelled twice at once.
+            let mut db = self.db.lock().unwrap();
+            ensure!(db.remove_pending_task(id)?, "there's no open task t{id}");
+            if let Err(err) = db.record_task(&project, &cancelled) {
+                eprintln!("crystal daemon: couldn't write down a closed task: {err:#}");
+            }
+        }
+        let event = Event::pending_task(Kind::TaskClosed, project, cancelled);
+        self.events.emit(event);
         Ok(())
     }
 

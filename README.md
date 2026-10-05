@@ -503,6 +503,7 @@ crystal attach review                       # show a session; Ctrl+\ hands your 
 crystal send review "check the diff"        # type into a session and press Enter
 crystal send-keys review 1                  # press keys: an answer, Enter, Escape, C-c, Up…
 crystal wait review                         # block until its agent stops working; print how it ended
+crystal wait t12                            # block until task t12 closes; print done, failed or cancelled
 crystal read review --lines 20              # print the last 20 rows of its screen
 crystal read review --history               # and what scrolled off it before
 crystal read review --since 10m             # only what it wrote in the last ten minutes
@@ -1715,12 +1716,30 @@ crystal send-keys reviewer 1 --wait                       # answer a question: t
 
 `send` types the way a person does: the text first, marked as a paste when the program asks for that, then
 Enter on its own, so an agent takes it as a prompt and not as pasted text. `-` as the text reads it from
-standard input: `git diff | crystal send reviewer -`. `--wait` waits for the turn the text starts, not one that
-ended before it. `wait` returns once the agent isn't working: `done`, `waiting` when it asks something,
-`idle`, or how its program exited. It takes a `--timeout` in seconds, and gives up when that runs out, with
-exit status 2; anything else that goes wrong, a mistyped flag included, is 1, so 2 always means "not yet".
-`--quiet` (`-q`) prints nothing once it's there. `send --wait`, `send-keys --wait`, `task --wait` and `flow
-wait` give up the same way. A program that doesn't say what it's doing counts as busy until it ends.
+standard input: `git diff | crystal send reviewer -`. `wait` returns once the agent isn't working: `done`,
+`waiting` when it asks something, `idle`, or how its program exited. It takes a `--timeout` in seconds, and
+gives up when that runs out, with exit status 2; anything else that goes wrong, a mistyped flag included, is
+1, so 2 always means "not yet". `--quiet` (`-q`) prints nothing once it's there. `send --wait`, `send-keys
+--wait`, `task --wait` and `flow wait` give up the same way. A program that doesn't say what it's doing counts
+as busy until it ends.
+
+`send --wait` waits for the turn the text starts, never one that ended before it: it listens to the session
+from before the text goes. An agent that wasn't working has five seconds from then to be seen starting on it,
+working, asking something, or its program ending; if it isn't, the prompt has stalled, and `send` fails with an
+error that starts `agent_prompt_stalled:`, with exit status 3, rather than taking what the agent said about its
+turn before for an answer. A stall doesn't prove the agent never got the text, which a turn too short to see
+can take, so `read` it before sending the text again. An agent working already takes the text once its turn
+is over, and that turn's end may be what ends the wait. A program that doesn't say what it's doing is waited on
+until it's seen starting or it ends, with no five seconds. `send-keys --wait` waits the five seconds for the
+turn the keys start too, then goes on either way: keys can start nothing to see, or carry on a turn its agent
+doesn't say it's working on, like an answer to a permission.
+
+| Exit status | `wait`, `send --wait`, `send-keys --wait`, `task --wait`, `flow wait` |
+|---|---|
+| 0 | it got there, and printed where |
+| 1 | anything else went wrong: no such session, it ended or was killed first, a mistyped flag |
+| 2 | `--timeout` ran out first: not yet |
+| 3 | `send --wait` only: the agent was never seen starting on what it was sent (`agent_prompt_stalled:`) |
 
 An agent asking you something takes nothing `send` types, since the text would land in its question: `send`
 refuses with an error that starts `agent_blocked:`, saying what it asks and how to answer it, with `crystal
@@ -1747,8 +1766,10 @@ terminal is stopped by its own key, which crystal doesn't press for another sess
 
 ```sh
 crystal wait reviewer --until waiting         # until it asks something; prints waiting
-crystal wait reviewer --until done,idle       # any of them: working, waiting, done, idle, ended
+crystal wait reviewer --until done,idle       # any of them: working, waiting, done, idle, ended, closed
 crystal wait server --output 'listening on'   # until a line on its screen matches; prints the line
+crystal wait t12                              # until task t12 closes; prints done, failed or cancelled
+crystal wait t12 --until waiting,closed       # until its agent asks something, or the task closes
 ```
 
 `--until` returns at once if the session is there already, and catches a state it's in only a moment, like
@@ -1758,6 +1779,14 @@ what it waits for, is an error. `--output` takes a regular expression, matched a
 screen and the 200 rows above it, so output already there counts. Both take `--timeout`. Waits listen to the
 daemon's [events](#events) rather than asking it again and again, and `--output` looks each time the program
 writes.
+
+`wait` takes a [task](#tasks)'s number, like `t12`, where it takes a session's name, and waits until the task
+closes, printing how it went: `done`, `failed` or `cancelled`. It follows the task whichever session works on
+it, from a task made to start later to one whose session has gone, and returns at once for one that's closed
+already. `--until closed` waits for a session's task to close the same way; a session with no task is refused.
+Beside other states, as in `--until waiting,closed`, those are about the session working on the task. A
+session that ends, or is killed, with its task open closes it, failed or cancelled, which the wait prints
+rather than failing. A closed task isn't always over: a follow-up opens a background task again.
 
 `send-keys` presses keys instead, the way tmux's does: key names like `Enter`, `Escape`, `Tab`, `Up`, `Down`,
 `BSpace`, `C-c` or `M-x`, and any other word typed as keys. That's what answers an agent's question, since
@@ -2452,6 +2481,7 @@ crystal tasks new --issue 7                         # to fix issue 7
 crystal tasks new --no-launch "Tidy the README"     # made now, started later: prints t13
 crystal tasks start t13                             # start it; prints its session's name
 crystal tasks show t12                              # how it stands, its session, what it asks for and costs
+crystal wait t12                                    # until it closes; prints done, failed or cancelled
 crystal tasks cancel t12                            # cancel it, and stop its session
 crystal tasks log t12                               # how it stands, then its session's transcript
 crystal tasks terminal t12                          # a background task, opened in a terminal
