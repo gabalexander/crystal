@@ -412,7 +412,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     from the sessions the TUI sees waiting their turn, and those that failed, said once; pure
   - `settings_view.rs`: the settings view (`,`): the settings in tabs (general, look, sessions, mouse, tasks,
     memory), each under its heading, changed with a key, gone through with the arrows or typed in, or taken out
-    of the file for its default, and how the models stand; crystal's hooks in each agent installed here, put
+    of the file for its default, and how the models stand, and with Gemini, where its key is or why it last
+    failed; crystal's hooks in each agent installed here, put
     in, brought up to date or taken out with a key; and the keys' tab, every key `[keys]` gives or those `/`'s
     filter finds, the key pressed next given one, one another has taken from it, or an installed plugin's
     action takes, once the user says so; a click on a tab or a row, and the wheel, where `hit` says the mouse
@@ -744,10 +745,20 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   its weights as it loads) and jina-reranker-v3, both run through Candle on a Mac's GPU (Metal, bfloat16) or
   the CPU, one call at a time (Candle on Metal answers wrong to threads running models at once); `Embed` (the
   models, or a stand-in in tests), with the scores from which the reranker counts an entry and from which two
-  entries say the same thing, measured on crystal's own memory, and a vector that isn't numbers made again
-  once; downloading both at pinned revisions with their SHA-256s checked, by the daemon as it starts unless
-  `CRYSTAL_NO_MODEL_DOWNLOAD` is set; and the one copy each process loads when `[memory] embeddings` is on;
-  memory.rs keeps the vectors and merges the rankings
+  entries say the same thing, measured on crystal's own memory, each `Embed`'s own, and a vector that isn't
+  numbers made again once; downloading both at pinned revisions with their SHA-256s checked, by the daemon as
+  it starts unless `CRYSTAL_NO_MODEL_DOWNLOAD` is set; the one copy each process loads when `[memory]
+  embeddings` is on, the reranker as it loads and the model that makes vectors once it's first asked for one;
+  with `embedder = "gemini"`, `Remote`: Gemini's vectors, the reranker here, and the model here to fall back
+  on while Gemini fails; and how search by meaning stands (`Status`); memory.rs keeps the vectors, one from
+  each model, and merges the rankings
+- `src/gemini.rs`: search by meaning through Google's Gemini API (`gemini-embedding-2`): its key read from
+  `gemini_key_file` or `GEMINI_API_KEY`/`GOOGLE_API_KEY` for each request and handed to `curl` on its
+  standard input with the request (never argv, the config file or a log), entries a hundred to a
+  `batchEmbedContents`, four at once, each text after Google's task prefix with credentials taken out, a
+  query's vector kept an hour, a failure said once and kept for the status with no request tried for a while
+  after it (as long as a 429 asks, or until the key changes), the thresholds measured for it at each size,
+  and what its tokens cost; `CRYSTAL_GEMINI_URL` points it elsewhere, as tests do, at a fake server
 - `src/qwen3.rs`: Qwen3, the transformer both models are, adapted from candle-transformers' to read texts whole:
   no cache, a batch padded at its end, causal attention through Candle's fused kernel on Metal (past 8 tokens,
   below which Candle's kernel isn't causal)
@@ -772,7 +783,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   proposes no longer holds, kept beside the memory until `--apply` makes it so), adding, deduping and grouping
   what's near through the daemon, which keeps the models loaded, and listing and exporting through it, which
   keeps each worktree's words, or here without one, and an entry in full as `show` and the `memory_show`
-  tool print it, with what's gone, or one that stopped holding as it was, with what holds in its place
+  tool print it, with what's gone, or one that stopped holding as it was, with what holds in its place;
+  `embed` (with Gemini, its vectors first and what Google counted) and `status`, how search by meaning
+  stands, as the daemon has it or here
 - `src/profile.rs`: agent profiles: what one runs, its prompt and postfix around the task or alone with no
   task (`skip_task`), how it's meant to start (`launch`: a session, a task or a background task), checking it,
   and saving or removing one in the config file with `toml_edit`, so the user's comments and layout stay;

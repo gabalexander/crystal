@@ -35,6 +35,7 @@ mod flow_run;
 mod flows;
 mod forge;
 mod front;
+mod gemini;
 mod git;
 mod handoff;
 mod handover;
@@ -1478,10 +1479,14 @@ enum MemoryCommand {
         #[arg(long)]
         apply: bool,
     },
-    /// Download the model that searches by meaning, if it isn't here yet,
-    /// and give every entry its vector: see `embeddings` under `[memory]`
-    /// in the config.
+    /// Give every entry its vector from what searches by meaning, and
+    /// download the models here, if they aren't yet: see `embeddings` and
+    /// `embedder` under `[memory]` in the config.
     Embed,
+    /// How search by meaning stands: what turns texts into vectors, how
+    /// many entries have theirs, the models here, and with Gemini, where
+    /// its key is and how its last request went.
+    Status,
     /// Have a model read what a session did and keep what a later session
     /// would need, now: what happens by itself once a task closes.
     Distill {
@@ -2838,6 +2843,7 @@ fn run(cli: Cli) -> Result<()> {
                 memory_cli::kind(&socket, dir, kinding)?;
             }
             Some(MemoryCommand::Embed) => memory_cli::embed(&socket)?,
+            Some(MemoryCommand::Status) => memory_cli::status(&socket)?,
             Some(MemoryCommand::Dedupe { apply }) => memory_cli::dedupe(&socket, dir, apply)?,
             Some(MemoryCommand::Retire { id, by, why }) => {
                 memory_cli::retire(&socket, dir, id, by, why)?;

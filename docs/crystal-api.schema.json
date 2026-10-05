@@ -670,12 +670,29 @@
           "type": "integer",
           "format": "uint",
           "minimum": 0,
-          "description": "How many entries every project has, and how many of them have their vector from the model."
+          "description": "How many entries every project has, and how many of them have their vector from the model searches use now."
         },
         "embedded": {
           "type": "integer",
           "format": "uint",
           "minimum": 0
+        },
+        "embedder": {
+          "type": "string",
+          "description": "What searches use, as its vectors are kept under: `MODEL`, or Gemini's model at its size.",
+          "default": ""
+        },
+        "gemini": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GeminiStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How Gemini stands, while searches use it.",
+          "default": null
         }
       },
       "required": [
@@ -1610,6 +1627,53 @@
         }
       ],
       "description": "What's in front in a session's terminal: the program its keys go to."
+    },
+    "GeminiStatus": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string",
+          "description": "The model and its size, as each vector is kept under: `gemini-embedding-2@768`."
+        },
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Where the key is read from, or `None` with none found."
+        },
+        "key_shared": {
+          "type": "boolean",
+          "description": "Whether the key's file can be read by others than its owner."
+        },
+        "failed": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why the key can't be had, or why the last request failed, while none has worked since; and how many seconds ago it failed."
+        },
+        "failed_secs_ago": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "How many tokens Google has counted since the process started."
+        }
+      },
+      "required": [
+        "model",
+        "key_shared",
+        "tokens"
+      ],
+      "description": "How the Gemini API stands for memory, as the daemon says it does."
     },
     "HandoffAbout": {
       "type": "object",

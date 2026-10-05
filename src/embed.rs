@@ -14,11 +14,20 @@
 //! leaves the second out. They aren't part of crystal: the daemon, or
 //! `crystal memory embed`, downloads them once, at pinned revisions, checks
 //! each file against its SHA-256, and keeps them in crystal's cache
-//! directory. Until they're there, a search goes by words alone.
+//! directory. Until they're there, a search goes by words alone. Each is
+//! loaded once it's first needed.
+//!
+//! With `embedder = "gemini"`, Google's Gemini API turns texts into vectors
+//! in place of the first ([`crate::gemini`]), and the reranker still reads
+//! the best of each search; when Gemini fails, a search goes by the model
+//! here, when it's downloaded ([`Remote`]). Each entry keeps a vector from
+//! each, so going from one to the other, or back, embeds again only what
+//! the other hasn't.
 //!
 //! Both models are licensed CC BY-NC 4.0: for use that isn't commercial.
 
-use crate::config::{Config, MemorySettings};
+use crate::config::{self, Config, MemorySettings};
+use crate::gemini::{self, Gemini};
 use crate::output::errln;
 use crate::qwen3::{self, Qwen3};
 use crate::rerank::Reranker;
@@ -102,6 +111,10 @@ const MAX_TOKENS: usize = 512;
 
 /// How many texts go through the model at once.
 const BATCH: usize = 16;
+
+/// How many entries with no vector yet are given one between writes to the
+/// database, by the model here.
+const EMBED_BATCH: usize = 32;
 
 /// What goes ahead of a query and of an entry, as the model was trained.
 const QUERY: &str = "Query: ";
@@ -252,7 +265,22 @@ pub trait Embed {
     fn near_from(&self) -> f32 {
         NEAR_FROM
     }
+
+    /// How many entries with no vector yet to give one between writes to
+    /// the database: what's done is kept, should the rest fail.
+    fn batch(&self) -> usize {
+        EMBED_BATCH
+    }
+
+    /// What to search with when this fails: the model on this machine, for
+    /// Gemini.
+    fn fallback(&self) -> Option<&dyn Embed> {
+        None
+    }
 }
+
+/// What a search asks of, shared between threads.
+pub type Shared = Arc<dyn Embed + Send + Sync>;
 
 /// Where the models run: on a Mac's GPU in bfloat16, the weights as they
 /// come, unless it can't be had (or `CRYSTAL_MODELS_ON_CPU` is set);
@@ -269,15 +297,15 @@ fn device() -> (Device, DType) {
 }
 
 /// The model that turns texts into vectors, loaded.
-pub struct Embedder {
+struct Encoder {
     model: Qwen3,
     tokenizer: Tokenizer,
 }
 
-impl Embedder {
+impl Encoder {
     /// The model whose files are in `dir`, its retrieval adapter folded into
     /// its weights.
-    fn load(dir: &Path, device: &Device, dtype: DType) -> Result<Embedder> {
+    fn load(dir: &Path, device: &Device, dtype: DType) -> Result<Encoder> {
         let config: qwen3::Config =
             serde_json::from_str(&fs::read_to_string(dir.join("config.json"))?)?;
         let adapter = dir.join("adapters/retrieval");
@@ -301,7 +329,7 @@ impl Embedder {
                 ..TruncationParams::default()
             }))
             .map_err(|err| anyhow!(err))?;
-        Ok(Embedder { model, tokenizer })
+        Ok(Encoder { model, tokenizer })
     }
 
     /// Each text's vector: its last token's state (the end-of-text token the
@@ -374,23 +402,26 @@ fn with_adapter(base: &Path, adapter: &Path, scale: f64) -> Result<HashMap<Strin
     Ok(weights)
 }
 
-/// Both models, loaded: the one that turns texts into vectors, and the
+/// Both models: the one that turns texts into vectors, loaded once it's
+/// first asked for one (with Gemini, only once Gemini fails), and the
 /// reranker, unless the config leaves it out.
 pub struct Models {
-    embedder: Embedder,
+    root: PathBuf,
+    device: Device,
+    dtype: DType,
+    /// The model that turns texts into vectors once it's loaded, held while
+    /// either model runs: Candle on a Mac's GPU gives wrong answers to
+    /// threads that run models at once, and the GPU would run them one
+    /// after another anyway.
+    lane: Mutex<Option<Encoder>>,
     reranker: Option<Reranker>,
-    /// Held while either model runs: Candle on a Mac's GPU gives wrong
-    /// answers to threads that run models at once, and the GPU would run
-    /// them one after another anyway.
-    lane: Mutex<()>,
 }
 
 impl Models {
-    /// The models whose files are under `root`.
+    /// The models whose files are under `root`: the reranker loaded now,
+    /// with `rerank`.
     pub fn load(root: &Path, rerank: bool) -> Result<Models> {
         let (device, dtype) = device();
-        let embedder = Embedder::load(&EMBEDDER.dir(root), &device, dtype)
-            .with_context(|| format!("couldn't load {MODEL}"))?;
         let reranker = if rerank {
             Some(
                 Reranker::load(&RERANKER.dir(root), &device, dtype)
@@ -400,14 +431,29 @@ impl Models {
             None
         };
         Ok(Models {
-            embedder,
+            root: root.to_path_buf(),
+            device,
+            dtype,
+            lane: Mutex::new(None),
             reranker,
-            lane: Mutex::new(()),
         })
     }
 
     fn has_reranker(&self) -> bool {
         self.reranker.is_some()
+    }
+
+    /// The vectors of `texts`, the model that makes them loaded first if it
+    /// isn't yet.
+    fn vectors(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        let mut lane = self.lane.lock().unwrap_or_else(PoisonError::into_inner);
+        if lane.is_none() {
+            let dir = EMBEDDER.dir(&self.root);
+            let encoder = Encoder::load(&dir, &self.device, self.dtype)
+                .with_context(|| format!("couldn't load {MODEL}"))?;
+            *lane = Some(encoder);
+        }
+        lane.as_ref().expect("loaded just now").vectors(texts)
     }
 }
 
@@ -425,26 +471,21 @@ impl Embed for Models {
     }
 
     fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let _lane = self.lane.lock().unwrap_or_else(PoisonError::into_inner);
         let texts: Vec<String> = texts
             .iter()
             .map(|text| format!("{PASSAGE}{text}"))
             .collect();
-        let vectors = self.embedder.vectors(texts.clone())?;
-        again_unless_numbers(vectors, &texts, |text| {
-            self.embedder.vectors(vec![text.to_string()])
-        })
+        let vectors = self.vectors(texts.clone())?;
+        again_unless_numbers(vectors, &texts, |text| self.vectors(vec![text.to_string()]))
     }
 
     fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
-        let _lane = self.lane.lock().unwrap_or_else(PoisonError::into_inner);
         let texts = vec![format!("{QUERY}{text}")];
-        let vectors = self.embedder.vectors(texts.clone())?;
-        let vector = again_unless_numbers(vectors, &texts, |text| {
-            self.embedder.vectors(vec![text.to_string()])
-        })?
-        .pop()
-        .context("the model gave no vector")?;
+        let vectors = self.vectors(texts.clone())?;
+        let vector =
+            again_unless_numbers(vectors, &texts, |text| self.vectors(vec![text.to_string()]))?
+                .pop()
+                .context("the model gave no vector")?;
         if !is_numbers(&vector) {
             bail!("the model gave a vector that isn't numbers");
         }
@@ -457,6 +498,64 @@ impl Embed for Models {
             Some(reranker) => Ok(Some(reranker.scores(query, passages)?)),
             None => Ok(None),
         }
+    }
+}
+
+/// Gemini turning texts into vectors, the reranker here reading the best
+/// of a search, and the model here what a search falls back on while
+/// Gemini fails: both of them only when they're downloaded.
+pub struct Remote {
+    gemini: Arc<Gemini>,
+    local: Option<Arc<Models>>,
+}
+
+impl Embed for Remote {
+    fn model(&self) -> &str {
+        self.gemini.name()
+    }
+
+    fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.gemini.embed_documents(texts)
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.gemini.embed_query(text)
+    }
+
+    fn min_similarity(&self) -> f32 {
+        self.gemini.thresholds().min_similarity
+    }
+
+    fn near_best(&self) -> f32 {
+        self.gemini.thresholds().near_best
+    }
+
+    fn same_from(&self) -> f32 {
+        self.gemini.thresholds().same_from
+    }
+
+    fn alike_from(&self) -> f32 {
+        self.gemini.thresholds().alike_from
+    }
+
+    fn near_from(&self) -> f32 {
+        self.gemini.thresholds().near_from
+    }
+
+    fn rerank(&self, query: &str, passages: &[&str]) -> Result<Option<Vec<f32>>> {
+        match &self.local {
+            Some(models) => models.rerank(query, passages),
+            None => Ok(None),
+        }
+    }
+
+    /// As many as go in the requests Gemini is sent at once.
+    fn batch(&self) -> usize {
+        gemini::BATCH * gemini::AT_ONCE
+    }
+
+    fn fallback(&self) -> Option<&dyn Embed> {
+        self.local.as_deref().map(|models| models as &dyn Embed)
     }
 }
 
@@ -490,11 +589,41 @@ fn again_unless_numbers(
 /// The models, once a process has loaded them.
 static LOADED: Mutex<Option<Arc<Models>>> = Mutex::new(None);
 
-/// The models, loaded once in each process and kept, when the config says
-/// to search with them and they've been downloaded. With the config saying
-/// not to, a process that had them loaded lets them go; with it leaving the
-/// reranker out, or putting it back, they're loaded again to match.
-pub fn shared(settings: &MemorySettings) -> Option<Arc<Models>> {
+/// What searches by meaning, as the config says: the models here, loaded
+/// once in each process and kept, once they're downloaded; or Gemini, with
+/// them beside it when they are. With the config saying not to search by
+/// meaning, a process that had the models loaded lets them go; with it
+/// leaving the reranker out, or putting it back, they're loaded again to
+/// match.
+pub fn shared(settings: &MemorySettings) -> Option<Shared> {
+    let local = local(settings);
+    match settings.embedder {
+        _ if !settings.embeddings => None,
+        config::Embedder::Local => local.map(|models| models as Shared),
+        config::Embedder::Gemini => Some(Arc::new(Remote {
+            gemini: gemini::shared(settings),
+            local,
+        })),
+    }
+}
+
+/// Gemini alone, without the models here: what `crystal memory embed`
+/// gives entries their vectors with, which needs nothing loaded.
+pub fn gemini_alone(settings: &MemorySettings) -> Remote {
+    Remote {
+        gemini: gemini::shared(settings),
+        local: None,
+    }
+}
+
+impl Remote {
+    pub fn status(&self) -> gemini::Status {
+        self.gemini.status()
+    }
+}
+
+/// The models here, loaded as [`shared`] says.
+fn local(settings: &MemorySettings) -> Option<Arc<Models>> {
     let mut loaded = LOADED.lock().unwrap();
     if !settings.embeddings {
         *loaded = None;
@@ -521,6 +650,54 @@ pub fn shared(settings: &MemorySettings) -> Option<Arc<Models>> {
             None
         }
     }
+}
+
+/// The name the vectors searches use now are kept under: the model's here,
+/// or Gemini's at its size.
+pub fn model_now(settings: &MemorySettings) -> String {
+    match settings.embedder {
+        config::Embedder::Local => MODEL.to_string(),
+        config::Embedder::Gemini => gemini_model(settings),
+    }
+}
+
+/// The name Gemini's vectors are kept under, its model and size as the
+/// settings give them, whether searches use it or not.
+pub fn gemini_model(settings: &MemorySettings) -> String {
+    gemini::name(
+        settings.gemini_model.trim().trim_start_matches("models/"),
+        settings.gemini_dimensions,
+    )
+}
+
+/// How search by meaning stands in this process, as `settings` say: the
+/// models' files here, whether it has them loaded, how many entries have
+/// their vector from what searches use, and how Gemini stands, when that's
+/// it. What the daemon is doing to get them ready is for it to say.
+pub fn status(socket: &Path, settings: &MemorySettings) -> Result<Status> {
+    let embedder = model_now(settings);
+    let (entries, embedded) = crate::memory::Store::open(socket)?.counts(&embedder)?;
+    let gemini = (settings.embeddings && settings.embedder == config::Embedder::Gemini)
+        .then(|| gemini::shared(settings).status());
+    Ok(Status {
+        on_disk: models_dir().map_or(0, |dir| on_disk(&dir)),
+        size: size(),
+        loaded: is_loaded(),
+        preparing: None,
+        failed: None,
+        entries,
+        embedded,
+        embedder,
+        gemini,
+    })
+}
+
+/// Whether Gemini is what searches use, and would be asked now: it has a
+/// key, and isn't resting after a failure.
+pub fn gemini_ready(settings: &MemorySettings) -> bool {
+    settings.embeddings
+        && settings.embedder == config::Embedder::Gemini
+        && gemini::shared(settings).ready()
 }
 
 /// Whether this process has the models loaded.
@@ -552,9 +729,16 @@ pub struct Status {
     /// Why getting them ready last failed.
     pub failed: Option<String>,
     /// How many entries every project has, and how many of them have their
-    /// vector from the model.
+    /// vector from the model searches use now.
     pub entries: usize,
     pub embedded: usize,
+    /// What searches use, as its vectors are kept under: `MODEL`, or
+    /// Gemini's model at its size.
+    #[serde(default)]
+    pub embedder: String,
+    /// How Gemini stands, while searches use it.
+    #[serde(default)]
+    pub gemini: Option<gemini::Status>,
 }
 
 impl Status {
@@ -584,12 +768,12 @@ pub fn size() -> u64 {
 }
 
 /// [`shared`], by the config file as it is now.
-pub fn shared_now() -> Option<Arc<Models>> {
+pub fn shared_now() -> Option<Shared> {
     shared(&Config::load().ok()?.memory)
 }
 
 /// What a search is given of [`shared`]'s answer.
-pub fn as_embed(models: &Option<Arc<Models>>) -> Option<&dyn Embed> {
+pub fn as_embed(models: &Option<Shared>) -> Option<&dyn Embed> {
     models.as_deref().map(|models| models as &dyn Embed)
 }
 
