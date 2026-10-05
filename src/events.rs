@@ -78,6 +78,7 @@ pub enum Kind {
     MemoryChanged,
     MemoryDistilled,
     MemoryDistillFailed,
+    MemoryMerged,
     BacklogAdded,
     BacklogClosed,
     PluginPaused,
@@ -97,7 +98,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 64] = [
+    pub const ALL: [Kind; 65] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -146,6 +147,7 @@ impl Kind {
         Kind::MemoryChanged,
         Kind::MemoryDistilled,
         Kind::MemoryDistillFailed,
+        Kind::MemoryMerged,
         Kind::BacklogAdded,
         Kind::BacklogClosed,
         Kind::PluginPaused,
@@ -215,6 +217,7 @@ impl Kind {
             Kind::MemoryChanged => "memory.changed",
             Kind::MemoryDistilled => "memory.distilled",
             Kind::MemoryDistillFailed => "memory.distill_failed",
+            Kind::MemoryMerged => "memory.merged",
             Kind::BacklogAdded => "backlog.added",
             Kind::BacklogClosed => "backlog.closed",
             Kind::PluginPaused => "plugin.paused",
@@ -292,6 +295,9 @@ impl Kind {
             Kind::MemoryChanged => "an entry's kind is changed, by you or by the distiller",
             Kind::MemoryDistilled => "the distiller has read what a session did",
             Kind::MemoryDistillFailed => "the distiller couldn't read what a session did",
+            Kind::MemoryMerged => {
+                "entries that say the same thing are merged into one, by `crystal memory dedupe`"
+            }
             Kind::BacklogAdded => "an item goes on a project's backlog",
             Kind::BacklogClosed => "an item is marked done",
             Kind::PluginPaused => "a plugin is paused for failing",
@@ -379,7 +385,8 @@ pub struct Event {
     /// was doing before it changed, or the agent that let go of it; a
     /// renamed tab's old name, the number a tab had before it moved or of
     /// the tab in front before, the number of the tab a session moved
-    /// from, or the session or project the user was on before.
+    /// from, or the session or project the user was on before; the ids of
+    /// the entries of memory merged into one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -957,6 +964,16 @@ impl Event {
         }
     }
 
+    /// The entries of `project`'s memory with the ids `merged` were merged
+    /// into `kept`, which says the same thing: `from` lists them.
+    pub fn merged(project: PathBuf, kept: Entry, merged: &[u64]) -> Event {
+        let ids: Vec<String> = merged.iter().map(u64::to_string).collect();
+        Event {
+            from: Some(ids.join(", ")),
+            ..Event::memory(Kind::MemoryMerged, project, kept)
+        }
+    }
+
     /// The distiller read what `session` did: `distill` says what came of
     /// it, and with its `failed`, why it couldn't.
     pub fn distilled(session: &SessionInfo, distill: DistillAbout) -> Event {
@@ -1282,6 +1299,15 @@ impl Event {
                     .unwrap_or_default();
                 format!(
                     "{} ({}) {}{into}",
+                    entry.id,
+                    entry.kind,
+                    memory::title(&entry.text)
+                )
+            }),
+            Kind::MemoryMerged => self.memory.as_ref().map_or(String::new(), |entry| {
+                let merged = self.from.as_deref().unwrap_or_default();
+                format!(
+                    "{} ({}) {} ← {merged}",
                     entry.id,
                     entry.kind,
                     memory::title(&entry.text)
@@ -1618,6 +1644,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
         Kind::MemoryAdded | Kind::MemoryForgotten | Kind::MemoryStale | Kind::MemoryChanged => {
             Event::memory(kind, project::of(dir).path, entry)
         }
+        Kind::MemoryMerged => Event::merged(project::of(dir).path, entry, &[4, 7]),
         Kind::MemoryPromoted => {
             let project = project::of(dir).path;
             Event::promoted(project.clone(), entry, project.join("CLAUDE.md"))

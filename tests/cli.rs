@@ -9429,6 +9429,33 @@ fn the_same_remembered_again_is_the_one_entry_seen_again() {
 }
 
 #[test]
+fn the_daemon_remembers_and_only_the_models_find_what_says_the_same() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    // A daemon to ask, as there is wherever sessions run.
+    crystal.ok(&["new", "-d", "-n", "here", "sleep", "30"]);
+    assert_eq!(
+        crystal.ok(&["remember", "-C", repo_dir, "Fees are kept in cents"]),
+        "remembered 1\n"
+    );
+    assert_eq!(
+        crystal.ok(&["remember", "-C", repo_dir, "fees are kept in CENTS"]),
+        "remembered 1 already\n"
+    );
+    let told = crystal.ok(&["events", "-k", "memory.added"]);
+    assert_eq!(told.lines().count(), 1, "told once: {told}");
+    assert!(told.contains("1 (note) Fees are kept in cents"), "{told}");
+
+    // The models aren't here, so it can't tell, and says how to get them.
+    let refused = crystal.fails(&["memory", "-C", repo_dir, "dedupe"]);
+    assert!(refused.contains("`crystal memory embed`"), "{refused}");
+    let refused = crystal.fails(&["memory", "-C", repo_dir, "dedupe", "--apply"]);
+    assert!(refused.contains("`crystal memory embed`"), "{refused}");
+    let shown = crystal.fails(&["memory", "-C", repo_dir, "show", "2"]);
+    assert!(shown.contains("there's no entry 2"), "{shown}");
+}
+
+#[test]
 fn memory_promote_adds_the_entry_to_claude_md_under_notes() {
     let (crystal, repo) = crystal_remembering();
     let repo_dir = repo.to_str().unwrap();

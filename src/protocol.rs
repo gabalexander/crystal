@@ -259,6 +259,21 @@ pub enum Request {
         #[serde(flatten)]
         wanted: crate::memory::Wanted,
     },
+    /// Add `entry` to the memory of `project`, a project's main worktree:
+    /// the daemon, which keeps the models loaded, finds whether the project
+    /// has it already in other words.
+    Remember {
+        project: PathBuf,
+        entry: crate::memory::New,
+    },
+    /// Find the entries of the memory of the project `dir` is in that say
+    /// what another does, by meaning, and with `apply`, merge each group
+    /// into the one it keeps.
+    DedupeMemory {
+        dir: PathBuf,
+        #[serde(default)]
+        apply: bool,
+    },
     /// The tasks of the project `dir` is in, or of every project with
     /// `all`: those still open, then those waiting to start, then those
     /// closed, the latest first.
@@ -786,6 +801,14 @@ pub enum Response {
     /// The entries a memory search found, the best first.
     Memory {
         entries: Vec<crate::memory::Listed>,
+    },
+    /// What adding an entry to a project's memory came to.
+    Remembered(crate::memory::Added),
+    /// The entries of a project's memory that say what another does, each
+    /// group with the one it keeps: merged, or with `Request::DedupeMemory`
+    /// not told to apply them, as they would be.
+    Deduped {
+        merges: Vec<crate::memory::Merge>,
     },
     /// What the hook that reported a turn ending tells its agent: its task
     /// is still open. The agent carries on, so the turn hasn't ended.

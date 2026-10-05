@@ -2529,6 +2529,7 @@ crystal memory kind --notes          # the notes a model reads as lessons, and t
 crystal memory promote 2             # copy one into the project's CLAUDE.md, under "Notes"
 crystal memory distill fixer         # have a model read what a session did, now
 crystal memory embed                 # download the model that searches by meaning
+crystal memory dedupe                # entries that say what another does, by meaning; --apply merges them
 ```
 
 - `-k` is `decision`, `gotcha`, `command` or `note` (the default). Inside a session, an entry goes to the
@@ -2575,8 +2576,20 @@ crystal memory embed                 # download the model that searches by meani
   it off, entries that mean the same count too, whatever their words, and what doesn't answer the search is
   left out. Expired entries are left out too, and `--all` (`-a`) brings them back, marked.
 - The same thing remembered again (the same words, whatever the case or punctuation) is the one entry, seen
-  again: `remembered 3 already`. Credentials in an entry, like `API_KEY=…` or a token, are taken out as it's
-  kept.
+  again: `remembered 3 already`. So is the same said in other words, by you, an agent or the distiller, once
+  [search by meaning](#search-by-meaning) is on: `remembered 3 already, in other words: <what 3 says>`. Seen
+  again, an entry counts it (`show` says how many times it was said), takes any new files it names, and
+  holds again for its files and what it names as they are now. Credentials in an entry, like `API_KEY=…` or a token, are taken
+  out as it's kept.
+- `dedupe` finds the entries that were kept twice before that, in other words, and lists them, each group
+  under the one it would keep, with how alike each is to it: one you or an agent remembered rather than one
+  the distiller said, then the one most of the others say the same as, then the earliest. Nothing changes
+  until `--apply`: then the one kept counts every time each of the others was said, so it doesn't expire,
+  takes their files, and holds as well as the freshest of them (when one still holds, it's anchored to its
+  files and what it names as they are now, as though said again). The others leave the list (`show` says where one went), kept
+  apart so their words said again count as the one kept said again, and the distiller can't add them back.
+  Each one goes straight into the one kept, never through another, so two that only both look like a third
+  stay apart. It needs the models, and takes under a minute on a few hundred entries.
 - Whether an entry still holds goes by what it names: the identifiers, paths, commands and flags in its text,
   in backticks or shaped like code (`local_origin`, `TaskRecord`, `Request::Shutdown` as `Shutdown`,
   `src/agent_rules.rs`, `agents/`, `--test-threads`), that are in the worktree's code as it's remembered:
@@ -2654,8 +2667,16 @@ crystal memory embed   # downloads both models now (2.4 GB), and gives every ent
   and every task's `memory_search` ask it, and only search in their own process when no daemon is running. A
   search takes about half a second on an Apple silicon Mac, most of it the reranker's; on a CPU, a few
   seconds.
-- Each entry's vector is kept beside it in `memory.db`. An entry without one, say one just remembered, gets it
-  the first time a search needs it, and vectors from a model crystal no longer uses are let go.
+- Each entry's vector is kept beside it in `memory.db`. An entry without one, say one remembered while the
+  models were off, gets it the first time a search needs it, and vectors from a model crystal no longer uses
+  are let go.
+- An entry being added is held against those there already, tasks' outcomes aside: one whose vector is as
+  alike as 0.92 says the same thing; one as alike as 0.87 does when the reranker, reading the new one as the
+  query, scores it 0.40 or more. On crystal's own memory, every pair that alike said the same thing, and
+  different lessons about the same thing were alike up to 0.90 but the reranker scored them 0.36 at most;
+  the same lesson said again, mostly from 0.4 to 0.75. Some rewordings slip through as their own entries:
+  keeping one twice does less harm than merging two that differ. Without the models, only the same words
+  count.
 - A search ranks by words (bm25) and by meaning, and merges the two by reciprocal rank fusion, so an entry
   high in both comes first; by meaning, only the entries close to the best match count. Then the reranker
   reads the first 20: when not even the best answers the query, the search finds nothing; otherwise the ones
@@ -2676,8 +2697,10 @@ task closed done or failed and it was read then. It's one `claude -p` run on Hai
   what crystal read of its runs), or for Claude Code in a terminal, the transcript its hooks named. Codex leaves
   nothing it can read. Credentials are taken out before the model sees any of it.
 - It's shown what the project's memory has already on the same subject, each entry by its id and kind, and
-  told never to give that again. Of the notes among them, those it says are lessons it makes `decision`,
-  `gotcha` or `command` (a note that reads as status it's never asked about), and `memory.changed` says so.
+  told never to give that again: with search by meaning on, the entries nearest in meaning to the last things
+  the session said, where what it keeps comes from, merged with those that have most to do with its task.
+  Of the notes among them, those it says are lessons it makes `decision`, `gotcha` or `command` (a note that
+  reads as status it's never asked about), and `memory.changed` says so.
 - It's told to keep lessons alone, what a later session couldn't get from the code, the git log, the backlog or
   CLAUDE.md, and never progress or status (merged, pushed, installed, CI passed), a commit's hash or a pull
   request's or backlog item's number as the point of an entry, or what's only true today, with entries of each
@@ -2687,9 +2710,9 @@ task closed done or failed and it was read then. It's one `claude -p` run on Hai
   by default) and two turns. Its answer is checked before anything is kept: at most 8 entries, of the kinds
   `decision`, `gotcha`, `command` and `note`, each 400 characters at most, naming only files that are in the
   checkout.
-- What passes is kept like anything else, `from the distiller, after task <name>`: what's there already is
-  seen again rather than added twice, and what you forgot with `rm` it never adds back (you can, by
-  remembering it yourself).
+- What passes is kept like anything else, `from the distiller, after task <name>`: what's there already, in
+  its words or others, is seen again rather than added twice, and what you forgot with `rm` it never adds
+  back (you can, by remembering it yourself).
 - It's also shown up to 4 of the stale entries about the files the work touched (those its branch changed
   since it left the default one, and those it edited), with what each names that's gone, and says of each the
   record settles whether it still holds (it's anchored again, to the code as it is), holds once reworded (its
@@ -3311,6 +3334,7 @@ runs the action its handlers give a link, to try them.
 | `memory.changed` | an entry's kind is changed, by `crystal memory kind`, `c` in the memory view or the distiller |
 | `memory.distilled` | the [distiller](#memory) has read what a session did: its `distill` says how many entries it `added`, found `again`, `rechecked` of those gone stale and `rejected`, and what it cost |
 | `memory.distill_failed` | the distiller couldn't: its `distill`'s `failed` says why |
+| `memory.merged` | `crystal memory dedupe --apply` merged entries that say the same thing into one: `memory` is the one kept, as it is now, and `from` the ids of those that went into it |
 | `backlog.added` | an item goes on a project's backlog |
 | `backlog.closed` | an item is marked done |
 | `plugin.paused` | a plugin is paused for failing |

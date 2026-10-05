@@ -32,6 +32,7 @@ use crate::config::MemorySettings;
 use crate::embed;
 use crate::handover::HELPERS;
 use crate::memory::{self, Added, Entry, Kind, Listed, New, Source, Store};
+use crate::output::errln;
 use crate::protocol::TaskRecord;
 use crate::secrets;
 use crate::session::signal_group;
@@ -86,6 +87,10 @@ pub const RECHECKED: usize = 4;
 /// How many notes one pass over notes alone reads: few enough that it
 /// weighs each.
 const NOTES_AT_ONCE: usize = 40;
+
+/// How many of the last things the session said the entries the model is
+/// shown are found nearest to: where the conclusions it would keep are.
+const SAID_LOOKED_AT: usize = 16;
 
 /// The kinds the distiller may give an entry: how a task turned out is the
 /// task's own to say.
@@ -365,6 +370,18 @@ impl Record {
             .collect()
     }
 
+    /// The last `most` things the session said, the latest last: what the
+    /// entries the model gives come from.
+    pub fn said(&self, most: usize) -> Vec<&str> {
+        let said: Vec<&str> = self
+            .lines
+            .iter()
+            .filter_map(|line| line.strip_prefix("ASSISTANT: "))
+            .filter(|said| !said.trim().is_empty())
+            .collect();
+        said[said.len().saturating_sub(most)..].to_vec()
+    }
+
     pub fn text(&self) -> String {
         let mut text = String::new();
         if self.cut {
@@ -591,7 +608,7 @@ pub fn run(job: &Job) -> Result<Report> {
     let mut store = Store::open(&job.socket)?;
     let embedder = embed::shared(&job.settings);
     let embedder = embed::as_embed(&embedder);
-    let known = store.search(&job.project, &job.about, None, KNOWN_SHOWN, embedder)?;
+    let known = known(&mut store, job, &record, embedder)?;
     // A note that reads as status is no lesson: `list --status` has it.
     let notes: Vec<u64> = known
         .iter()
@@ -620,9 +637,9 @@ pub fn run(job: &Job) -> Result<Report> {
             source: Source::Distilled(job.session.clone()),
             ..entry
         };
-        match store.add(&job.project, new)? {
+        match store.add_with(&job.project, new, embedder)? {
             Added::New(entry) => report.added.push(entry.id),
-            Added::Again(entry) => report.again.push(entry.id),
+            Added::Again(entry) | Added::Alike(entry) => report.again.push(entry.id),
             Added::Refused => report.forgotten += 1,
         }
     }
@@ -668,6 +685,35 @@ fn touched(checkout: &Path, record: &Record) -> Vec<String> {
         }
     }
     touched
+}
+
+/// What the project's memory has already that the model is shown, so it
+/// doesn't give it again: the entries with most to do with what the work
+/// was about, and with the models, those nearest in meaning to what the
+/// session said, where what it gives comes from, the two merged. A session
+/// with no task has nothing it was about but what it said.
+fn known(
+    store: &mut Store,
+    job: &Job,
+    record: &Record,
+    embedder: Option<&dyn embed::Embed>,
+) -> Result<Vec<memory::Entry>> {
+    let Some(embedder) = embedder else {
+        return store.search(&job.project, &job.about, None, KNOWN_SHOWN, None);
+    };
+    let about = if job.about.trim().is_empty() {
+        Vec::new()
+    } else {
+        store.search(&job.project, &job.about, None, KNOWN_SHOWN, Some(embedder))?
+    };
+    let said = record.said(SAID_LOOKED_AT);
+    match store.nearest(&job.project, &said, KNOWN_SHOWN, embedder) {
+        Ok(nearest) => Ok(memory::fused(&[nearest, about], KNOWN_SHOWN)),
+        Err(err) => {
+            errln!("crystal: couldn't find what the memory has near what was said: {err:#}");
+            Ok(about)
+        }
+    }
 }
 
 /// The message a pass sends: what the work was and how it ended, what the
@@ -1141,6 +1187,25 @@ mod tests {
         assert!(text.len() <= MATERIAL_CAP + 100);
         assert!(text.starts_with("[… the start is cut"));
         assert!(text.ends_with("ASSISTANT: line 9999\n"));
+    }
+
+    #[test]
+    fn what_the_session_said_is_its_last_words_alone() {
+        let mut record = Record::default();
+        for line in [
+            "USER: fix the ledger",
+            "ASSISTANT: looking",
+            "TOOL Bash: cargo test",
+            "RESULT: ok",
+            "ASSISTANT:  ",
+            "ASSISTANT: the ledger needs redis",
+            "ASSISTANT: done",
+        ] {
+            record.push(line.to_string());
+        }
+        assert_eq!(record.said(2), ["the ledger needs redis", "done"]);
+        assert_eq!(record.said(9).len(), 3);
+        assert!(Record::default().said(4).is_empty());
     }
 
     #[test]

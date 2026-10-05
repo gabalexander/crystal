@@ -7,8 +7,11 @@
 //! start or stem from. Anyone can add to it: the user, an agent in a
 //! session (`crystal remember`), and the distiller ([`crate::distill`]),
 //! from what a closed task did. The same thing said again is the one entry
-//! seen again, not a second one, and what the user forgot the distiller
-//! can't bring back.
+//! seen again, not a second one: in the same words, or, with the models
+//! that search by meaning, in others; and what the user forgot the distiller
+//! can't bring back. Entries kept twice before that check, `crystal memory
+//! dedupe` merges into one, and what it merged counts as the entry it went
+//! into said again.
 //!
 //! Every agent crystal starts is shown, as it starts, the entries that have
 //! most to do with its launch: first those about files its worktree has
@@ -153,6 +156,10 @@ const NOT_NAMES: &[&str] = &[
 
 /// The most entries a search gives back.
 pub const SEARCH_LIMIT: usize = 50;
+
+/// The most entries said before that the reranker reads with one being
+/// added, to find whether it says what one of them does: the most alike.
+const TWIN_POOL: usize = 20;
 
 /// The longest a title of an entry's own may be, in characters: a line.
 const MAX_TITLE: usize = 120;
@@ -345,6 +352,24 @@ const COUNTED_FROM: &str = "
 ALTER TABLE entries ADD COLUMN counted_from INTEGER;
 ";
 
+/// Each entry merged into another that says the same thing, as it was: by
+/// a hash of its key, as [`FORGOTTEN_ENTRIES`] keeps the forgotten, so that
+/// its words said again count as `kept`, the entry it went into, said again.
+const MERGED: &str = "
+CREATE TABLE merged (
+  project TEXT NOT NULL,
+  key     TEXT NOT NULL,
+  kept    INTEGER NOT NULL,
+  id      INTEGER NOT NULL,
+  kind    TEXT NOT NULL,
+  text    TEXT NOT NULL,
+  files   TEXT NOT NULL DEFAULT '[]',
+  source  TEXT NOT NULL,
+  merged  INTEGER NOT NULL,
+  PRIMARY KEY (project, key)
+);
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
@@ -358,6 +383,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     |conn| Ok(conn.execute_batch(USED)?),
     add_names,
     count_from_now,
+    |conn| Ok(conn.execute_batch(MERGED)?),
 ];
 
 /// The columns [`entry_of`] reads, in its order.
@@ -606,7 +632,9 @@ fn once() -> u32 {
 }
 
 /// An entry about to be added.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "MemoryNew"))]
 pub struct New {
     pub kind: Kind,
     pub text: String,
@@ -618,13 +646,20 @@ pub struct New {
 }
 
 /// What adding an entry came to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "MemoryAdded"))]
+#[serde(rename_all = "lowercase")]
 pub enum Added {
     /// A new entry.
     New(Entry),
-    /// The project had it already: it was seen again, with any new files
-    /// it named added to its own.
+    /// The project had it already, in the same words: it was seen again,
+    /// with any new files it named added to its own.
     Again(Entry),
+    /// The project had it already in other words: this entry, which says
+    /// the same thing, or had one merged into it in those words, was seen
+    /// again, as with [`Added::Again`].
+    Alike(Entry),
     /// The user forgot it, and crystal can't add it back.
     Refused,
 }
@@ -633,10 +668,34 @@ pub enum Added {
 impl Added {
     pub fn entry(&self) -> Option<&Entry> {
         match self {
-            Added::New(entry) | Added::Again(entry) => Some(entry),
+            Added::New(entry) | Added::Again(entry) | Added::Alike(entry) => Some(entry),
             Added::Refused => None,
         }
     }
+}
+
+/// An entry said before, and how alike it is to another, which says the
+/// same thing: by the model's vectors, from -1 to 1, and by the reranker,
+/// reading the other as the query, when it was asked.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "MemoryTwin"))]
+pub struct Twin {
+    pub entry: Entry,
+    pub alike: f32,
+    #[serde(default)]
+    pub reranked: Option<f32>,
+}
+
+/// Entries of a project that say the same thing, as `crystal memory
+/// dedupe` finds them: the one kept, and those that go into it, each as
+/// alike to it as it is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "MemoryMerge"))]
+pub struct Merge {
+    pub kept: Entry,
+    pub merged: Vec<Twin>,
 }
 
 /// What a search keeps to besides its words, and the most it gives.
@@ -712,13 +771,38 @@ impl Store {
     /// control characters, which would drive the terminal of whoever reads
     /// it. Either way, it's anchored to its files and what it names as they
     /// are now.
+    #[cfg(test)]
     pub fn add(&mut self, project: &Path, new: New) -> Result<Added> {
+        self.add_with(project, new, None)
+    }
+
+    /// [`Store::add`], and with an `embedder`, an entry that says what one
+    /// already there does in other words is that one seen again too: one
+    /// as alike as [`Embed::same_from`], or as [`Embed::alike_from`] that
+    /// the reranker, reading the new one as the query, scores
+    /// [`Embed::same_reranked_from`]. So is one in the words of an entry
+    /// merged into another. A new entry keeps the vector it was compared
+    /// by.
+    pub fn add_with(
+        &mut self,
+        project: &Path,
+        new: New,
+        embedder: Option<&dyn Embed>,
+    ) -> Result<Added> {
         let text = clean(&secrets::redact(new.text.trim()));
         if text.trim().is_empty() {
             bail!("there's nothing to remember");
         }
         let key = key_of(&text);
         let name = self.ready(project)?;
+        // By meaning before the write, which holds up every other while
+        // the models take their time.
+        let meant = embedder.and_then(|embedder| {
+            self.meaning(&name, &text, embedder)
+                .map(|meant| (meant, embedder.model()))
+                .inspect_err(|err| errln!("crystal: couldn't compare it by meaning: {err:#}"))
+                .ok()
+        });
         let now = seconds_since_epoch(SystemTime::now());
         let checkout = new.checkout.as_deref().unwrap_or(project);
         // Read before the database is held: the worktree's words are kept
@@ -742,23 +826,7 @@ impl Store {
             .optional()?
         };
         if let Some(said) = said {
-            let files = joined(&said.files, &new.files);
-            // Said again, it holds for its files as they are now.
-            let anchors = anchors_in(checkout, &files);
-            tx.execute(
-                "UPDATE entries SET seen = seen + 1, last_seen = ?3, files = ?4, anchors = ?5, \
-                 checkout = ?6, names = ?7, told_stale = 0 WHERE project = ?1 AND id = ?2",
-                params![
-                    name,
-                    said.id,
-                    now,
-                    serde_json::to_string(&files)?,
-                    serde_json::to_string(&anchors)?,
-                    path_text(&new.checkout),
-                    serde_json::to_string(&code.names_in(checkout, &said.text, &files))?,
-                ],
-            )?;
-            let entry = get(&tx, &name, said.id)?.context("the entry just seen is gone")?;
+            let entry = seen_again(&tx, &name, &said, &new, checkout, now, &mut code)?;
             tx.commit()?;
             return Ok(Added::Again(entry));
         }
@@ -776,6 +844,38 @@ impl Store {
                 "DELETE FROM forgotten WHERE project = ?1 AND key = ?2",
                 params![name, forgotten],
             )?;
+        }
+        let merged_into: Option<u64> = tx
+            .query_row(
+                "SELECT kept FROM merged WHERE project = ?1 AND key = ?2",
+                params![name, forgotten],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(kept) = merged_into {
+            match get(&tx, &name, kept)? {
+                Some(kept) => {
+                    let entry = seen_again(&tx, &name, &kept, &new, checkout, now, &mut code)?;
+                    tx.commit()?;
+                    return Ok(Added::Alike(entry));
+                }
+                // The entry it went into was forgotten since, and with it
+                // what it said.
+                None if new.source.is_crystal() => return Ok(Added::Refused),
+                None => {
+                    tx.execute(
+                        "DELETE FROM merged WHERE project = ?1 AND key = ?2",
+                        params![name, forgotten],
+                    )?;
+                }
+            }
+        }
+        let twin = meant.as_ref().and_then(|((_, twin), _)| *twin);
+        // Only while it's there: it may have gone as the models ran.
+        if let Some(twin) = twin.map(|id| get(&tx, &name, id)).transpose()?.flatten() {
+            let entry = seen_again(&tx, &name, &twin, &new, checkout, now, &mut code)?;
+            tx.commit()?;
+            return Ok(Added::Alike(entry));
         }
         let id: u64 = tx.query_row(
             "SELECT next_id FROM projects WHERE path = ?1",
@@ -802,6 +902,12 @@ impl Store {
             counted_from: None,
         };
         insert(&tx, &name, &entry)?;
+        if let Some(((vector, _), model)) = &meant {
+            tx.execute(
+                "INSERT OR REPLACE INTO vectors (n, model, vector) VALUES (?1, ?2, ?3)",
+                params![tx.last_insert_rowid(), model, bytes_of(vector)],
+            )?;
+        }
         tx.commit()?;
         Ok(Added::New(entry))
     }
@@ -886,6 +992,248 @@ impl Store {
         let entry = get(&tx, &name, id)?.context("the entry just reworded is gone")?;
         tx.commit()?;
         Ok(entry)
+    }
+
+    /// `text`'s vector, and the entry of the project called `project` that
+    /// says what it does, if one does: see [`Store::add_with`].
+    fn meaning(
+        &mut self,
+        project: &str,
+        text: &str,
+        embedder: &dyn Embed,
+    ) -> Result<(Vec<f32>, Option<u64>)> {
+        let entries = self.with_vectors(project, embedder)?;
+        let vector = embedder
+            .embed_passages(&[text])?
+            .pop()
+            .context("the model gave no vector")?;
+        let alike = alike_to(&vector, &entries, embedder.alike_from());
+        let twin = same_as(text, alike, embedder)
+            .first()
+            .map(|twin| twin.entry.id);
+        Ok((vector, twin))
+    }
+
+    /// Every entry of the project called `project` but tasks' outcomes,
+    /// with its vector from `embedder`, in the order they were added: those
+    /// with none yet get one first.
+    fn with_vectors(
+        &mut self,
+        project: &str,
+        embedder: &dyn Embed,
+    ) -> Result<Vec<(Entry, Vec<f32>)>> {
+        self.embed_missing_in(Some(project), embedder)?;
+        let mut rows = self.conn.prepare(&format!(
+            "SELECT {COLUMNS}, v.vector FROM entries e JOIN vectors v ON v.n = e.n \
+             WHERE e.project = ?1 AND v.model = ?2 AND e.kind != ?3 ORDER BY e.id"
+        ))?;
+        let outcome = Kind::Outcome.to_string();
+        let rows = rows.query_map(params![project, embedder.model(), outcome], |row| {
+            Ok((entry_of(row)?, vector_of(&row.get::<_, Vec<u8>>("vector")?)))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The entries of `project` but tasks' outcomes nearest in meaning to
+    /// any of `texts`, the nearest first, as many as `limit`: each as near
+    /// as it is to the nearest of them. For the distiller, to be shown what
+    /// the memory has already on what it's about to say.
+    pub fn nearest(
+        &mut self,
+        project: &Path,
+        texts: &[&str],
+        limit: usize,
+        embedder: &dyn Embed,
+    ) -> Result<Vec<Entry>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let name = self.ready(project)?;
+        let entries = self.with_vectors(&name, embedder)?;
+        let asked = embedder.embed_passages(texts)?;
+        let mut near: Vec<(f32, Entry)> = entries
+            .into_iter()
+            .filter_map(|(entry, vector)| {
+                let nearest = asked
+                    .iter()
+                    .map(|text| dot(text, &vector))
+                    .filter(|score| score.is_finite())
+                    .max_by(f32::total_cmp)?;
+                Some((nearest, entry))
+            })
+            .collect();
+        near.sort_by(|a, b| b.0.total_cmp(&a.0));
+        Ok(near.into_iter().take(limit).map(|(_, e)| e).collect())
+    }
+
+    /// The entries of `project` that say what another does, grouped about
+    /// the one each group keeps, for `crystal memory dedupe`: each entry
+    /// read as though it were being added now, by [`Store::add_with`]'s
+    /// check, against every other, and the groups as [`grouped`] makes
+    /// them, the one kept earliest first.
+    pub fn twins(&mut self, project: &Path, embedder: &dyn Embed) -> Result<Vec<Merge>> {
+        let name = self.ready(project)?;
+        let entries = self.with_vectors(&name, embedder)?;
+        let same: Vec<Vec<Twin>> = entries
+            .iter()
+            .map(|(entry, vector)| {
+                let mut alike = alike_to(vector, &entries, embedder.alike_from());
+                alike.retain(|(_, other)| other.id != entry.id);
+                same_as(&entry.text, alike, embedder)
+            })
+            .collect();
+        let entries: Vec<Entry> = entries.into_iter().map(|(entry, _)| entry).collect();
+        let mut merges = grouped(&entries, &same);
+        merges.sort_by_key(|merge| merge.kept.id);
+        Ok(merges)
+    }
+
+    /// Merges each of `merges` into the entry it keeps, as it is now, those
+    /// changed or gone since left out: the one kept counts every time each
+    /// was said, was last said when the latest of them was, and is about
+    /// every file each was, and was used when the latest of them was, so it
+    /// doesn't expire. It holds as well as the freshest of them: when one
+    /// still holds, it's anchored to its files and what it names as they
+    /// are now, as it would be said again; otherwise each file as the
+    /// latest said of them that names it was, and what it names as it was.
+    /// Those merged leave the list, kept apart as they were, so their words
+    /// said again count as the one kept said again. Gives back what it
+    /// merged, each one kept as it is now.
+    pub fn merge(&mut self, project: &Path, merges: &[Merge]) -> Result<Vec<Merge>> {
+        let name = self.ready(project)?;
+        let now = seconds_since_epoch(SystemTime::now());
+        // Read before the database is held, as adding reads it: whether
+        // each still holds, by the code its worktree has, and that code,
+        // for what the one kept names.
+        let mut code = Code::default();
+        let mut holds: HashMap<u64, bool> = HashMap::new();
+        for merge in merges {
+            let merged = merge.merged.iter().map(|twin| &twin.entry);
+            for entry in std::iter::once(&merge.kept).chain(merged) {
+                let fresh = code.holds(entry, project).0 == Freshness::Fresh;
+                holds.insert(entry.id, fresh);
+                if fresh {
+                    let checkout = entry.checkout.as_deref().filter(|dir| dir.is_dir());
+                    code.names_in(checkout.unwrap_or(project), &merge.kept.text, &[]);
+                }
+            }
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut done = Vec::new();
+        for merge in merges {
+            let Some(kept) = get(&tx, &name, merge.kept.id)? else {
+                continue;
+            };
+            let mut merged = Vec::new();
+            for twin in &merge.merged {
+                match get(&tx, &name, twin.entry.id)? {
+                    Some(entry) if entry.text == twin.entry.text => merged.push(Twin {
+                        entry,
+                        ..twin.clone()
+                    }),
+                    _ => {}
+                }
+            }
+            if merged.is_empty() {
+                continue;
+            }
+            let mut said: Vec<&Entry> = merged.iter().map(|twin| &twin.entry).collect();
+            let files = said.iter().fold(kept.files.clone(), |files, entry| {
+                joined(&files, &entry.files)
+            });
+            said.push(&kept);
+            said.sort_by_key(|entry| (entry.last_seen, entry.id));
+            let latest = said.last().expect("the one kept at least");
+            let holding = said
+                .iter()
+                .find(|entry| holds.get(&entry.id).copied().unwrap_or(false));
+            // One of them holds still, so all of it does, as it does said
+            // again; otherwise each file as the latest said of them that
+            // names it was, and what the one kept names as it was.
+            let (anchors, names, checkout) = match holding {
+                Some(entry) => {
+                    let checkout = entry.checkout.as_deref().filter(|dir| dir.is_dir());
+                    let top = checkout.unwrap_or(project);
+                    let names = code.names_in(top, &kept.text, &files);
+                    (
+                        anchors_in(top, &files),
+                        names,
+                        checkout.map(Path::to_path_buf),
+                    )
+                }
+                None => {
+                    let mut anchors = BTreeMap::new();
+                    for entry in &said {
+                        anchors.extend(entry.anchors.clone());
+                    }
+                    (anchors, kept.names.clone(), latest.checkout.clone())
+                }
+            };
+            let seen: u32 = said.iter().map(|entry| entry.seen).sum();
+            let used = said.iter().filter_map(|entry| entry.used).max();
+            tx.execute(
+                "UPDATE entries SET seen = ?3, last_seen = ?4, files = ?5, anchors = ?6, \
+                 checkout = ?7, told_stale = told_stale AND ?8, used = ?9, names = ?10 \
+                 WHERE project = ?1 AND id = ?2",
+                params![
+                    name,
+                    kept.id,
+                    seen,
+                    latest.last_seen,
+                    serde_json::to_string(&files)?,
+                    serde_json::to_string(&anchors)?,
+                    path_text(&checkout),
+                    holding.is_none(),
+                    used,
+                    serde_json::to_string(&names)?,
+                ],
+            )?;
+            for Twin { entry, .. } in &merged {
+                tx.execute(
+                    "INSERT OR REPLACE INTO merged (project, key, kept, id, kind, text, files, \
+                     source, merged) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        name,
+                        hash(&key_of(&entry.text)),
+                        kept.id,
+                        entry.id,
+                        entry.kind.to_string(),
+                        entry.text,
+                        serde_json::to_string(&entry.files)?,
+                        serde_json::to_string(&entry.source)?,
+                        now,
+                    ],
+                )?;
+                // What went into it before goes with it.
+                tx.execute(
+                    "UPDATE merged SET kept = ?3 WHERE project = ?1 AND kept = ?2",
+                    params![name, entry.id, kept.id],
+                )?;
+                tx.execute(
+                    "DELETE FROM entries WHERE project = ?1 AND id = ?2",
+                    params![name, entry.id],
+                )?;
+            }
+            let kept = get(&tx, &name, kept.id)?.context("the entry kept is gone")?;
+            done.push(Merge { kept, merged });
+        }
+        tx.commit()?;
+        Ok(done)
+    }
+
+    /// The entry that entry `id` of `project` was merged into, when it was.
+    pub fn merged_into(&mut self, project: &Path, id: u64) -> Result<Option<u64>> {
+        let name = self.ready(project)?;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT kept FROM merged WHERE project = ?1 AND id = ?2 LIMIT 1",
+                params![name, id],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// Takes entry `id` out of `project`'s memory, and gives it back. What
@@ -1636,6 +1984,167 @@ fn insert(conn: &Connection, project: &str, entry: &Entry) -> Result<()> {
     Ok(())
 }
 
+/// Counts `said`, an entry of the project called `project`, said again at
+/// `now` as `new`, which says the same thing: with any new files `new`
+/// names added to its own, and, said again, holding for its files and what
+/// it names as they are now in `checkout`, looked at in `code`. Gives it
+/// back as it is then.
+fn seen_again(
+    conn: &Connection,
+    project: &str,
+    said: &Entry,
+    new: &New,
+    checkout: &Path,
+    now: u64,
+    code: &mut Code,
+) -> Result<Entry> {
+    let files = joined(&said.files, &new.files);
+    let anchors = anchors_in(checkout, &files);
+    conn.execute(
+        "UPDATE entries SET seen = seen + 1, last_seen = ?3, files = ?4, anchors = ?5, \
+         checkout = ?6, names = ?7, told_stale = 0 WHERE project = ?1 AND id = ?2",
+        params![
+            project,
+            said.id,
+            now,
+            serde_json::to_string(&files)?,
+            serde_json::to_string(&anchors)?,
+            path_text(&new.checkout),
+            serde_json::to_string(&code.names_in(checkout, &said.text, &files))?,
+        ],
+    )?;
+    get(conn, project, said.id)?.context("the entry just seen is gone")
+}
+
+/// Of `entries`, those at least `from` alike to `vector`, the most alike
+/// first, each with how alike. A vector the model made nothing of, which
+/// it can, is alike to none.
+fn alike_to<'a>(
+    vector: &[f32],
+    entries: &'a [(Entry, Vec<f32>)],
+    from: f32,
+) -> Vec<(f32, &'a Entry)> {
+    let mut alike: Vec<(f32, &Entry)> = entries
+        .iter()
+        .map(|(entry, other)| (dot(vector, other), entry))
+        .filter(|(score, _)| *score >= from)
+        .collect();
+    alike.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.id.cmp(&b.1.id)));
+    alike
+}
+
+/// Of `alike`, the entries said before at least [`Embed::alike_from`]
+/// alike to `text`, the most alike first, those that say what `text` does:
+/// every one at least [`Embed::same_from`] alike, and those the reranker,
+/// reading `text` as the query with the first [`TWIN_POOL`] of them, scores
+/// at least [`Embed::same_reranked_from`]. Without a reranker, or with it
+/// failing, only the first.
+fn same_as(text: &str, alike: Vec<(f32, &Entry)>, embedder: &dyn Embed) -> Vec<Twin> {
+    let alike: Vec<(f32, &Entry)> = alike
+        .into_iter()
+        .filter(|(score, _)| *score >= embedder.alike_from())
+        .take(TWIN_POOL)
+        .collect();
+    let unsure = alike.iter().any(|(score, _)| *score < embedder.same_from());
+    let scores = if unsure {
+        let passages: Vec<&str> = alike.iter().map(|(_, entry)| entry.text.as_str()).collect();
+        match embedder.rerank(text, &passages) {
+            Ok(Some(scores)) if scores.len() == alike.len() => Some(scores),
+            Ok(Some(_)) => {
+                errln!("crystal: the reranker didn't score every entry");
+                None
+            }
+            Ok(None) => None,
+            Err(err) => {
+                errln!("crystal: couldn't rerank: {err:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    alike
+        .into_iter()
+        .enumerate()
+        .filter_map(|(at, (score, entry))| {
+            let reranked = scores.as_ref().map(|scores| scores[at]);
+            let same = score >= embedder.same_from()
+                || reranked.is_some_and(|reranked| reranked >= embedder.same_reranked_from());
+            same.then(|| Twin {
+                entry: entry.clone(),
+                alike: score,
+                reranked,
+            })
+        })
+        .collect()
+}
+
+/// `entries` grouped about the ones kept, by `same`, the entries each of
+/// them says what they do (in its order). The one kept is, first, one
+/// someone remembered rather than one the distiller said; then the one most
+/// of the rest say the same as, the clearest statement of what they all say;
+/// then the earliest. Those that say what it does go into it, each straight
+/// into one kept that it says the same as itself, never through another.
+/// Those remembered are all kept or gone before any the distiller said is
+/// kept, so one remembered never goes into one the distiller said. Groups
+/// of one are left out.
+fn grouped(entries: &[Entry], same: &[Vec<Twin>]) -> Vec<Merge> {
+    let at: HashMap<u64, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(n, entry)| (entry.id, n))
+        .collect();
+    // The entries that say what each does, by their places, and how alike.
+    let mut saying: Vec<Vec<(usize, &Twin)>> = vec![Vec::new(); entries.len()];
+    for (n, twins) in same.iter().enumerate() {
+        for twin in twins {
+            if let Some(&kept) = at.get(&twin.entry.id) {
+                saying[kept].push((n, twin));
+            }
+        }
+    }
+    let mut left = vec![true; entries.len()];
+    let mut merges = Vec::new();
+    loop {
+        let into = |kept: usize| -> Vec<(usize, &Twin)> {
+            saying[kept]
+                .iter()
+                .copied()
+                .filter(|(n, _)| left[*n])
+                .collect()
+        };
+        let next = (0..entries.len()).filter(|&n| left[n]).min_by_key(|&n| {
+            let entry = &entries[n];
+            (
+                entry.source.is_crystal(),
+                std::cmp::Reverse(into(n).len()),
+                entry.id,
+            )
+        });
+        let Some(kept) = next else {
+            break;
+        };
+        let merged = into(kept);
+        left[kept] = false;
+        for (n, _) in &merged {
+            left[*n] = false;
+        }
+        if !merged.is_empty() {
+            merges.push(Merge {
+                kept: entries[kept].clone(),
+                merged: merged
+                    .into_iter()
+                    .map(|(n, twin)| Twin {
+                        entry: entries[n].clone(),
+                        ..twin.clone()
+                    })
+                    .collect(),
+            });
+        }
+    }
+    merges
+}
+
 /// A path as the database keeps it.
 fn path_text(path: &Option<PathBuf>) -> Option<String> {
     path.as_ref()
@@ -1673,7 +2182,7 @@ fn entry_of(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
 /// `1 / (K + its place)` from each ranking it's in, so one high in both
 /// comes before one first in only one. Between equals, the one said most
 /// recently comes first.
-fn fused(rankings: &[Vec<Entry>], limit: usize) -> Vec<Entry> {
+pub fn fused(rankings: &[Vec<Entry>], limit: usize) -> Vec<Entry> {
     let mut scored: Vec<(f32, &Entry)> = Vec::new();
     for ranking in rankings {
         for (at, entry) in ranking.iter().enumerate() {
@@ -1959,6 +2468,7 @@ pub fn project_of(dir: &Path) -> PathBuf {
 }
 
 /// Adds an entry to `project`'s memory.
+#[cfg(test)]
 pub fn add(socket: &Path, project: &Path, new: New) -> Result<Added> {
     Store::open(socket)?.add(project, new)
 }
@@ -1966,6 +2476,32 @@ pub fn add(socket: &Path, project: &Path, new: New) -> Result<Added> {
 /// Takes the entry `id` out of `project`'s memory, and returns it.
 pub fn remove(socket: &Path, project: &Path, id: u64) -> Result<Entry> {
     Store::open(socket)?.remove(project, id)
+}
+
+/// The entries of `project`'s memory that say what another does, grouped
+/// about the one each group keeps ([`Store::twins`]), and with `apply`,
+/// merged into it ([`Store::merge`]). Only the models can tell, so without
+/// an `embedder` it's refused.
+pub fn dedupe(
+    socket: &Path,
+    project: &Path,
+    embedder: Option<&dyn Embed>,
+    apply: bool,
+) -> Result<Vec<Merge>> {
+    let Some(embedder) = embedder else {
+        bail!(
+            "only the models that search by meaning can tell which entries say the same thing: \
+             `crystal memory embed` downloads them, and `embeddings = true` under `[memory]` in \
+             the config turns them on"
+        );
+    };
+    let mut store = Store::open(socket)?;
+    let merges = store.twins(project, embedder)?;
+    if apply {
+        store.merge(project, &merges)
+    } else {
+        Ok(merges)
+    }
 }
 
 /// `entries` with whether each still holds, in the order they came.
@@ -3863,6 +4399,329 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, MIGRATIONS.len());
+    }
+
+    /// A stand-in whose vectors are at the angle a text starts with, `@10`
+    /// for 10 degrees (90 without one), so two texts are as alike as the
+    /// cosine of the angle between them: 10 degrees apart is 0.98, past
+    /// [`Embed::same_from`]; 25 is 0.91, alike enough for the reranker to be
+    /// asked; 40 is 0.77, apart. With `reranker`, it holds a query that says
+    /// "unlike" to say something else, and any other the same.
+    struct Angled {
+        reranker: bool,
+    }
+
+    impl Angled {
+        fn vector(text: &str) -> Vec<f32> {
+            let degrees: f32 = text
+                .strip_prefix('@')
+                .and_then(|text| text.split_whitespace().next()?.parse().ok())
+                .unwrap_or(90.0);
+            let (sin, cos) = degrees.to_radians().sin_cos();
+            vec![cos, sin]
+        }
+    }
+
+    impl Embed for Angled {
+        fn model(&self) -> &str {
+            "angled"
+        }
+
+        fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|text| Angled::vector(text)).collect())
+        }
+
+        fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+            Ok(Angled::vector(text))
+        }
+
+        fn min_similarity(&self) -> f32 {
+            0.0
+        }
+
+        fn near_best(&self) -> f32 {
+            1.0
+        }
+
+        fn rerank(&self, query: &str, passages: &[&str]) -> Result<Option<Vec<f32>>> {
+            if !self.reranker {
+                return Ok(None);
+            }
+            let score = if query.contains("unlike") { 0.1 } else { 0.6 };
+            Ok(Some(vec![score; passages.len()]))
+        }
+    }
+
+    const ANGLED: Angled = Angled { reranker: true };
+
+    fn adding(store: &mut Store, text: &str, embedder: &dyn Embed) -> Added {
+        store
+            .add_with(Path::new(APP), note(text), Some(embedder))
+            .unwrap()
+    }
+
+    #[test]
+    fn what_says_the_same_in_other_words_is_the_one_entry_seen_again() {
+        let (_dir, _socket, mut store) = remembering(&[(
+            Kind::Gotcha,
+            "@0 Postgres has to be up for the ledger tests",
+        )]);
+        let project = Path::new(APP);
+        let again = New {
+            files: vec!["ledger.rs".into()],
+            source: Source::Distilled("fixer".into()),
+            ..note("@10 The ledger tests need the database running")
+        };
+        let Added::Alike(entry) = store.add_with(project, again, Some(&ANGLED)).unwrap() else {
+            panic!("a second entry");
+        };
+        assert_eq!(entry.id, 1);
+        assert_eq!(entry.seen, 2);
+        assert_eq!(entry.text, "@0 Postgres has to be up for the ledger tests");
+        assert_eq!(entry.files, ["ledger.rs"]);
+        assert_eq!(store.entries(project).unwrap().len(), 1);
+
+        // Without the models, only the same words are the same.
+        let words = store.add(project, note("@10 The ledger tests need the database up"));
+        assert!(matches!(words.unwrap(), Added::New(_)));
+    }
+
+    #[test]
+    fn the_reranker_says_whether_what_is_only_alike_says_the_same() {
+        let (_dir, _socket, mut store) = remembering(&[(Kind::Note, "@0 the refund ledger")]);
+        assert!(matches!(
+            adding(&mut store, "@25 refunds wait for the ledger", &ANGLED),
+            Added::Alike(Entry { id: 1, .. })
+        ));
+        assert!(matches!(
+            adding(&mut store, "@25 unlike: refunds skip the ledger", &ANGLED),
+            Added::New(Entry { id: 2, .. })
+        ));
+        let alone = Angled { reranker: false };
+        assert!(matches!(
+            adding(&mut store, "@-26 refunds go to the ledger", &alone),
+            Added::New(Entry { id: 3, .. })
+        ));
+        assert!(matches!(
+            adding(&mut store, "@-70 the ledger's own tests", &ANGLED),
+            Added::New(Entry { id: 4, .. })
+        ));
+        // A new entry keeps the vector it was compared by.
+        assert_eq!(store.counts("angled").unwrap(), (4, 4));
+    }
+
+    #[test]
+    fn a_vector_the_model_made_nothing_of_is_alike_to_none() {
+        let entries = vec![
+            (entry(1, Kind::Note, "one"), vec![f32::NAN, f32::NAN]),
+            (entry(2, Kind::Note, "two"), vec![1.0, 0.0]),
+        ];
+        let alike = alike_to(&[1.0, 0.0], &entries, 0.5);
+        let ids: Vec<u64> = alike.iter().map(|(_, entry)| entry.id).collect();
+        assert_eq!(ids, [2]);
+    }
+
+    /// What `texts` come to in the project's memory, each said by the user,
+    /// or with "(distilled)" in it, by the distiller.
+    fn said(texts: &[&str]) -> (tempfile::TempDir, Store) {
+        let (dir, socket) = socket();
+        let mut store = Store::open(&socket).unwrap();
+        for text in texts {
+            let source = if text.contains("(distilled)") {
+                Source::Distilled("fixer".into())
+            } else {
+                Source::User
+            };
+            let new = New {
+                source,
+                files: vec![format!("{}.rs", text.split_whitespace().nth(1).unwrap())],
+                ..note(text)
+            };
+            store.add(Path::new(APP), new).unwrap();
+        }
+        (dir, store)
+    }
+
+    fn groups(merges: &[Merge]) -> Vec<(u64, Vec<u64>)> {
+        merges
+            .iter()
+            .map(|merge| {
+                let merged = merge.merged.iter().map(|twin| twin.entry.id).collect();
+                (merge.kept.id, merged)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dedupe_keeps_what_was_remembered_and_what_most_say_the_same_as() {
+        // Thirty degrees apart is too far to say the same.
+        let (_dir, mut store) = said(&[
+            "@0 one (distilled)",
+            "@14 two (distilled)",
+            "@30 three",
+            "@80 four (distilled)",
+            "@96 five (distilled)",
+            "@112 six (distilled)",
+        ]);
+        let merges = store.twins(Path::new(APP), &ANGLED).unwrap();
+        // Three, remembered, is kept over two, which more say the same as,
+        // and one doesn't go into it through two. Five is the one four and
+        // six both say the same as.
+        assert_eq!(groups(&merges), [(3, vec![2]), (5, vec![4, 6])]);
+        assert!((merges[0].merged[0].alike - 16_f32.to_radians().cos()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dedupe_merges_straight_into_the_one_kept_never_through_another() {
+        let (_dir, mut store) = said(&["@0 one", "@25 two (distilled)", "@50 three (distilled)"]);
+        let merges = store.twins(Path::new(APP), &ANGLED).unwrap();
+        assert_eq!(groups(&merges), [(1, vec![2])]);
+        let alone = Angled { reranker: false };
+        assert!(store.twins(Path::new(APP), &alone).unwrap().is_empty());
+        let (_dir, socket) = socket();
+        let refused = dedupe(&socket, Path::new(APP), None, false).unwrap_err();
+        assert!(
+            refused.to_string().contains("crystal memory embed"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn a_merge_counts_each_merged_as_said_again_and_takes_its_files() {
+        let (_dir, mut store) = said(&["@0 one", "@5 two (distilled)", "@8 three (distilled)"]);
+        let project = Path::new(APP);
+        // None holds still, and two, said last, is anchored as it was then.
+        store
+            .conn
+            .execute_batch(
+                "UPDATE entries SET anchors = '{\"two.rs\":\"beef\"}' WHERE id = 1;
+                 UPDATE entries SET seen = 3, last_seen = 9999999999,
+                   anchors = '{\"two.rs\":\"cafe\"}' WHERE id = 2;
+                 UPDATE entries SET anchors = '{\"three.rs\":\"dead\"}', used = 1234
+                   WHERE id = 3;",
+            )
+            .unwrap();
+        let merges = store.twins(project, &ANGLED).unwrap();
+        let done = store.merge(project, &merges).unwrap();
+        assert_eq!(groups(&done), [(1, vec![2, 3])]);
+        let kept = store.get(project, 1).unwrap().unwrap();
+        assert_eq!((kept.seen, kept.last_seen), (5, 9_999_999_999));
+        assert_eq!(kept.used, Some(1234));
+        assert!(!kept.expired(u64::MAX), "found again, it lasts");
+        assert_eq!(kept.files, ["one.rs", "two.rs", "three.rs"]);
+        let anchors: Vec<(&str, &str)> = kept
+            .anchors
+            .iter()
+            .map(|(file, hash)| (file.as_str(), hash.as_str()))
+            .collect();
+        assert_eq!(anchors, [("three.rs", "dead"), ("two.rs", "cafe")]);
+        assert_eq!(done[0].kept, kept);
+        let ids: Vec<u64> = store
+            .entries(project)
+            .unwrap()
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, [1]);
+        assert_eq!(store.merged_into(project, 2).unwrap(), Some(1));
+        assert_eq!(store.merged_into(project, 1).unwrap(), None);
+        // Merging again finds nothing, and what's gone isn't merged twice.
+        assert!(store.twins(project, &ANGLED).unwrap().is_empty());
+        assert!(store.merge(project, &merges).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_one_kept_holds_as_well_as_the_freshest_that_went_into_it() {
+        let project = project_with(&["a.rs", "b.rs"]);
+        let (_dir, socket) = socket();
+        let mut store = Store::open(&socket).unwrap();
+        let one = New {
+            files: vec!["a.rs".into()],
+            ..note("@0 one")
+        };
+        store.add(project.path(), one).unwrap();
+        fs::remove_file(project.path().join("a.rs")).unwrap();
+        let stale = |store: &mut Store| {
+            let kept = store.get(project.path(), 1).unwrap().unwrap();
+            checked(kept, project.path()).freshness
+        };
+        assert_eq!(stale(&mut store), Freshness::Stale);
+        // Two's file hasn't changed, so it holds still, and so does what it
+        // says.
+        let two = New {
+            files: vec!["b.rs".into(), "gone.rs".into()],
+            ..note("@5 two")
+        };
+        store.add(project.path(), two).unwrap();
+        let merges = store.twins(project.path(), &ANGLED).unwrap();
+        store.merge(project.path(), &merges).unwrap();
+        assert_eq!(stale(&mut store), Freshness::Fresh);
+        let kept = store.get(project.path(), 1).unwrap().unwrap();
+        assert_eq!(kept.files, ["a.rs", "b.rs", "gone.rs"]);
+        let anchored: Vec<&String> = kept.anchors.keys().collect();
+        assert_eq!(anchored, ["b.rs"], "a file that isn't there isn't anchored");
+    }
+
+    #[test]
+    fn what_was_merged_said_again_is_the_one_kept_said_again() {
+        let (_dir, mut store) = said(&["@0 one", "@5 two (distilled)"]);
+        let project = Path::new(APP);
+        let merges = store.twins(project, &ANGLED).unwrap();
+        store.merge(project, &merges).unwrap();
+        let distilled = New {
+            source: Source::Distilled("fixer".into()),
+            ..note("@5 TWO (distilled)!")
+        };
+        // By its words, without the models.
+        let Added::Alike(kept) = store.add(project, distilled.clone()).unwrap() else {
+            panic!("added back");
+        };
+        assert_eq!((kept.id, kept.seen), (1, 3));
+
+        // Once the one kept is forgotten, the distiller can't bring back
+        // what went into it either; the user can.
+        store.remove(project, 1).unwrap();
+        assert_eq!(store.add(project, distilled).unwrap(), Added::Refused);
+        let Added::New(entry) = store.add(project, note("@5 two (distilled)")).unwrap() else {
+            panic!("not added back");
+        };
+        assert_eq!(entry.id, 3);
+        assert_eq!(store.merged_into(project, 2).unwrap(), None);
+    }
+
+    #[test]
+    fn what_went_into_an_entry_merged_since_goes_with_it() {
+        let (_dir, mut store) = said(&["@0 one (distilled)", "@15 two (distilled)"]);
+        let project = Path::new(APP);
+        let merges = store.twins(project, &ANGLED).unwrap();
+        assert_eq!(
+            groups(&store.merge(project, &merges).unwrap()),
+            [(1, vec![2])]
+        );
+        store.add(project, note("@20 three")).unwrap();
+        let merges = store.twins(project, &ANGLED).unwrap();
+        assert_eq!(
+            groups(&store.merge(project, &merges).unwrap()),
+            [(3, vec![1])]
+        );
+        assert_eq!(store.merged_into(project, 2).unwrap(), Some(3));
+        let kept = store.get(project, 3).unwrap().unwrap();
+        assert_eq!(kept.seen, 3);
+    }
+
+    #[test]
+    fn the_nearest_to_what_was_said_are_nearest_to_any_of_it() {
+        let (_dir, mut store) = said(&["@0 one", "@30 two", "@60 three", "@90 four"]);
+        let project = Path::new(APP);
+        store
+            .conn
+            .execute("UPDATE entries SET kind = 'outcome' WHERE id = 2", [])
+            .unwrap();
+        let near = store
+            .nearest(project, &["@88 what was said", "@10 and more"], 2, &ANGLED)
+            .unwrap();
+        assert_eq!(ids(&near), [4, 1], "outcomes left out");
+        assert!(store.nearest(project, &[], 2, &ANGLED).unwrap().is_empty());
     }
 
     #[test]

@@ -702,7 +702,7 @@
             "string",
             "null"
           ],
-          "description": "What it was before: a renamed session's old name, what its agent was doing before it changed, or the agent that let go of it; a renamed tab's old name, the number a tab had before it moved or of the tab in front before, the number of the tab a session moved from, or the session or project the user was on before."
+          "description": "What it was before: a renamed session's old name, what its agent was doing before it changed, or the agent that let go of it; a renamed tab's old name, the number a tab had before it moved or of the tab in front before, the number of the tab a session moved from, or the session or project the user was on before; the ids of the entries of memory merged into one."
         },
         "task": {
           "anyOf": [
@@ -1056,6 +1056,10 @@
         {
           "const": "memory.distill_failed",
           "description": "the distiller couldn't read what a session did"
+        },
+        {
+          "const": "memory.merged",
+          "description": "entries that say the same thing are merged into one, by `crystal memory dedupe`"
         },
         {
           "const": "backlog.added",
@@ -2597,6 +2601,59 @@
       ],
       "description": "An entry, with whether it still holds."
     },
+    "MemoryMerge": {
+      "type": "object",
+      "properties": {
+        "kept": {
+          "$ref": "#/$defs/MemoryEntry"
+        },
+        "merged": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MemoryTwin"
+          }
+        }
+      },
+      "required": [
+        "kept",
+        "merged"
+      ],
+      "description": "Entries of a project that say the same thing, as `crystal memory dedupe` finds them: the one kept, and those that go into it, each as alike to it as it is."
+    },
+    "MemoryNew": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/MemoryKind"
+        },
+        "text": {
+          "type": "string"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "$ref": "#/$defs/MemorySource"
+        },
+        "checkout": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The worktree its files are in, from its top; the project's main worktree when it's `None`."
+        }
+      },
+      "required": [
+        "kind",
+        "text",
+        "files",
+        "source"
+      ],
+      "description": "An entry about to be added."
+    },
     "MemorySource": {
       "oneOf": [
         {
@@ -2646,6 +2703,31 @@
         }
       ],
       "description": "Who an entry came from."
+    },
+    "MemoryTwin": {
+      "type": "object",
+      "properties": {
+        "entry": {
+          "$ref": "#/$defs/MemoryEntry"
+        },
+        "alike": {
+          "type": "number",
+          "format": "float"
+        },
+        "reranked": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "default": null
+        }
+      },
+      "required": [
+        "entry",
+        "alike"
+      ],
+      "description": "An entry said before, and how alike it is to another, which says the same thing: by the model's vectors, from -1 to 1, and by the reranker, reading the other as the query, when it was asked."
     },
     "MessageAbout": {
       "type": "object",
@@ -4210,6 +4292,48 @@
         {
           "type": "object",
           "properties": {
+            "project": {
+              "type": "string"
+            },
+            "entry": {
+              "$ref": "#/$defs/MemoryNew"
+            },
+            "type": {
+              "type": "string",
+              "const": "remember"
+            }
+          },
+          "required": [
+            "type",
+            "project",
+            "entry"
+          ],
+          "description": "Add `entry` to the memory of `project`, a project's main worktree: the daemon, which keeps the models loaded, finds whether the project has it already in other words."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "dir": {
+              "type": "string"
+            },
+            "apply": {
+              "type": "boolean",
+              "default": false
+            },
+            "type": {
+              "type": "string",
+              "const": "dedupe_memory"
+            }
+          },
+          "required": [
+            "type",
+            "dir"
+          ],
+          "description": "Find the entries of the memory of the project `dir` is in that say what another does, by meaning, and with `apply`, merge each group into the one it keeps."
+        },
+        {
+          "type": "object",
+          "properties": {
             "dir": {
               "type": "string"
             },
@@ -5636,6 +5760,82 @@
             "entries"
           ],
           "description": "The entries a memory search found, the best first."
+        },
+        {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "new": {
+                  "$ref": "#/$defs/MemoryEntry"
+                }
+              },
+              "required": [
+                "new"
+              ],
+              "description": "A new entry."
+            },
+            {
+              "type": "object",
+              "properties": {
+                "again": {
+                  "$ref": "#/$defs/MemoryEntry"
+                }
+              },
+              "required": [
+                "again"
+              ],
+              "description": "The project had it already, in the same words: it was seen again, with any new files it named added to its own."
+            },
+            {
+              "type": "object",
+              "properties": {
+                "alike": {
+                  "$ref": "#/$defs/MemoryEntry"
+                }
+              },
+              "required": [
+                "alike"
+              ],
+              "description": "The project had it already in other words: this entry, which says the same thing, or had one merged into it in those words, was seen again, as with `Added::Again`."
+            },
+            {
+              "type": "string",
+              "const": "refused",
+              "description": "The user forgot it, and crystal can't add it back."
+            }
+          ],
+          "description": "What adding an entry to a project's memory came to.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "remembered"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "merges": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MemoryMerge"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "deduped"
+            }
+          },
+          "required": [
+            "type",
+            "merges"
+          ],
+          "description": "The entries of a project's memory that say what another does, each group with the one it keeps: merged, or with `Request::DedupeMemory` not told to apply them, as they would be."
         },
         {
           "type": "object",

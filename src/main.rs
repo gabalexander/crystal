@@ -1402,6 +1402,15 @@ enum MemoryCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// List the entries that say what another does, each group under the
+    /// one it would keep, found by meaning; with --apply, merge each group
+    /// into that one.
+    Dedupe {
+        /// Merge them: each one kept counts the others as said again, and
+        /// takes their files.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Download the model that searches by meaning, if it isn't here yet,
     /// and give every entry its vector: see `embeddings` under `[memory]`
     /// in the config.
@@ -2759,6 +2768,7 @@ fn run(cli: Cli) -> Result<()> {
                 memory_cli::kind(&socket, dir, kinding)?;
             }
             Some(MemoryCommand::Embed) => memory_cli::embed(&socket)?,
+            Some(MemoryCommand::Dedupe { apply }) => memory_cli::dedupe(&socket, dir, apply)?,
             Some(MemoryCommand::Promote { id, yes }) => {
                 memory_cli::promote(&socket, dir, id, yes)?;
             }
