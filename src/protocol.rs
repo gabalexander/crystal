@@ -88,8 +88,9 @@ pub enum Request {
         seq: Option<u64>,
     },
     /// What an agent or a script puts on its session's row with `crystal
-    /// report --line` or `--model`, for the sidebar alone: it doesn't take
-    /// the session's status over. Said the way [`Request::ReportAgent`] is.
+    /// report --line`, `--model`, `--token` and the rest, for the sidebar
+    /// alone: it doesn't take the session's status over. Said the way
+    /// [`Request::ReportAgent`] is.
     ReportMetadata {
         #[serde(default)]
         id: Option<String>,
@@ -97,6 +98,15 @@ pub enum Request {
         name: Option<String>,
         metadata: Metadata,
     },
+    /// The tokens a script puts on the project with its main worktree at
+    /// `project`, with `crystal project report`, for the sidebar's project
+    /// and worktree rows to show: `metadata`'s tokens, and nothing else.
+    ReportProject {
+        project: PathBuf,
+        metadata: Metadata,
+    },
+    /// The tokens reported for each project, as they are now.
+    ProjectTokens,
     /// Tell the user `text` with a notification, the way the daemon tells
     /// them a session needs them: about the session with `id`, or else
     /// called `name`, which a click on it takes them to, when there is one.
@@ -756,6 +766,11 @@ pub enum Response {
     Removals {
         worktrees: Vec<PathBuf>,
     },
+    /// The tokens reported for each project that has any, by its main
+    /// worktree, then by their names.
+    ProjectTokens {
+        projects: BTreeMap<PathBuf, BTreeMap<String, String>>,
+    },
     /// The name a new flow run got.
     FlowStarted {
         run: String,
@@ -859,6 +874,10 @@ pub struct SessionInfo {
     /// --line`, until it's taken off or its time is up.
     #[serde(default)]
     pub line: Option<String>,
+    /// The rest of what `crystal report` put on its row: a title, the
+    /// agent it says is in front, labels for its statuses and tokens.
+    #[serde(default, skip_serializing_if = "RowReport::is_empty")]
+    pub row: RowReport,
     /// Its program rang the terminal's bell while nobody was watching, and
     /// nobody has looked at it since.
     #[serde(default)]
@@ -1037,7 +1056,9 @@ pub enum AgentReport {
     Release,
 }
 
-/// What `crystal report --line` and `--model` put on a session's row.
+/// What `crystal report --line`, `--model`, `--title`, `--display-agent`,
+/// `--state-label` and `--token` put on a session's row, or `crystal
+/// project report --token` on a project's.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Metadata {
@@ -1048,6 +1069,24 @@ pub struct Metadata {
     /// empty gives that back.
     #[serde(default)]
     pub model: Option<String>,
+    /// What a row laid out with `title` says in place of the session's
+    /// name; empty takes it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// What the row says is in front, in place of the agent crystal reads;
+    /// empty gives that back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_agent: Option<String>,
+    /// What a row laid out with `state` says for a status, by the status's
+    /// word (`waiting`, `working`, `done`, `idle`, …); an empty one takes
+    /// that status's off.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub state_labels: BTreeMap<String, String>,
+    /// The values of tokens a row laid out with `$name` shows, by their
+    /// names; an empty one takes that token off. Those not named stay as
+    /// they were.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tokens: BTreeMap<String, String>,
     /// How long what this says stays, in seconds, unless it's said again:
     /// until it's replaced, with none.
     #[serde(default)]
@@ -1062,9 +1101,39 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    /// Whether it puts anything on the row: a line or a model.
+    /// Whether it puts anything on the row.
     pub fn shows(&self) -> bool {
-        self.line.is_some() || self.model.is_some()
+        self.line.is_some()
+            || self.model.is_some()
+            || self.title.is_some()
+            || self.display_agent.is_some()
+            || !self.state_labels.is_empty()
+            || !self.tokens.is_empty()
+    }
+}
+
+/// What `crystal report` put on a session's row besides its line and its
+/// model, while it lasts: for the sidebar alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct RowReport {
+    /// What a row laid out with `title` says in place of its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// What the row says is in front, in place of the agent crystal reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_agent: Option<String>,
+    /// What a row laid out with `state` says for a status, by its word.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub state_labels: BTreeMap<String, String>,
+    /// The values of the row's `$name` tokens, by their names.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tokens: BTreeMap<String, String>,
+}
+
+impl RowReport {
+    pub fn is_empty(&self) -> bool {
+        *self == RowReport::default()
     }
 }
 

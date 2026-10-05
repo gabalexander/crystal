@@ -28,10 +28,11 @@
 //! simple.
 
 use crate::flow_run::FlowRun;
+use crate::report;
 use crate::session;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -74,6 +75,9 @@ pub struct State {
     /// moves them.
     #[serde(default)]
     pub moves: Vec<HandedMove>,
+    /// The tokens reported for each project, by its main worktree.
+    #[serde(default)]
+    pub project_tokens: HashMap<PathBuf, report::Shown>,
 }
 
 /// A flow run as it's handed over: with the environment its steps start
@@ -522,6 +526,7 @@ mod tests {
             flows: Vec::new(),
             removals: Vec::new(),
             moves: Vec::new(),
+            project_tokens: HashMap::new(),
         };
         let fd = write(dir.path(), &state).unwrap();
         // Unlinked: nothing is left on disk.

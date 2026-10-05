@@ -48,6 +48,7 @@ mod ram_view;
 mod reply;
 mod restarted;
 mod review;
+pub(crate) mod rows;
 pub(crate) mod screen_widget;
 mod scrollbar;
 mod search;
@@ -96,6 +97,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use diff_view::Against;
+use groups::ByHand;
 use keymap::{CommandKind, KeyCommand, Sequence, SplitWay};
 use layouts::{Layouts, Which};
 use page::Page;
@@ -103,7 +105,7 @@ use pane::Pane;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 use settings_view::Setting;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -345,6 +347,8 @@ pub enum Event {
     },
     /// How many backlog items each project has to do.
     BacklogCounts(HashMap<PathBuf, usize>),
+    /// The tokens reported for each project, for the sidebar's rows.
+    ProjectTokens(BTreeMap<PathBuf, BTreeMap<String, String>>),
     /// What background tasks have spent today.
     Spending(Spending),
     /// The settings as they are now, for the settings view: boxed, as the
@@ -385,10 +389,19 @@ pub enum Event {
 pub(crate) fn obey_alone(
     sessions: Vec<SessionInfo>,
     flows: Vec<FlowRun>,
-    kept: Option<&str>,
+    projects: Vec<Worktree>,
+    (kept_tabs, kept_order): (Option<&str>, Option<&str>),
     order: Order,
 ) -> Result<app::Alone, String> {
-    App::obey_alone(sessions, flows, tabs::read(kept), order)
+    let by_hand = kept_order.and_then(|json| serde_json::from_str(json).ok());
+    let kept = app::Kept {
+        sessions,
+        flows,
+        projects,
+        tabs: tabs::read(kept_tabs),
+        by_hand: by_hand.unwrap_or_default(),
+    };
+    App::obey_alone(kept, order)
 }
 
 pub fn run(socket: &Path) -> Result<()> {
@@ -423,6 +436,7 @@ pub fn run(socket: &Path) -> Result<()> {
     let count_backlog = Arc::new(AtomicBool::new(crate::backlog::enabled(&config)));
     let poll_flows = Arc::new(AtomicBool::new(crate::flows::enabled(&config)));
     let poll_settings = Arc::new(AtomicBool::new(false));
+    let poll_project_tokens = Arc::new(AtomicBool::new(config.sidebar.shows_project_tokens()));
     spawn_session_poller(
         socket.to_path_buf(),
         sender.clone(),
@@ -430,6 +444,7 @@ pub fn run(socket: &Path) -> Result<()> {
             backlog_counts: count_backlog.clone(),
             flows: poll_flows.clone(),
             settings: poll_settings.clone(),
+            project_tokens: poll_project_tokens.clone(),
         },
     );
     let projects = Arc::new(Mutex::new(Vec::new()));
@@ -483,9 +498,11 @@ pub fn run(socket: &Path) -> Result<()> {
         kept_tabs: tabs::Tabs::default(),
         kept_sidebar: app::Shape::default(),
         kept_folded: BTreeSet::new(),
+        kept_by_hand: ByHand::default(),
         quitting: false,
         overlay: None,
         count_backlog,
+        poll_project_tokens,
         poll_flows,
         poll_settings,
         ram_open,
@@ -516,6 +533,11 @@ pub fn run(socket: &Path) -> Result<()> {
         .and_then(|json| serde_json::from_str(&json).ok());
     tui.app.set_folded_projects(folded.unwrap_or_default());
     tui.kept_folded = tui.app.folded_projects().clone();
+    let by_hand = tui
+        .ui(db::ORDER)
+        .and_then(|json| serde_json::from_str(&json).ok());
+    tui.app.set_by_hand(by_hand.unwrap_or_default());
+    tui.kept_by_hand = tui.app.by_hand().clone();
     tui.app
         .set_memory(launcher::read_memory(tui.ui(db::LAUNCHER).as_deref()));
     tui.app.set_diff_tree(tui.review().tree);
@@ -665,6 +687,9 @@ struct Tui {
     /// Whether the session poller asks how many backlog items each project
     /// has, which follows the backlog plugin being switched.
     count_backlog: Arc<AtomicBool>,
+    /// Whether the session poller asks for the tokens reported for each
+    /// project: a worktree's or a project's row laid out shows some.
+    poll_project_tokens: Arc<AtomicBool>,
     /// Whether the session poller asks for the flow runs too: the flows
     /// plugin is on.
     poll_flows: Arc<AtomicBool>,
@@ -719,6 +744,8 @@ struct Tui {
     kept_sidebar: app::Shape,
     /// The projects folded in the sidebar, as they were last written down.
     kept_folded: BTreeSet<PathBuf>,
+    /// The order put by hand, as it was last written down.
+    kept_by_hand: ByHand,
     /// How many searches find in files has asked for: a search that isn't
     /// the last one asked for stops.
     searches: Arc<AtomicU64>,
@@ -1144,6 +1171,14 @@ impl Tui {
             }
             self.kept_folded = folded.clone();
         }
+        // And the order put by hand.
+        let by_hand = self.app.by_hand();
+        if *by_hand != self.kept_by_hand {
+            if let Ok(db) = &self.db {
+                let _ = db.keep_ui(db::ORDER, by_hand);
+            }
+            self.kept_by_hand = by_hand.clone();
+        }
     }
 
     /// Tells the thread that counts what worktrees have changed which the
@@ -1534,6 +1569,7 @@ impl Tui {
             Event::MemoryRead { dir, read } => self.app.memory_read(&dir, read),
             Event::Backlog { dir, found } => self.app.set_backlog(&dir, found),
             Event::BacklogCounts(counts) => self.app.set_backlog_counts(counts),
+            Event::ProjectTokens(tokens) => self.app.set_project_tokens(tokens),
             Event::Spending(spending) => self.app.set_spending(spending),
             Event::Settings(current) => {
                 // The file changed by hand, or by another crystal, counts
@@ -2807,6 +2843,8 @@ impl Tui {
         self.app.set_plugin_keys(plugin_keys(config));
         let backlog = crate::backlog::enabled(config);
         self.count_backlog.store(backlog, Ordering::Relaxed);
+        let tokens = config.sidebar.shows_project_tokens();
+        self.poll_project_tokens.store(tokens, Ordering::Relaxed);
         let flows = crate::flows::enabled(config);
         self.poll_flows.store(flows, Ordering::Relaxed);
         self.set_sessions(self.app.sessions().to_vec());
@@ -3950,6 +3988,7 @@ struct Polled {
     backlog_counts: Arc<AtomicBool>,
     flows: Arc<AtomicBool>,
     settings: Arc<AtomicBool>,
+    project_tokens: Arc<AtomicBool>,
 }
 
 /// How often the config file is looked at for a change.
@@ -3988,6 +4027,7 @@ fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) 
         backlog_counts: count_backlog,
         flows: poll_flows,
         settings: poll_settings,
+        project_tokens: poll_project_tokens,
     } = polled;
     thread::spawn(move || {
         // Why the list couldn't be had, last time, once it has been said.
@@ -4051,6 +4091,13 @@ fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) 
             if count_backlog.load(Ordering::Relaxed)
                 && let Some(counts) = backlog_counts(&socket, projects)
                 && events.send(Event::BacklogCounts(counts)).is_err()
+            {
+                return;
+            }
+            if poll_project_tokens.load(Ordering::Relaxed)
+                && let Ok(Some(Response::ProjectTokens { projects })) =
+                    client::ask(&socket, &Request::ProjectTokens, false)
+                && events.send(Event::ProjectTokens(projects)).is_err()
             {
                 return;
             }
