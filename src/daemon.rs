@@ -4,6 +4,7 @@
 
 mod moving;
 mod removal;
+mod spare;
 
 use crate::agent_rules;
 use crate::agents;
@@ -57,6 +58,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use moving::{Move, written_down};
 use regex::Regex;
 use removal::Removal;
+use spare::Spare;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::io::{BufReader, ErrorKind, Read, Write};
@@ -93,6 +95,10 @@ fn idle_check_every() -> Duration {
         .and_then(|ms| ms.parse().ok())
         .map_or(Duration::from_secs(15), Duration::from_millis)
 }
+
+/// How long `crystal send` waits for an agent crystal stopped idle, started
+/// again to take what's sent, to be back at its prompt.
+const WAKE_TO_SEND: Duration = Duration::from_secs(60);
 
 /// How often a client that only listens is checked for having hung up.
 const LOOK_FOR_HANG_UP: Duration = Duration::from_secs(1);
@@ -181,6 +187,7 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
         projects: Mutex::default(),
         removals: Mutex::default(),
         moves: Mutex::default(),
+        spare: Mutex::default(),
         sweep,
     });
     // A daemon starts again after every upgrade, or is handed over to the
@@ -335,6 +342,10 @@ struct Daemon {
     /// The sessions on their way into other worktrees. Taken after
     /// `sessions`, never before it.
     moves: Mutex<Vec<Move>>,
+    /// The agent kept warm for a new session to take over, while
+    /// `[sessions] warm_agent` is on: see [`spare`]. Taken after
+    /// `sessions`, never before it.
+    spare: Mutex<Option<Spare>>,
     /// Asks for a look for entries of memory gone stale: see [`tell_stale`].
     sweep: SyncSender<()>,
 }
@@ -454,7 +465,7 @@ impl Daemon {
         sessions.extend(
             saved
                 .into_iter()
-                .map(|saved| Session::to_start(new_id(), saved)),
+                .map(|saved| Session::put_back(new_id(), saved)),
         );
     }
 
@@ -791,8 +802,9 @@ impl Daemon {
             if idle_checked.elapsed() >= idle_check_every {
                 idle_checked = Instant::now();
                 let settings = settings();
-                stop_idle_agents(&mut sessions, &settings);
+                stop_idle_sessions(&mut sessions, &settings);
                 follow_scrollback(&sessions, &settings);
+                self.keep_spare(&settings);
             }
             // Read only when a session has something to tell, at most once
             // a round.
@@ -1072,6 +1084,8 @@ impl Daemon {
         exe: &Path,
         deadline: Instant,
     ) -> Result<Infallible> {
+        // The agent kept warm isn't handed over: a TUI asks for another.
+        self.drop_spare();
         let mut sessions = self.sessions.lock().unwrap();
         let flows = self.flows.lock().unwrap();
         // Held until the exec, so each removal's git is handed over either
@@ -1898,6 +1912,7 @@ impl Daemon {
         from: Option<&str>,
         force: bool,
     ) -> Result<Response> {
+        self.wake_to_send(name)?;
         // In a block of its own, so the sessions are let go before the
         // typing below, which takes a moment.
         let (text, info, sender) = {
@@ -1973,6 +1988,46 @@ impl Daemon {
         }
         self.events.emit(Event::message(info, sender, text));
         Ok(Response::Done)
+    }
+
+    /// Starts again the session called `name` when crystal stopped it as
+    /// it sat idle, and waits for its agent to be back at its prompt: what's
+    /// sent to an agent left idle, like another agent's message, is taken
+    /// as if it had never stopped. Nothing for any other session.
+    fn wake_to_send(&self, name: &str) -> Result<()> {
+        let deadline = Instant::now() + WAKE_TO_SEND;
+        let mut woken = false;
+        loop {
+            {
+                let mut sessions = self.sessions.lock().unwrap();
+                let session = named(&mut sessions, name)?;
+                match (session.stopped_idle(), session.is_running(), woken) {
+                    (false, _, false) => return Ok(()),
+                    // Stopped, and not gone yet.
+                    (true, true, false) => {}
+                    (true, false, false) => {
+                        // In the environment it started with, or after a
+                        // restart, which forgot it, the daemon's.
+                        let env = match session.env() {
+                            env if env.is_empty() => env::current(),
+                            env => env.clone(),
+                        };
+                        drop(sessions);
+                        self.respawn(name, env)?;
+                        woken = true;
+                        continue;
+                    }
+                    (_, false, true) => bail!("{name} has ended"),
+                    (_, true, true) if session.at_prompt() => return Ok(()),
+                    (_, true, true) => {}
+                }
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "{name} was stopped as it sat idle, and isn't back at its prompt yet"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// The terminal of the session called `name`, to type into, which
@@ -2085,6 +2140,7 @@ impl Daemon {
         match request {
             Request::Attach { .. } => bail!("attach takes over the connection"),
             Request::New(new) => self.new_session(new),
+            Request::Warm(warm) => self.warm(warm),
             Request::NewTask(task) => {
                 let mut sessions = self.sessions.lock().unwrap();
                 let name = start_task(
@@ -2113,8 +2169,15 @@ impl Daemon {
                 cwd,
                 subagent,
                 model,
+                wakeup,
             } => {
                 let agent = agent.unwrap_or_else(|| "claude".to_string());
+                // The agent kept warm is in no list till it's taken over.
+                if let Some(id) = &id
+                    && self.spare_heard(id, event, conversation.clone(), model.as_deref())
+                {
+                    return Ok(Response::Done);
+                }
                 let mut sessions = self.sessions.lock().unwrap();
                 let id = match id {
                     Some(id) => id,
@@ -2155,6 +2218,9 @@ impl Daemon {
                 }
                 if let Some(model) = model {
                     session.heard_model(&model);
+                }
+                if let Some(wakeup) = wakeup {
+                    session.scheduled(wakeup);
                 }
                 // A conversation just named is looked at now: what's
                 // written to it from here on is news, its model and its
@@ -2577,7 +2643,8 @@ impl Daemon {
                         .filter_map(|session| Some((session.name.clone(), session.running_pid()?)));
                     running.collect()
                 };
-                let taken = resources::measure(std::process::id(), client, &running);
+                let warm = self.spare_pid();
+                let taken = resources::measure(std::process::id(), client, &running, warm);
                 Ok(Response::Resources(taken))
             }
             Request::Spending => Ok(Response::Spending(protocol::Spending {
@@ -2704,10 +2771,14 @@ impl Daemon {
             // daemon, and the list of them stays as it was last written.
             Request::Shutdown {
                 keep_sessions: true,
-            } => Ok(Response::Done),
+            } => {
+                self.drop_spare();
+                Ok(Response::Done)
+            }
             Request::Shutdown {
                 keep_sessions: false,
             } => {
+                self.drop_spare();
                 let mut sessions = std::mem::take(&mut *self.sessions.lock().unwrap());
                 let tasks_on = tasks::enabled(&settings());
                 for session in &mut sessions {
@@ -3032,7 +3103,11 @@ impl Daemon {
     fn new_session(&self, new: NewSession) -> Result<Response> {
         let mut sessions = self.sessions.lock().unwrap();
         let given = new.name.is_some();
-        let name = start(&mut sessions, &self.socket, new, None, None)?;
+        // The agent kept warm takes it on, when it was started the same way.
+        let name = match self.take_spare(&new) {
+            Some(spare) => spare::adopt(&mut sessions, spare, new)?,
+            None => start(&mut sessions, &self.socket, new, None, None)?,
+        };
         if given {
             named(&mut sessions, &name)?.keep_given_name();
         }
@@ -3223,9 +3298,10 @@ impl Daemon {
 
     /// Runs an ended session's command again, in its directory and under
     /// its name, keeping its place in the list. An agent whose conversation
-    /// can be picked up starts back in it. One yet to start again after a
-    /// restart, or that couldn't, starts now, as the restart would have
-    /// started it.
+    /// can be picked up starts back in it, and a terminal crystal stopped
+    /// idle in the directory its shell was in. One yet to start again after
+    /// a restart, one that couldn't, and one crystal had stopped idle before
+    /// it start now, as the restart would have started them.
     fn respawn(&self, name: &str, env: BTreeMap<String, String>) -> Result<Response> {
         let mut sessions = self.sessions.lock().unwrap();
         let index = sessions
@@ -3280,12 +3356,18 @@ impl Daemon {
                     brief,
                     agent_names: false,
                 };
-                start(
+                // A terminal crystal stopped idle shows what it showed,
+                // above its shell started again.
+                let before = ended.stopped_idle().then(|| ended.term().kept_screen());
+                start_as(
+                    new_id(),
                     &mut sessions,
                     &self.socket,
                     new,
                     launch.conversation,
                     launch.resume,
+                    None,
+                    before,
                 )
             }
         };
@@ -3313,21 +3395,38 @@ impl Daemon {
     }
 }
 
-/// Stops the agents that have sat idle for longer than `settings` allow:
-/// see [`Session::idle_for`]. They stay in the list, ended, to start again
-/// in their conversations.
-fn stop_idle_agents(sessions: &mut [Session], settings: &Config) {
+/// Stops the sessions that have sat idle for longer than `settings` allow:
+/// agents, and terminals when they say so (see [`Session::idle_for`]),
+/// unless what runs under them holds them (see [`Session::held_by`]),
+/// which is looked at only then, once for all of them. They stay in the
+/// list, ended, to start again where they were. Processes that can't be
+/// looked at hold every one.
+fn stop_idle_sessions(sessions: &mut [Session], settings: &Config) {
     let Some(limit) = settings.sessions.idle_limit() else {
         return;
     };
-    let idle: Vec<(usize, Duration)> = sessions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, session)| Some((index, session.idle_for()?)))
+    let terminals = settings.sessions.stop_idle_terminals;
+    let idle: Vec<usize> = (sessions.iter().enumerate())
+        .filter(|(_, session)| {
+            session
+                .idle_for(terminals)
+                .is_some_and(|idle| idle >= limit)
+        })
+        .map(|(index, _)| index)
         .collect();
-    for (index, for_how_long) in idle {
-        if for_how_long >= limit {
-            sessions[index].stop_idle();
+    if idle.is_empty() {
+        return;
+    }
+    let Some(processes) = resources::Processes::read() else {
+        return;
+    };
+    for index in idle {
+        let session = &mut sessions[index];
+        let Some(pid) = session.running_pid() else {
+            continue;
+        };
+        if !session.held_by(processes.under(pid)) {
+            session.stop_idle();
         }
     }
 }
@@ -3693,27 +3792,10 @@ fn start_as(
         "command not found: {program}"
     );
     let config = settings();
-    // Not given a name, a session is named for what it's asked to do, or
-    // else after its program, until its first prompt names it.
-    let from_prompt = task
-        .as_deref()
-        .filter(|_| config.name_from_prompt)
-        .and_then(names::from_prompt);
-    let named_after_program = name.is_none() && from_prompt.is_none();
     // Claude Code, asked to with its first prompt, names it better still,
     // unless whoever started it holds on to the name it's given here.
-    let agent_names = agent_names
-        && name.is_none()
-        && config.name_by_agent
-        && agents::program_name(&command) == Some("claude");
-    let taken = |name: &str| sessions.iter().any(|session| session.name == name);
-    let name = match name {
-        Some(name) => {
-            check_name(&name, taken)?;
-            name
-        }
-        None => unique_name(from_prompt.as_deref().unwrap_or(program), taken),
-    };
+    let agent_names = agent_names && names_itself(name.as_deref(), &command, &config);
+    let (name, named_after_program) = name_for(sessions, name, task.as_deref(), program, &config)?;
 
     let rollouts = codex::Rollouts::for_session(&command, &cwd, &env);
     // An agent that said how to resume it comes back with that command:
@@ -3755,29 +3837,12 @@ fn start_as(
     // With tasks off, a session started with something to do is just a
     // session.
     let task = task.filter(|_| tasks::enabled(&config));
-    // The pull request and the issue it's about, which it's told of beside
-    // its task, whether tasks are on or off, and with no task at all.
-    let about_task = paragraphs([
-        task.as_ref()
-            .map(|_| tasks::instructions(backlog::enabled(&config))),
-        tasks::forge_notes(&brief, &cwd, task.is_some()),
-    ]);
-    let parallel = (agents::program_name(&command) == Some("claude"))
-        .then(|| format!("{} {}", agents::PARALLEL_WORK, agents::SHOWING_FILES));
-    let remembered = remembered(socket, &cwd, &command);
-    let said = [
-        task.as_deref(),
-        about_task.as_deref(),
-        parallel.as_deref(),
-        remembered.as_deref(),
-    ];
-    let handoff = handoff_note(&cwd, &said);
     // Picked up again with its own command, its conversation has heard
     // crystal's notes already.
     let instructions = if resumed {
         Vec::new()
     } else {
-        notes(about_task, parallel, handoff, remembered)
+        launch_notes(socket, &cwd, &command, task.as_deref(), &brief, &config)
     };
     let argv = agents::argv(
         &asked,
@@ -3820,6 +3885,70 @@ fn start_as(
     }
     sessions.push(session);
     Ok(name)
+}
+
+/// The name a new session takes beside `sessions`, and whether it's named
+/// after its program: `name` when it's given and free; or else, with
+/// `name_from_prompt` on, one for `task`, what it's asked to do; or else one
+/// after its `program`, until its first prompt names it.
+fn name_for(
+    sessions: &[Session],
+    name: Option<String>,
+    task: Option<&str>,
+    program: &str,
+    config: &Config,
+) -> Result<(String, bool)> {
+    let from_prompt = task
+        .filter(|_| config.name_from_prompt)
+        .and_then(names::from_prompt);
+    let named_after_program = name.is_none() && from_prompt.is_none();
+    let taken = |name: &str| sessions.iter().any(|session| session.name == name);
+    let name = match name {
+        Some(name) => {
+            check_name(&name, taken)?;
+            name
+        }
+        None => unique_name(from_prompt.as_deref().unwrap_or(program), taken),
+    };
+    Ok((name, named_after_program))
+}
+
+/// Whether a new session started as `command`, given the name `name`, is
+/// for its agent to name, as the settings say: Claude Code, with a name
+/// nobody gave it.
+fn names_itself(name: Option<&str>, command: &[String], config: &Config) -> bool {
+    name.is_none() && config.name_by_agent && agents::program_name(command) == Some("claude")
+}
+
+/// What crystal tells an agent starting in `cwd` with `command` on top of
+/// what it's asked (see [`notes`]): of `task`, the task it's given, with
+/// tasks on, and of the pull request and the issue `brief` names, whether
+/// it's a task or not; how to work on several things at once here and show
+/// the user files, for Claude Code; the notes its worktree's sessions left; and what its
+/// project remembers that has to do with the words of `command`.
+fn launch_notes(
+    socket: &Path,
+    cwd: &Path,
+    command: &[String],
+    task: Option<&str>,
+    brief: &TaskBrief,
+    config: &Config,
+) -> Vec<String> {
+    let about_task = paragraphs([
+        task.map(|_| tasks::instructions(backlog::enabled(config))),
+        tasks::forge_notes(brief, cwd, task.is_some()),
+    ]);
+    let parallel = (agents::program_name(command) == Some("claude"))
+        .then(|| format!("{} {}", agents::PARALLEL_WORK, agents::SHOWING_FILES));
+    let remembered = remembered(socket, cwd, command);
+    let said = [
+        task,
+        about_task.as_deref(),
+        parallel.as_deref(),
+        remembered.as_deref(),
+    ];
+    let handoff = handoff_note(cwd, &said);
+    notes(about_task, parallel, handoff, remembered)
 }
 
 /// Whether the session called `name` can be resumed with `argv`, the
@@ -4574,6 +4703,7 @@ mod tests {
             about: TaskBrief::default(),
             name_given: false,
             moved: None,
+            stopped_idle: false,
         };
         assert!(shows_again(&shell));
         // An agent whose conversation is there to pick up shows its own.

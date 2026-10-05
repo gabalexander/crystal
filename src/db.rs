@@ -277,6 +277,14 @@ ALTER TABLE sessions ADD COLUMN moved TEXT;
 ALTER TABLE archived ADD COLUMN moved TEXT;
 ";
 
+/// Whether crystal had stopped a session after it sat idle when it was
+/// written down: 1 if it had. It stays stopped after a restart, to start
+/// again once it's wanted.
+const STOPPED_IDLE: &str = "
+ALTER TABLE sessions ADD COLUMN stopped_idle INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE archived ADD COLUMN stopped_idle INTEGER NOT NULL DEFAULT 0;
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
@@ -294,13 +302,14 @@ const MIGRATIONS: &[&str] = &[
     NAME_GIVEN,
     SCREENS,
     MOVED,
+    STOPPED_IDLE,
 ];
 
 /// The file each project kept its backlog in before the database.
 const OLD_BACKLOG: &str = "backlog.json";
 
 const SESSION_COLUMNS: &str =
-    "name, command, cwd, conversation, task, goal, resume, about, name_given, moved";
+    "name, command, cwd, conversation, task, goal, resume, about, name_given, moved, stopped_idle";
 const RUN_COLUMNS: &str =
     "name, flow, profiles, goal, cwd, worktree, round, feedback, steps, started";
 const TASK_COLUMNS: &str = "project_name, goal, session, branch, background, backlog, failed, \
@@ -403,7 +412,7 @@ impl Db {
         self.conn.execute(
             &format!(
                 "INSERT OR REPLACE INTO archived (id, {SESSION_COLUMNS}, worktree, archived) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
             ),
             params![
                 archived.id,
@@ -417,6 +426,7 @@ impl Db {
                 brief_json(&session.about)?,
                 session.name_given,
                 json_or_null(&session.moved)?,
+                session.stopped_idle,
                 json_or_null(&archived.worktree)?,
                 archived.archived as i64,
             ],
@@ -956,7 +966,7 @@ fn write_sessions(conn: &Connection, sessions: &[SavedSession]) -> Result<()> {
         conn.execute(
             &format!(
                 "INSERT INTO sessions (position, {SESSION_COLUMNS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
             ),
             params![
                 position as i64,
@@ -970,6 +980,7 @@ fn write_sessions(conn: &Connection, sessions: &[SavedSession]) -> Result<()> {
                 brief_json(&session.about)?,
                 session.name_given,
                 json_or_null(&session.moved)?,
+                session.stopped_idle,
             ],
         )?;
     }
@@ -992,15 +1003,16 @@ fn session_of(row: &Row) -> Result<SavedSession> {
         about: from_json_or_null(row.get(7)?)?.unwrap_or_default(),
         name_given: row.get(8)?,
         moved: from_json_or_null(row.get(9)?)?,
+        stopped_idle: row.get(10)?,
     })
 }
 
 fn archived_of(row: &Row) -> Result<ArchivedSession> {
     Ok(ArchivedSession {
         session: session_of(row)?,
-        id: row.get(10)?,
-        worktree: from_json_or_null(row.get(11)?)?,
-        archived: row.get::<_, i64>(12)? as u64,
+        id: row.get(11)?,
+        worktree: from_json_or_null(row.get(12)?)?,
+        archived: row.get::<_, i64>(13)? as u64,
     })
 }
 
@@ -1284,6 +1296,7 @@ mod tests {
             about: Default::default(),
             name_given: false,
             moved: None,
+            stopped_idle: false,
         }
     }
 
@@ -1397,7 +1410,12 @@ mod tests {
             path: PathBuf::from("/code/app.worktrees/fix"),
             branch: Some("fix".into()),
         });
-        let sessions = vec![reported, task, named, moving];
+        // One crystal stopped idle stays stopped.
+        let stopped = SavedSession {
+            stopped_idle: true,
+            ..saved("d")
+        };
+        let sessions = vec![reported, task, named, moving, stopped];
         db.save_sessions(&sessions).unwrap();
         assert_eq!(db.sessions().unwrap(), sessions);
 

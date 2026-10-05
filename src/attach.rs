@@ -89,7 +89,13 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
     let (cols, rows) = terminal::size()?;
     // The history from before, for copy mode and the wheel to go back
     // through: your terminal's own scrolling can't reach it.
-    let (viewer, output) = Viewer::connect(socket, name, (rows, cols), true)?;
+    let (mut viewer, mut output) = Viewer::connect(socket, name, (rows, cols), true)?;
+    // One crystal stopped as it sat idle starts again where it was, as
+    // going to it in the TUI has it do.
+    if !viewer.running && stopped_idle(socket, &viewer.id) {
+        client::respawn(socket, &viewer.name)?;
+        (viewer, output) = Viewer::connect(socket, Some(&viewer.name), (rows, cols), true)?;
+    }
     let name = viewer.name.clone();
     if env::own_session_id(socket).as_deref() == Some(viewer.id.as_str()) {
         bail!("can't attach {name} to itself");
@@ -129,6 +135,17 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
         outln!("{}", ending(socket, &name))?;
     }
     Ok(())
+}
+
+/// Whether crystal stopped the session with the id `id` after it sat idle.
+fn stopped_idle(socket: &Path, id: &str) -> bool {
+    let Ok(Some(Response::Sessions { sessions })) = client::ask(socket, &Request::List, false)
+    else {
+        return false;
+    };
+    sessions
+        .iter()
+        .any(|session| session.id == id && session.stopped_idle)
 }
 
 /// Whether the session with the id `id` is a background task, whose screen

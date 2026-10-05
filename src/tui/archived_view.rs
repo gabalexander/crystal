@@ -244,6 +244,7 @@ mod tests {
                 about: Default::default(),
                 name_given: false,
                 moved: None,
+                stopped_idle: false,
             },
             worktree: None,
             archived: 10,

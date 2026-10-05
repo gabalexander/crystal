@@ -3317,6 +3317,20 @@
           ]
         },
         {
+          "$ref": "#/$defs/WarmAgent",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "warm"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "description": "Keep an agent started and waiting as `warm` says, while `[sessions] warm_agent` is on, for a new session started the same way to take over: asked again, to keep it. The daemon keeps one, for the client that asked last."
+        },
+        {
           "$ref": "#/$defs/NewTask",
           "type": "object",
           "properties": {
@@ -3431,6 +3445,17 @@
               ],
               "description": "The model the agent runs on, when its hooks say.",
               "default": null
+            },
+            "wakeup": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Wakeup"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Work the agent scheduled to wake it later, when its hooks say it just did: it isn't idle meanwhile."
             },
             "type": {
               "type": "string",
@@ -4943,6 +4968,17 @@
           },
           "description": "Each session whose program runs, in the daemon's order."
         },
+        "warm": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProcessUsage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The agent kept warm for a new session to take over, while there's one: `[sessions] warm_agent`."
+        },
         "total": {
           "type": "integer",
           "format": "uint64",
@@ -5908,6 +5944,10 @@
             }
           ],
           "description": "The worktree it was on its way into when it was written down, which its `cwd` is in already: its agent is told it has moved as it starts there."
+        },
+        "stopped_idle": {
+          "type": "boolean",
+          "description": "Whether crystal had stopped it after it sat idle: it stays stopped after a restart, to start again once it's wanted."
         }
       },
       "required": [
@@ -7411,6 +7451,72 @@
         "seen"
       ],
       "description": "A rule as it was tried on a screen."
+    },
+    "Wakeup": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "after": {
+              "type": "object",
+              "properties": {
+                "secs": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "secs"
+              ]
+            }
+          },
+          "required": [
+            "after"
+          ],
+          "additionalProperties": false,
+          "description": "Once, this many seconds on."
+        },
+        {
+          "type": "string",
+          "const": "recurring",
+          "description": "Again and again, for as long as it runs."
+        }
+      ],
+      "description": "Work an agent scheduled to wake it later, as its hooks say: Claude Code's `ScheduleWakeup`, which a `/loop` paces itself with, and `CronCreate`. An agent stopped meanwhile would never wake."
+    },
+    "WarmAgent": {
+      "type": "object",
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Its command, with no first prompt: Claude Code's."
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "The client's environment, which the program starts from."
+        },
+        "task": {
+          "type": "boolean",
+          "description": "Whether the session that takes it over is a task, with tasks on: the agent is told of closing it as it starts."
+        }
+      },
+      "required": [
+        "cwd",
+        "command",
+        "env",
+        "task"
+      ],
+      "description": "What a warm agent is started as: what a new session that takes it over is started as, but for its first prompt, which is typed into it then."
     },
     "Worktree": {
       "type": "object",

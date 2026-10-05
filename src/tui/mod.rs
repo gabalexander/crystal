@@ -65,6 +65,7 @@ pub(crate) mod theme;
 mod timeline;
 mod tree_browser;
 mod ui;
+mod warm;
 pub(crate) mod window;
 
 use crate::bell::Ringer;
@@ -83,7 +84,7 @@ use crate::profile;
 use crate::project_cli;
 use crate::project_commands::{self, Commands, Verb};
 use crate::protocol::{
-    Backlog, NewSession, Request, Response, SessionInfo, Spending, State, Worktree,
+    Backlog, NewSession, Request, Response, SessionInfo, Spending, State, WarmAgent, Worktree,
 };
 use crate::{catalog, keys, links, names, project, shell, socket, typing, update};
 use crate::{client, clipboard, drive, env, event_log, events, git, handoff};
@@ -512,6 +513,7 @@ pub fn run(socket: &Path) -> Result<()> {
         ringer: Ringer::default(),
         fetched_remotes: HashMap::new(),
         fetching_remotes: HashSet::new(),
+        warming: warm::Warming::default(),
     };
     tui.app.set_agents(catalog::installed());
     let server = socket::server_of(socket).filter(|server| server != socket::DEFAULT);
@@ -782,6 +784,9 @@ struct Tui {
     /// the worktrees whose fetch is still going: one at a time in each.
     fetched_remotes: HashMap<PathBuf, Instant>,
     fetching_remotes: HashSet<PathBuf>,
+    /// Asking the daemon to keep an agent warm where the selection is,
+    /// while `[sessions] warm_agent` is on.
+    warming: warm::Warming,
 }
 
 impl Tui {
@@ -801,6 +806,7 @@ impl Tui {
         // What the layout comes to as the TUI opens is nothing new.
         self.layout_told = self.app.look();
         self.layout_seen = self.layout_told.clone();
+        self.wake_landed();
         while !self.quitting {
             if changed {
                 self.draw(terminal)?;
@@ -821,9 +827,55 @@ impl Tui {
             self.tell_layout();
             self.count_worktrees();
             self.ask_modes_when_due();
+            changed |= self.wake_landed();
+            self.keep_warm();
         }
         self.keep_seen();
         Ok(())
+    }
+
+    /// Starts again the session crystal stopped idle that the selection has
+    /// rested on, as if it had never stopped: in its conversation, or a
+    /// terminal where its shell was, the keyboard left where it is. Whether
+    /// it did, for the sidebar to be drawn again.
+    fn wake_landed(&mut self) -> bool {
+        let Some(name) = self.app.wake_landed(Instant::now()) else {
+            return false;
+        };
+        let woken = client::respawn(&self.socket, &name).and_then(|()| self.refresh_sessions());
+        if let Err(err) = woken {
+            self.app
+                .notify(format!("couldn't start {name} again: {err:#}"));
+        }
+        true
+    }
+
+    /// Asks the daemon, off the loop, to keep an agent warm where the
+    /// selection is, while `[sessions] warm_agent` is on: Claude Code as
+    /// the new-session panel would start it there, for a session started
+    /// that way to take over. See [`warm`].
+    fn keep_warm(&mut self) {
+        let wanted = self
+            .config
+            .sessions
+            .warm_agent
+            .then(|| self.app.warm_agent());
+        let wanted = wanted
+            .flatten()
+            .and_then(|(place, command, task)| Some((self.start_dir(place).ok()?, command, task)));
+        let Some((cwd, command, task)) = self.warming.follow(wanted, Instant::now()) else {
+            return;
+        };
+        let request = Request::Warm(WarmAgent {
+            cwd,
+            command,
+            env: env::current(),
+            task,
+        });
+        let socket = self.socket.clone();
+        // An agent that can't be kept warm is no harm: the session it was
+        // for starts as it would have.
+        thread::spawn(move || client::ask(&socket, &request, false));
     }
 
     /// Lays everything out for the terminal's size, and draws it.
@@ -1288,7 +1340,13 @@ impl Tui {
         let layout = self
             .layout_changed
             .map(|changed| (changed + layout_events::SETTLE).saturating_duration_since(now));
-        let Some(wait) = draw.into_iter().chain(modes).chain(layout).min() else {
+        // A session crystal stopped idle starts again once the selection
+        // has rested on it, and the agent kept warm is asked for once where
+        // it would be has held: what they change is drawn as they do.
+        let wake = (self.app.wake_due()).map(|due| due.saturating_duration_since(now));
+        let warm = (self.warming.due()).map(|due| due.saturating_duration_since(now));
+        let quiet = modes.into_iter().chain(layout).chain(wake).chain(warm);
+        let Some(wait) = draw.into_iter().chain(quiet).min() else {
             return Ok(Woke::Event(Box::new(events.recv()?)));
         };
         match events.recv_timeout(wait) {
@@ -1882,6 +1940,8 @@ impl Tui {
                     ..purpose
                 };
                 let name = client::new_session_for(&self.socket, None, cwd, command, purpose)?.name;
+                // It may have taken the agent kept warm over.
+                self.warming.taken();
                 self.show_new_session(&name)?;
                 self.keep_memory();
             }

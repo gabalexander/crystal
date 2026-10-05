@@ -86,6 +86,8 @@ pub enum Setting {
     NameFromPrompt,
     NameByAgent,
     StopIdle,
+    StopIdleTerminals,
+    WarmAgent,
     RestartSpacing,
     ResumeReported,
     Shell,
@@ -145,6 +147,8 @@ impl Setting {
             Setting::NameFromPrompt => &["name_from_prompt"],
             Setting::NameByAgent => &["name_by_agent"],
             Setting::StopIdle => &["sessions", "stop_idle_after"],
+            Setting::StopIdleTerminals => &["sessions", "stop_idle_terminals"],
+            Setting::WarmAgent => &["sessions", "warm_agent"],
             Setting::RestartSpacing => &["sessions", "restart_spacing_ms"],
             Setting::ResumeReported => &["resume_reported_agents"],
             Setting::Shell => &["terminal", "default_shell"],
@@ -204,6 +208,8 @@ impl Setting {
             Setting::NameFromPrompt => "name from the prompt",
             Setting::NameByAgent => "named by Claude",
             Setting::StopIdle => "stop idle agents",
+            Setting::StopIdleTerminals => "  terminals too",
+            Setting::WarmAgent => "keep one warm",
             Setting::RestartSpacing => "space out restarts",
             Setting::ResumeReported => "resume as reported",
             Setting::Shell => "shell",
@@ -500,6 +506,8 @@ const TABS: [Tab; 8] = [
                     S::NameFromPrompt,
                     S::NameByAgent,
                     S::StopIdle,
+                    S::StopIdleTerminals,
+                    S::WarmAgent,
                     S::RestartSpacing,
                     S::ResumeReported,
                 ],
@@ -1150,6 +1158,8 @@ impl SettingsView {
                 let now = &config.sessions.stop_idle_after;
                 Change::set(setting, next_named(&SessionSettings::CHOICES, now, forward))
             }
+            S::StopIdleTerminals => on(!config.sessions.stop_idle_terminals),
+            S::WarmAgent => on(!config.sessions.warm_agent),
             S::RestartSpacing => {
                 let now = config.sessions.restart_spacing_ms;
                 let spacing = next_of(&SessionSettings::SPACINGS, now, forward);
@@ -1862,10 +1872,18 @@ fn shown(setting: Setting, config: &Config) -> Shown {
                     Some(_) => format!("after {}", config.sessions.stop_idle_after),
                     None => "off".to_string(),
                 },
-                about: "at their prompt, unwatched: they start again where they were".to_string(),
+                about: "at their prompt, unwatched: they start again as you go to them".to_string(),
                 dim: false,
             }
         }
+        S::StopIdleTerminals => switch(
+            config.sessions.stop_idle_terminals,
+            "a shell at its prompt, nothing under it: back where it was, its variables gone",
+        ),
+        S::WarmAgent => switch(
+            config.sessions.warm_agent,
+            "a Claude Code waiting where you are, a few hundred MB: new sessions start at once",
+        ),
         S::RestartSpacing => {
             let spacing = config.sessions.restart_spacing_ms;
             Shown {
@@ -2037,6 +2055,7 @@ fn shown(setting: Setting, config: &Config) -> Shown {
     };
     let quiet = match setting {
         S::NotifyAfter | S::UnfocusedOnly | S::NotifyCommand => !config.notify,
+        S::StopIdleTerminals => config.sessions.idle_limit().is_none(),
         _ => false,
     };
     Shown {
@@ -2426,6 +2445,8 @@ mod tests {
             (S::NameFromPrompt, false),
             (S::NameByAgent, false),
             (S::ResumeReported, false),
+            (S::StopIdleTerminals, true),
+            (S::WarmAgent, true),
             (S::RestoreScreens, true),
             (S::MouseCapture, false),
             (S::CopyOnSelect, false),
@@ -2501,8 +2522,8 @@ mod tests {
         both(
             &mut view,
             S::StopIdle,
+            change(S::StopIdle, "1h"),
             change(S::StopIdle, "15m"),
-            change(S::StopIdle, "8h"),
         );
         both(
             &mut view,
@@ -2622,7 +2643,7 @@ mod tests {
             }
         }
         let settings: usize = (0..KEYS_TAB).map(|tab| rows(tab, &[]).len()).sum();
-        assert_eq!(settings, 53);
+        assert_eq!(settings, 55);
     }
 
     /// Writes `change` to a config file made of `text`, and reads it back.

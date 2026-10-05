@@ -17279,13 +17279,16 @@ fn an_archived_agent_leaves_the_list_and_comes_back_where_it_was() {
     );
 }
 
+/// The config of a test of sessions stopped idle: after a second.
+const STOP_IDLE: &str = "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
+                         [sessions]\nstop_idle_after = \"1s\"\n";
+
 #[test]
 fn an_agent_left_idle_is_stopped_and_starts_again_where_it_was() {
     let crystal = Crystal::new();
-    crystal.configure(
-        "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
-         [sessions]\nstop_idle_after = \"1s\"\n",
-    );
+    crystal.configure(STOP_IDLE);
+    let checks = [("CRYSTAL_IDLE_CHECK_MS", "100")];
+    let daemon = crystal.start_daemon_with(&checks);
     let bin = fake_reporting_agent(crystal.dir.path());
     let path = path_of(&[&bin]);
     let args = crystal.dir.path().join("pi-args");
@@ -17293,7 +17296,6 @@ fn an_agent_left_idle_is_stopped_and_starts_again_where_it_was() {
     let out = crystal
         .command(&["new", "-d", "-n", "agent", "pi"])
         .env("PATH", &path)
-        .env("CRYSTAL_IDLE_CHECK_MS", "100")
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -17315,15 +17317,217 @@ fn an_agent_left_idle_is_stopped_and_starts_again_where_it_was() {
     });
     assert_eq!(crystal.row("plain").unwrap()[1], "running");
 
+    // It stays stopped after a crash, rather than starting again.
+    eventually("it's written down as stopped", || {
+        crystal
+            .query("SELECT CAST(stopped_idle AS TEXT) FROM sessions WHERE name = 'agent'")
+            .as_deref()
+            == Some("1")
+    });
     std::fs::remove_file(&args).unwrap();
+    crash(daemon);
+    let daemon = crystal.start_daemon_with(&checks);
+    eventually("the other session is back", || {
+        crystal.row("plain").unwrap()[1] == "running"
+    });
+    assert_eq!(crystal.row("agent").unwrap()[1], "stopped idle");
+    assert!(!args.exists(), "it didn't start");
+
+    // Going to it starts it again in its conversation.
+    let mut back = crystal.attach_with_env(&["attach", "agent"], &[("PATH", &path)]);
+    eventually("it's started again", || args.exists());
+    assert_eq!(written(&args), "--resume\ns 1\n");
+    back.type_keys("\x1c");
+    assert!(back.exit());
+    assert_ne!(crystal.row("agent").unwrap()[1], "stopped idle");
+    crash(daemon);
+}
+
+/// A stand-in for an agent that says it has finished its turn, and how to
+/// resume it, with a job it cut loose from its terminal still running, as
+/// Claude Code's Bash calls in the background are: its pid in `job-pid`.
+fn fake_agent_with_a_job(dir: &Path) -> PathBuf {
+    let bin = dir.join("job-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let body = format!(
+        r#"
+perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' sleep 300 &
+printf '%s\n' $! > job-pid.new && mv job-pid.new job-pid
+'{CRYSTAL}' report working --agent pi
+'{CRYSTAL}' report idle -- pi --resume 's 1'
+while [ ! -e quit ]; do sleep 0.05; done
+"#
+    );
+    script(&bin.join("pi"), &body);
+    bin
+}
+
+#[test]
+fn an_agent_with_a_job_running_on_its_own_is_left_until_the_job_ends() {
+    let crystal = Crystal::new();
+    crystal.configure(STOP_IDLE);
+    let daemon = crystal.start_daemon_with(&[("CRYSTAL_IDLE_CHECK_MS", "100")]);
+    let bin = fake_agent_with_a_job(crystal.dir.path());
     let out = crystal
-        .command(&["respawn", "agent"])
-        .env("PATH", &path)
+        .command(&["new", "-d", "-n", "agent", "pi"])
+        .env("PATH", path_of(&[&bin]))
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert_eq!(written(&args), "--resume\ns 1\n");
+    let job = crystal.dir.path().join("job-pid");
+    eventually("its job has started", || job.exists());
+    let job: i32 = written(&job).trim().parse().unwrap();
+    eventually("its turn has ended", || {
+        crystal.listed("agent")["activity"] == "done"
+    });
+    let mut seen = crystal.attach(&["attach", "agent"]);
+    seen.type_keys("\x1c");
+    assert!(seen.exit());
+    thread::sleep(Duration::from_millis(2000));
+    assert_eq!(crystal.row("agent").unwrap()[1], "idle", "its job holds it");
+
+    // SAFETY: kill only sends a signal, to the job this test started.
+    unsafe { libc::kill(job, libc::SIGKILL) };
+    eventually("it's stopped once its job has ended", || {
+        crystal.row("agent").unwrap()[1] == "stopped idle"
+    });
+
+    // A message sent to it, say by another agent, starts it again and
+    // reaches it once it's back at its prompt.
+    let started = Instant::now();
+    let out = crystal
+        .command(&["send", "agent", "carry on"])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_ne!(crystal.row("agent").unwrap()[1], "stopped idle");
+    let sent = crystal.ok(&["events", "-n", "agent", "-k", "session.message"]);
+    assert!(sent.contains("carry on"), "{sent}");
+    crash(daemon);
 }
+
+#[test]
+fn a_terminal_left_idle_is_stopped_only_when_asked_and_comes_back_where_it_was() {
+    let crystal = Crystal::new();
+    crystal.configure(&format!("{STOP_IDLE}stop_idle_terminals = true\n"));
+    let daemon = crystal.start_daemon_with(&[("CRYSTAL_IDLE_CHECK_MS", "100")]);
+    std::fs::create_dir(crystal.dir.path().join("sub")).unwrap();
+    crystal.ok(&["new", "-d", "-n", "busy", "sh"]);
+    crystal.ok(&["send", "busy", "sleep 30 &"]);
+    crystal.ok(&["new", "-d", "-n", "box", "sh"]);
+    crystal.ok(&["send", "box", "cd sub && echo marker"]);
+    eventually("the idle shell is stopped", || {
+        crystal.row("box").unwrap()[1] == "stopped idle"
+    });
+    // A shell with a job under it isn't.
+    assert_eq!(crystal.row("busy").unwrap()[1], "running");
+    crystal.ok(&["kill", "busy"]);
+
+    // The TUI's selection resting on it starts it again, where it was,
+    // showing what it showed.
+    let _tui = crystal.tui();
+    eventually("it starts again as the TUI goes to it", || {
+        crystal.row("box").unwrap()[1] == "running"
+    });
+    crystal.ok(&["send", "box", "pwd"]);
+    eventually("it's where it was, showing what it showed", || {
+        let read = crystal.ok(&["read", "box"]);
+        read.contains("marker") && read.lines().any(|line| line.ends_with("/sub"))
+    });
+    crash(daemon);
+}
+
+#[test]
+fn a_terminal_is_never_stopped_idle_unless_asked() {
+    let crystal = Crystal::new();
+    crystal.configure(STOP_IDLE);
+    let daemon = crystal.start_daemon_with(&[("CRYSTAL_IDLE_CHECK_MS", "100")]);
+    crystal.ok(&["new", "-d", "-n", "box", "sh"]);
+    thread::sleep(Duration::from_millis(2000));
+    assert_eq!(crystal.row("box").unwrap()[1], "running");
+    crash(daemon);
+}
+
+/// A stand-in for Claude Code that tells crystal it has started through
+/// the hooks crystal gives it, then takes what's typed into it: each start
+/// adds its pid to `starts`, and writes its arguments, `ready` once crystal
+/// has heard its hook, and what it's typed to files named for its pid.
+fn fake_waiting_claude(dir: &Path) -> PathBuf {
+    let bin = dir.join("warm-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let body = format!(
+        r#"
+printf '%s\n' "$@" > args-$$
+printf '%s\n' $$ >> starts
+printf '{{"hook_event_name":"SessionStart","source":"startup","session_id":"c-'$$'"}}' \
+    | '{CRYSTAL}' hook claude
+: > ready-$$
+stty raw -echo
+exec cat > typed-$$
+"#
+    );
+    script(&bin.join("claude"), &body);
+    bin
+}
+
+#[test]
+fn a_warm_agent_waits_where_the_selection_is_and_a_new_session_takes_it_over() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
+         [sessions]\nwarm_agent = true\n",
+    );
+    let bin = fake_waiting_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    let starts = crystal.dir.path().join("starts");
+    eventually("an agent is kept warm", || starts.exists());
+    let started = Instant::now();
+    let warm = written(&starts).trim().to_string();
+    // Started as a task would be, but with no first prompt.
+    let args = written(&crystal.dir.path().join(format!("args-{warm}")));
+    assert!(args.contains("crystal done"), "{args}");
+    assert!(!args.lines().any(|arg| arg == "--"), "{args}");
+    assert_eq!(crystal.row("claude"), None, "it's in no list");
+    // Taken over only once it has said it's up.
+    let ready = crystal.dir.path().join(format!("ready-{warm}"));
+    eventually("crystal has heard it's up", || ready.exists());
+
+    tui.type_keys("n");
+    tui.shows("What should it do?");
+    tui.type_keys("fix the login bug");
+    tui.type_keys("\r");
+    eventually("the session has started", || {
+        crystal.row("claude").is_some()
+    });
+    assert_eq!(
+        crystal.pid("claude").to_string(),
+        warm,
+        "it took the agent over"
+    );
+    let typed = crystal.dir.path().join(format!("typed-{warm}"));
+    // Typed in once it has been up long enough to take keys, then Enter on
+    // its own: in raw mode, a return.
+    let up = Duration::from_secs(3);
+    thread::sleep(up.saturating_sub(started.elapsed()));
+    eventually("its first prompt is typed in", || {
+        std::fs::read_to_string(&typed)
+            .is_ok_and(|text| text.contains("fix the login bug") && text.ends_with('\r'))
+    });
+    let listed = crystal.listed("claude");
+    assert_eq!(listed["task"]["goal"], "fix the login bug");
+    // Another is kept warm for the next.
+    eventually("another agent is kept warm", || {
+        written(&starts).lines().count() == 2
+    });
+}
+
 #[test]
 fn keys_the_config_gives_run_their_commands_and_colon_lists_every_one() {
     let crystal = Crystal::new();

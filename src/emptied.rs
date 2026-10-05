@@ -181,6 +181,7 @@ mod tests {
                 about: Default::default(),
                 name_given: false,
                 moved: None,
+                stopped_idle: false,
             },
             worktree: Some(worktree),
             archived: 0,
