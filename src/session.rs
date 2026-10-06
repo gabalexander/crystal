@@ -33,6 +33,7 @@ use crate::state::SavedSession;
 use crate::subagents::{self, Subagents};
 use crate::task::{self, Task};
 use crate::tasks;
+use crate::typing;
 use crate::vt;
 use anyhow::{Context, Result, bail, ensure};
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, native_pty_system};
@@ -84,6 +85,14 @@ pub struct Session {
     /// `None` until an agent reports what it's doing; most programs never
     /// do.
     activity: Option<Activity>,
+    /// How many times its agent has gone to work, or asked the user
+    /// something, from its prompt: a send watches it for its prompt taken.
+    /// Counted afresh by each daemon.
+    turns_begun: u64,
+    /// What picked its agent up where it was, as it started again: its
+    /// conversation, or the command it said resumes it. Not handed over:
+    /// it's told as the session starts.
+    resumed: Option<String>,
     /// When the session last changed: it started, its activity changed, or
     /// its program ended. Shared with the thread that waits for that end.
     changed: Arc<Mutex<SystemTime>>,
@@ -514,6 +523,8 @@ impl Session {
             pid: Some(pid),
             state,
             activity: None,
+            turns_begun: 0,
+            resumed: None,
             changed,
             conversation: None,
             rollouts: None,
@@ -590,6 +601,8 @@ impl Session {
             pid: None,
             state,
             activity: None,
+            turns_begun: 0,
+            resumed: None,
             changed: Arc::new(Mutex::new(SystemTime::now())),
             conversation: None,
             rollouts: None,
@@ -690,6 +703,8 @@ impl Session {
             pid: None,
             state: Arc::new(Mutex::new(State::Starting)),
             activity: None,
+            turns_begun: 0,
+            resumed: None,
             changed: Arc::new(Mutex::new(SystemTime::now())),
             conversation: saved.conversation.clone(),
             rollouts: None,
@@ -1279,6 +1294,32 @@ impl Session {
         matches!(self.activity, Some(Activity::Idle | Activity::Done))
     }
 
+    /// How many times its agent has gone to work, or asked the user
+    /// something, from its prompt, since this daemon has had it: one more
+    /// once it has taken a prompt.
+    pub fn turns_begun(&self) -> u64 {
+        self.turns_begun
+    }
+
+    /// What picked its agent up where it was, as it started again: its
+    /// conversation, or the command it said resumes it.
+    pub fn resumed(&self) -> Option<&str> {
+        self.resumed.as_deref()
+    }
+
+    /// Says what picked its agent up where it was, as it started again.
+    pub fn set_resumed(&mut self, resumed: String) {
+        self.resumed = Some(resumed);
+    }
+
+    /// Whether it starts again as an agent picked up where it was, in its
+    /// conversation or with the command it said resumes it, rather than a
+    /// terminal's shell.
+    pub fn resumes_agent(&self) -> bool {
+        let launch = self.launch();
+        launch.conversation.is_some() || launch.resume.is_some()
+    }
+
     /// Takes a warm agent over as the session `name`, as `command` asked
     /// for it, its first prompt typed in after: what it did while it
     /// waited is no news.
@@ -1613,6 +1654,10 @@ impl Session {
             conversation.prompted = true;
         }
         if activity != self.activity {
+            let busy = |activity| matches!(activity, Some(Activity::Working | Activity::Waiting));
+            if busy(activity) && !busy(self.activity) {
+                self.turns_begun += 1;
+            }
             self.changes.push(Change::Activity {
                 from: self.activity,
                 to: activity,
@@ -2182,6 +2227,8 @@ impl Session {
             pid: handed.pid,
             state,
             activity: handed.activity,
+            turns_begun: 0,
+            resumed: None,
             changed,
             screen_watch: ScreenWatch::seeing(handed.looks),
             front: handed.front,
@@ -2316,6 +2363,18 @@ impl Pty {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Whether the terminal hands its program keys as they come, out of
+    /// the line at a time it starts with: a program reading keys asks for
+    /// that, Claude Code once its prompt reads them. The master's settings
+    /// are the terminal's own.
+    fn takes_keys(&self) -> bool {
+        // SAFETY: termios is plain data, which tcgetattr fills in.
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: tcgetattr only asks, writing into `termios`.
+        let asked = unsafe { libc::tcgetattr(self.master.as_raw_fd(), &mut termios) };
+        asked == 0 && termios.c_lflag & libc::ICANON == 0
     }
 
     /// The process group in front: the job its keys go to.
@@ -2552,6 +2611,16 @@ impl Term {
         self.screen.lock().unwrap().vt.rows(with_history)
     }
 
+    /// What the screen shows, and where its cursor is, to tell when it
+    /// changes as it's typed into.
+    pub fn shown(&self) -> typing::Shown {
+        let screen = self.screen.lock().unwrap();
+        typing::Shown {
+            rows: screen.vt.rows(false),
+            cursor: screen.vt.cursor(),
+        }
+    }
+
     /// Has the screen keep `lines` rows of history from now on: see
     /// [`vt::Screen::keep_history`].
     pub fn keep_history(&self, lines: usize) {
@@ -2584,6 +2653,12 @@ impl Term {
     /// `None` without a terminal, or when the terminal won't say.
     pub fn foreground_group(&self) -> Option<i32> {
         self.pty.as_ref()?.foreground_group()
+    }
+
+    /// Whether its program takes keys as they come, rather than a line at
+    /// a time: see [`Pty::takes_keys`].
+    pub fn takes_keys(&self) -> bool {
+        self.pty.as_ref().is_some_and(Pty::takes_keys)
     }
 
     /// Whether the user is watching it, not only a program.
@@ -3292,6 +3367,24 @@ mod tests {
         session.on_agent_event(AgentEvent::TurnEnded);
         session.set_hooked_conversation("claude", named);
         assert!(resumes(&session));
+    }
+
+    #[test]
+    fn a_turn_begun_from_its_prompt_is_counted_once() {
+        let mut session = typed_claude(claude());
+        session.on_agent_event(AgentEvent::Started);
+        assert!(session.at_prompt());
+        assert_eq!(session.turns_begun(), 0);
+        session.on_agent_event(AgentEvent::TurnStarted);
+        assert_eq!(session.turns_begun(), 1);
+        // Asking something, then at work again, is the same turn.
+        session.on_agent_event(AgentEvent::Asking);
+        session.on_agent_event(AgentEvent::ToolFinished);
+        session.on_agent_event(AgentEvent::TurnEnded);
+        assert_eq!(session.turns_begun(), 1);
+        // A turn that asks the user something at once has begun too.
+        session.on_agent_event(AgentEvent::Asking);
+        assert_eq!(session.turns_begun(), 2);
     }
 
     #[test]

@@ -746,7 +746,7 @@
             "string",
             "null"
           ],
-          "description": "What it was before: a renamed session's old name, what its agent was doing before it changed, or the agent that let go of it; a renamed tab's old name, the number a tab had before it moved or of the tab in front before, the number of the tab a session moved from, or the session or project the user was on before; the ids of the entries of memory merged into one."
+          "description": "What it was before: a renamed session's old name, what its agent was doing before it changed, or the agent that let go of it; a renamed tab's old name, the number a tab had before it moved or of the tab in front before, the number of the tab a session moved from, or the session or project the user was on before; the ids of the entries of memory merged into one; what picked a session's agent up where it was as it started again, `conversation` and its id, or the command that resumes it."
         },
         "task": {
           "anyOf": [

@@ -24,7 +24,12 @@ crystal send-keys reviewer 1 --wait                       # answer a question: t
 
 `send` types the way a person does: the text first, marked as a paste when the program asks for that, then
 Enter on its own, so an agent takes it as a prompt and not as pasted text. `-` as the text reads it from
-standard input: `git diff | crystal send reviewer -`. `wait` returns once the agent isn't working: `done`,
+standard input: `git diff | crystal send reviewer -`. An agent at its prompt is watched as it's typed into:
+Enter goes once its screen shows the text, and is pressed again, three times in all, while the agent neither
+starts on it nor changes its screen, as when it was still reading the paste. One that never takes it has
+stalled: `send` fails with an error that starts `agent_prompt_stalled:`, with exit status 3, rather than
+returning as if the text went, and the text may still be in the agent's input, so `read` it before sending it
+again. `wait` returns once the agent isn't working: `done`,
 `waiting` when it asks something, `idle`, or how its program exited. It takes a `--timeout` in seconds, and
 gives up when that runs out, with exit status 2; anything else that goes wrong, a mistyped flag included, is
 1, so 2 always means "not yet". `--quiet` (`-q`) prints nothing once it's there. `send --wait`, `send-keys
@@ -37,10 +42,10 @@ five seconds from then to be seen starting on it, working, asking something, or 
 its screen. One whose screen changes took the text, though its turn wasn't seen: one too short to fall between
 two of crystal's looks, or one getting under way on a loaded machine. Once the five seconds are over and its
 screen has held still for two, the wait ends on how it stands. One that did neither, its screen as it was once
-the text went in, has stalled, and `send` fails with an error that starts `agent_prompt_stalled:`, with exit
-status 3, rather than taking what the agent said about its turn before for an answer. A stall doesn't prove the
-agent never got the text, which a turn shorter than the moment the screen is given to show it can take, so
-`read` it before sending the text again. An agent working already takes the text once its turn is over, and
+the text went in, has stalled, `agent_prompt_stalled:` with exit status 3 as above, rather than taking what the
+agent said about its turn before for an answer. A stall doesn't prove the agent never got the text, which a turn
+shorter than the moment the screen is given to show it can take, so `read` it before sending the text again.
+`--timeout` counts from before the text goes, the typing and the Enters included. An agent working already takes the text once its turn is over, and
 that turn's end may be what ends the wait. A program that doesn't say what it's doing is waited on until it's
 seen starting or it ends, or its screen changes and holds still. `send-keys --wait` waits for the turn the keys
 start the same way, but never stalls: keys that change nothing on the screen in five seconds end the wait on how
@@ -52,7 +57,7 @@ permission.
 | 0 | it got there, and printed where |
 | 1 | anything else went wrong: no such session, it ended or was killed first, a mistyped flag |
 | 2 | `--timeout` ran out first: not yet |
-| 3 | `send --wait` only: the agent was never seen starting on what it was sent, nor changed its screen (`agent_prompt_stalled:`) |
+| 3 | `send`, with `--wait` or not: the agent never took what it was sent, neither starting on it nor changing its screen (`agent_prompt_stalled:`) |
 
 An agent asking you something takes nothing `send` types, since the text would land in its question: `send`
 refuses with an error that starts `agent_blocked:`, saying what it asks and how to answer it, with `crystal
@@ -107,7 +112,8 @@ rather than failing. A closed task isn't always over: a follow-up opens a backgr
 
 `send-keys` presses keys instead, the way tmux's does: key names like `Enter`, `Escape`, `Tab`, `Up`, `Down`,
 `BSpace`, `C-c` or `M-x`, and any other word typed as keys. That's what answers an agent's question, since
-agents don't act on a pasted answer. With `--wait`, it waits for the turn the answer lets carry on.
+agents don't act on a pasted answer. With `--wait`, it waits for the turn the answer lets carry on. An agent
+crystal [stopped idle](sessions.md#archiving-and-idle-agents) is started again first, as `send` starts it.
 
 `read` prints the screen as text, each row without the blanks at its end:
 

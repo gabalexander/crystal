@@ -101,6 +101,10 @@ fn idle_check_every() -> Duration {
 /// again to take what's sent, to be back at its prompt.
 const WAKE_TO_SEND: Duration = Duration::from_secs(60);
 
+/// How often a session being typed into, or started again to be, is
+/// looked at: see [`typing`].
+const TYPING_LOOK_EVERY: Duration = Duration::from_millis(50);
+
 /// How often a client that only listens is checked for having hung up.
 const LOOK_FOR_HANG_UP: Duration = Duration::from_secs(1);
 
@@ -550,9 +554,9 @@ impl Daemon {
                 }
                 drop(runs);
                 sessions.insert(index, started);
-                let info = sessions[index].info();
+                let started = &sessions[index];
                 self.events
-                    .emit(Event::about_session(Kind::SessionStarted, &info));
+                    .emit(Event::started(&started.info(), started.resumed()));
                 Ok(name)
             }
             Err(err) => {
@@ -1984,15 +1988,57 @@ impl Daemon {
             }
             (text, session.info(), sender)
         };
-        let typed = self.running_term(name).and_then(|term| {
-            term.write(&typing::keystrokes(&text, term.wants_bracketed_paste()))?;
-            if enter {
-                thread::sleep(typing::ENTER_PAUSE);
-                term.write(typing::ENTER)?;
-            }
-            Ok(())
-        });
+        let typed = self.type_in(&info.id, name, &text, enter);
         self.sent(typed, &info, sender.as_ref(), &text)
+    }
+
+    /// Types `text` into the session with id `id`, called `name`, and
+    /// presses Enter after it with `enter`. An agent at its prompt is
+    /// watched until it takes it, as a [`typing::Delivery`] says: Enter
+    /// goes once the text shows, and again while the agent neither starts
+    /// on it nor changes its screen. One that never takes it has stalled,
+    /// which the sender is told rather than that it went.
+    fn type_in(&self, id: &str, name: &str, text: &str, enter: bool) -> Result<()> {
+        let term = self.running_term(name)?;
+        let (at_prompt, turns) = self.look_at(id)?;
+        let screen = term.shown();
+        term.write(&typing::keystrokes(text, term.wants_bracketed_paste()))?;
+        if !enter {
+            return Ok(());
+        }
+        if !at_prompt {
+            thread::sleep(typing::ENTER_PAUSE);
+            term.write(typing::ENTER)?;
+            return Ok(());
+        }
+        let mut delivery = typing::Delivery::typed(screen, turns, Instant::now());
+        loop {
+            thread::sleep(TYPING_LOOK_EVERY);
+            let (_, turns) = self.look_at(id)?;
+            match delivery.look(term.shown(), turns, Instant::now()) {
+                typing::Step::Wait => {}
+                typing::Step::Enter => term.write(typing::ENTER)?,
+                typing::Step::Taken => return Ok(()),
+                typing::Step::Stalled => {
+                    let enters = delivery.enters();
+                    bail!(
+                        "agent_prompt_stalled: {name} didn't take what it was sent: Enter was \
+                         pressed {enters} times, and it neither started on it nor changed its \
+                         screen, so it may still be in its input: `crystal read {name}` before \
+                         sending it again"
+                    )
+                }
+            }
+        }
+    }
+
+    /// Whether the session with id `id` has its agent at its prompt, and
+    /// how many turns it has begun.
+    fn look_at(&self, id: &str) -> Result<(bool, u64)> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = with_id(&mut sessions, id)?;
+        ensure!(session.is_running(), "{} has ended", session.name);
+        Ok((session.at_prompt(), session.turns_begun()))
     }
 
     /// What came of sending `text` to the session `info` is about, from
@@ -2016,42 +2062,56 @@ impl Daemon {
     }
 
     /// Starts again the session called `name` when crystal stopped it as
-    /// it sat idle, and waits for its agent to be back at its prompt: what's
-    /// sent to an agent left idle, like another agent's message, is taken
-    /// as if it had never stopped. Nothing for any other session.
+    /// it sat idle, and waits for it to be ready to be typed into, as
+    /// [`typing::Waking`] tells: its agent back at its prompt and reading
+    /// keys, or a terminal's shell back, its screen held still. What's sent
+    /// to an agent left idle, like another agent's message, is taken as if
+    /// it had never stopped. Nothing for any other session.
     fn wake_to_send(&self, name: &str) -> Result<()> {
         let deadline = Instant::now() + WAKE_TO_SEND;
-        let mut woken = false;
+        // Once started again: whether it's an agent, and how it's coming.
+        let mut woken: Option<(bool, typing::Waking)> = None;
         loop {
             {
                 let mut sessions = self.sessions.lock().unwrap();
                 let session = named(&mut sessions, name)?;
-                match (session.stopped_idle(), session.is_running(), woken) {
-                    (false, _, false) => return Ok(()),
+                match (session.stopped_idle(), session.is_running(), &mut woken) {
+                    (false, _, None) => return Ok(()),
                     // Stopped, and not gone yet.
-                    (true, true, false) => {}
-                    (true, false, false) => {
+                    (true, true, None) => {}
+                    (true, false, None) => {
                         // In the environment it started with, or after a
                         // restart, which forgot it, the daemon's.
                         let env = match session.env() {
                             env if env.is_empty() => env::current(),
                             env => env.clone(),
                         };
+                        let agent = session.resumes_agent();
                         drop(sessions);
                         self.respawn(name, env)?;
-                        woken = true;
+                        woken = Some((agent, typing::Waking::new(Instant::now())));
                         continue;
                     }
-                    (_, false, true) => bail!("{name} has ended"),
-                    (_, true, true) if session.at_prompt() => return Ok(()),
-                    (_, true, true) => {}
+                    (_, false, Some(_)) => bail!("{name} has ended"),
+                    (_, true, Some((agent, waking))) => {
+                        let term = session.term();
+                        // A shell takes what's typed whenever it comes.
+                        let look = typing::Look {
+                            at_prompt: !*agent || session.at_prompt(),
+                            takes_keys: !*agent || term.takes_keys(),
+                            screen: term.shown(),
+                        };
+                        if waking.ready(look, Instant::now()) {
+                            return Ok(());
+                        }
+                    }
                 }
             }
             ensure!(
                 Instant::now() < deadline,
                 "{name} was stopped as it sat idle, and isn't back at its prompt yet"
             );
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(TYPING_LOOK_EVERY);
         }
     }
 
@@ -2516,6 +2576,7 @@ impl Daemon {
                     "{name} is a task, which takes no keys: \
                      `crystal send {name} \"…\"` gives it a follow-up"
                 );
+                self.wake_to_send(&name)?;
                 let term = self.running_term(&name)?;
                 for key in &keys {
                     term.write(&term.keystrokes(key))?;
@@ -3222,7 +3283,7 @@ impl Daemon {
         sessions.insert(index, started);
         let info = sessions[index].info();
         self.events
-            .emit(Event::about_session(Kind::SessionStarted, &info));
+            .emit(Event::started(&info, sessions[index].resumed()));
         self.events
             .emit(Event::about_session(Kind::SessionOpenedInTerminal, &info));
         Ok(Response::Created {
@@ -3264,8 +3325,7 @@ impl Daemon {
             return;
         };
         let info = session.info();
-        self.events
-            .emit(Event::about_session(Kind::SessionStarted, &info));
+        self.events.emit(Event::started(&info, session.resumed()));
         if let Some(task) = session.task_record().filter(|task| task.outcome.is_none()) {
             self.events.emit(Event::task(task_kind, &info, task));
         }
@@ -3432,7 +3492,10 @@ impl Daemon {
     /// can be picked up starts back in it, and a terminal crystal stopped
     /// idle in the directory its shell was in. One yet to start again after
     /// a restart, one that couldn't, and one crystal had stopped idle before
-    /// it start now, as the restart would have started them.
+    /// it start now, as the restart would have started them. Its task is
+    /// open again, the work going on, but for one crystal stopped idle,
+    /// which carries on as if it had never stopped: its task, closed before
+    /// it was stopped, stays closed.
     fn respawn(&self, name: &str, env: BTreeMap<String, String>) -> Result<Response> {
         let mut sessions = self.sessions.lock().unwrap();
         let index = sessions
@@ -3493,8 +3556,14 @@ impl Daemon {
                 // A terminal crystal stopped idle shows what it showed,
                 // above its shell started again.
                 let before = ended.stopped_idle().then(|| ended.term().kept_screen());
+                // Woken, it's the same session, under its id: whoever
+                // watches it, like `send --wait`, goes on watching it.
+                let id = match ended.stopped_idle() {
+                    true => ended.id.clone(),
+                    false => new_id(),
+                };
                 start_as(
-                    new_id(),
+                    id,
                     &mut sessions,
                     &self.socket,
                     new,
@@ -3510,8 +3579,10 @@ impl Daemon {
             return Err(err);
         }
         // `start` adds the new session at the end; it goes where the old
-        // one was.
+        // one was. Whoever was looking at the old one is let go, to look
+        // again at the one started, under its id or a new one.
         let mut started = sessions.pop().expect("start added a session");
+        ended.term().close();
         if name_given {
             started.keep_given_name();
         }
@@ -3522,10 +3593,13 @@ impl Daemon {
         }
         // It's the same task, open again, under the same number.
         if let (Some(goal), true) = (launch.goal, started.task_record().is_some()) {
-            started.give_task(TaskInfo {
-                waiting: false,
-                outcome: None,
-                ..goal
+            started.give_task(match ended.stopped_idle() {
+                true => goal,
+                false => TaskInfo {
+                    waiting: false,
+                    outcome: None,
+                    ..goal
+                },
             });
         }
         sessions.insert(index, started);
@@ -3961,6 +4035,10 @@ fn start_as(
     let resume_command = resume_command.filter(|argv| resumable(argv, &name, &config, &cwd, &env));
     let at_a_shell = matches!(front::of_command(&command), Some(Front::Shell { .. }));
     let resumed = resume_command.is_some();
+    let resumed_with = resume_command.as_ref().map(|argv| {
+        let quoted: Vec<String> = argv.iter().map(|arg| crate::shell::quote(arg)).collect();
+        quoted.join(" ")
+    });
     let (asked, typed) = match resume_command {
         Some(argv) if at_a_shell => (command.clone(), Some(report::typed(&argv))),
         Some(argv) => (argv, None),
@@ -4021,6 +4099,12 @@ fn start_as(
         && let Err(err) = session.term().write(&typed)
     {
         errln!("crystal daemon: couldn't resume {name}'s agent: {err:#}");
+    }
+    if let Some(picked_up) = resume
+        .map(|id| format!("conversation {id}"))
+        .or(resumed_with)
+    {
+        session.set_resumed(picked_up);
     }
     if named_after_program {
         session.mark_named_after_program();

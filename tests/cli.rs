@@ -570,8 +570,14 @@ impl Drop for Crystal {
     }
 }
 
-fn eventually(what: &str, mut check: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+fn eventually(what: &str, check: impl FnMut() -> bool) {
+    eventually_within(Duration::from_secs(5), what, check);
+}
+
+/// Like [`eventually`], given `within`: for what a loaded machine can be
+/// slow to come to.
+fn eventually_within(within: Duration, what: &str, mut check: impl FnMut() -> bool) {
+    let deadline = Instant::now() + within;
     while !check() {
         assert!(Instant::now() < deadline, "timed out waiting until {what}");
         thread::sleep(Duration::from_millis(20));
@@ -3523,15 +3529,25 @@ impl Crystal {
 
     /// Like [`Crystal::start_daemon`], with `env` added to its environment,
     /// and waits until it's listening: a command run before that would start
-    /// a daemon of its own, without `env`.
+    /// a daemon of its own, without `env`. One that isn't in time is killed,
+    /// rather than left running with the test's output open, which would
+    /// keep whatever reads it waiting.
     fn start_daemon_with(&self, env: &[(&str, &str)]) -> std::process::Child {
-        let daemon = self
+        let mut daemon = self
             .command(&["daemon"])
             .envs(env.iter().copied())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        eventually("the daemon is listening", || self.listening());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.listening() {
+            if Instant::now() >= deadline {
+                let _ = daemon.kill();
+                let _ = daemon.wait();
+                panic!("timed out waiting until the daemon is listening");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
         daemon
     }
 
@@ -4191,13 +4207,13 @@ fn send_wait_fails_when_the_agent_never_starts_on_what_it_was_sent() {
     run_hook(&crystal, "agent", &hook, stop);
     eventually("the agent is done", || status(&crystal, "agent") == "done");
 
-    // Its turn before ends nothing: five seconds on, its screen as it was,
-    // the prompt has stalled, which exits 3.
+    // Its turn before ends nothing: Enter pressed three times, its screen
+    // as it was, the prompt has stalled, which exits 3.
     let out = crystal.run(&["send", "agent", "hello", "--wait"]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(3), "{err}");
-    let stalled = "agent_prompt_stalled: agent didn't start on what it was sent: 5s on, it's \
-                   done, its screen as it was once the text went in";
+    let stalled = "agent_prompt_stalled: agent didn't take what it was sent: Enter was pressed 3 \
+                   times, and it neither started on it nor changed its screen";
     assert!(err.contains(stalled), "{err}");
     assert!(
         err.contains("`crystal read agent` before sending it again"),
@@ -18462,6 +18478,7 @@ fn an_agent_left_idle_is_stopped_and_starts_again_where_it_was() {
 /// A stand-in for an agent that says it has finished its turn, and how to
 /// resume it, with a job it cut loose from its terminal still running, as
 /// Claude Code's Bash calls in the background are: its pid in `job-pid`.
+/// It reads keys as they come, and each Enter is a turn.
 fn fake_agent_with_a_job(dir: &Path) -> PathBuf {
     let bin = dir.join("job-bin");
     std::fs::create_dir(&bin).unwrap();
@@ -18471,7 +18488,14 @@ perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' sleep 300 &
 printf '%s\n' $! > job-pid.new && mv job-pid.new job-pid
 '{CRYSTAL}' report working --agent pi
 '{CRYSTAL}' report idle -- pi --resume 's 1'
-while [ ! -e quit ]; do sleep 0.05; done
+stty raw -echo
+enter=$(printf '\r')
+while key=$(dd bs=1 count=1 2>/dev/null) && [ -n "$key" ]; do
+    if [ "$key" = "$enter" ]; then
+        '{CRYSTAL}' report working --agent pi
+        '{CRYSTAL}' report idle -- pi --resume 's 1'
+    fi
+done
 "#
     );
     script(&bin.join("pi"), &body);
@@ -18568,6 +18592,305 @@ fn a_terminal_is_never_stopped_idle_unless_asked() {
     thread::sleep(Duration::from_millis(2000));
     assert_eq!(crystal.row("box").unwrap()[1], "running");
     crash(daemon);
+}
+
+/// A stand-in for Claude Code that takes what's typed into it as Claude
+/// Code does. It tells crystal it has started, through the hooks crystal
+/// gives it, in its conversation `c-` and its pid, or the one `--resume`
+/// names, adding its arguments to `starts`. Then it reads keys as they
+/// come, behind a prompt. An Enter read on its own sends what's in its
+/// prompt: its hooks say it starts on it, it adds it to `prompts`, and its
+/// hooks say its turn is over. One read with anything else in it, as a
+/// paste, goes into the prompt, an Enter in it a new line there, as Claude
+/// Code takes it.
+///
+/// What it does otherwise, files say: `slow`, picking a conversation up it
+/// says it has started two seconds before it takes keys, as Claude Code
+/// picking up a long conversation does, so what's typed meanwhile waits
+/// in the terminal, a line at a time, and comes to it in one read;
+/// `slow-paste`, an Enter a second after a paste is lost, added to
+/// `lost`, as it would be while Claude Code still reads the paste; `deaf`,
+/// an Enter never sends anything.
+fn fake_slow_claude(dir: &Path) -> PathBuf {
+    let bin = dir.join("slow-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let body = r#"#!/usr/bin/perl
+use strict;
+use warnings;
+use Cwd qw(getcwd);
+use Time::HiRes qw(sleep time);
+$| = 1;
+
+sub hook {
+    open(my $hook, '|-', 'CRYSTAL_BIN', 'hook', 'claude') or die "no hook: $!";
+    print $hook $_[0];
+    close($hook);
+}
+
+sub note {
+    my ($file, $line) = @_;
+    open(my $out, '>>', $file) or die "can't write $file: $!";
+    print $out "$line\n";
+    close($out);
+}
+
+my ($conversation, $resumed) = ("c-$$", 0);
+for my $at (0 .. $#ARGV - 1) {
+    ($conversation, $resumed) = ($ARGV[$at + 1], 1) if $ARGV[$at] eq '--resume';
+}
+my $transcript = getcwd() . "/$conversation.jsonl";
+note($transcript, '{}');
+hook(qq({"hook_event_name":"SessionStart","source":"startup","session_id":"$conversation","transcript_path":"$transcript"}));
+sleep 2 if $resumed && -e 'slow';
+system('stty', 'raw', '-echo');
+print "\e[?2004h";
+note('starts', join(' ', map { (my $arg = $_) =~ s/\n/ /g; $arg } @ARGV));
+
+my ($typed, $pasted) = ('', 0);
+sub prompt {
+    (my $shown = $typed) =~ s/\n/ | /g;
+    print "\r\e[K> $shown";
+}
+print "earlier turns\r\n";
+prompt();
+while (sysread(STDIN, my $keys, 4096)) {
+    if ($keys ne "\r") {
+        $keys =~ s/\e\[20[01]~//g;
+        $keys =~ s/\r/\n/g;
+        $typed .= $keys;
+        $pasted = time;
+        prompt();
+        next;
+    }
+    next if $typed eq '' || -e 'deaf';
+    if (-e 'slow-paste' && time - $pasted < 1) {
+        note('lost', $typed);
+        next;
+    }
+    my $prompt = $typed;
+    $typed = '';
+    (my $json = $prompt) =~ s/(["\\])/\\$1/g;
+    $json =~ s/\n/\\n/g;
+    hook(qq({"hook_event_name":"UserPromptSubmit","session_id":"$conversation","prompt":"$json"}));
+    note('prompts', $prompt);
+    print "\r\n* working on it\r\n";
+    hook(qq({"hook_event_name":"Stop","session_id":"$conversation"}));
+    prompt();
+}
+"#
+    .replace("CRYSTAL_BIN", CRYSTAL);
+    let claude = bin.join("claude");
+    std::fs::write(&claude, body).unwrap();
+    let mut permissions = std::fs::metadata(&claude).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&claude, permissions).unwrap();
+    bin
+}
+
+/// Starts the slow Claude Code of [`fake_slow_claude`] as the session
+/// `agent`, its task to write the readme, which it closes; then has crystal
+/// stop it as it sits idle. Gives back the daemon, which stops no more
+/// agents idle: one started again waits a while before it takes keys.
+fn stopped_slow_claude(crystal: &Crystal, path: &str) -> std::process::Child {
+    crystal.configure(STOP_IDLE);
+    let daemon = crystal.start_daemon_with(&[("CRYSTAL_IDLE_CHECK_MS", "100")]);
+    crystal.stage("slow");
+    let out = crystal
+        .command(&[
+            "new",
+            "-d",
+            "-n",
+            "agent",
+            "claude",
+            "--",
+            "write the readme",
+        ])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eventually("it's at its prompt", || {
+        crystal.listed("agent")["activity"] == "idle"
+    });
+    crystal.ok(&["done", "-n", "agent", "wrote it"]);
+    // It sits idle a second, then the daemon looks at every process on the
+    // machine for what may hold it.
+    eventually_within(Duration::from_secs(15), "the idle agent is stopped", || {
+        crystal.row("agent").unwrap()[1] == "stopped idle"
+    });
+    crystal.configure(&STOP_IDLE.replace("\"1s\"", "\"1h\""));
+    daemon
+}
+
+/// What the slow Claude Code was sent, as it took it.
+fn prompts(crystal: &Crystal) -> String {
+    std::fs::read_to_string(crystal.dir.path().join("prompts")).unwrap_or_default()
+}
+
+#[test]
+fn a_message_to_an_agent_stopped_idle_goes_in_once_it_takes_keys() {
+    let crystal = Crystal::new();
+    let bin = fake_slow_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let daemon = stopped_slow_claude(&crystal, &path);
+
+    // It's started again, and typed into only once it reads keys: what's
+    // typed before reaches it in one piece, its Enter lost in the paste.
+    let out = crystal
+        .command(&["send", "agent", "now the docs\nand the changelog"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(prompts(&crystal), "now the docs\nand the changelog\n");
+    let told = events(&crystal, &["-n", "agent", "-k", "session.working"]);
+    assert_eq!(told.len(), 1, "it started on it");
+
+    // It was picked up in its conversation, not asked its task again, and
+    // its task, closed before it was stopped, stays closed.
+    let starts = written(&crystal.dir.path().join("starts"));
+    let starts: Vec<&str> = starts.lines().collect();
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    assert!(starts[0].ends_with("-- write the readme"), "{}", starts[0]);
+    assert!(starts[1].contains("--resume c-"), "{}", starts[1]);
+    assert!(!starts[1].contains("write the readme"), "{}", starts[1]);
+    let started = crystal.ok(&["events", "-n", "agent", "-k", "session.started"]);
+    let started: Vec<&str> = started.lines().collect();
+    assert_eq!(started.len(), 2, "{started:?}");
+    assert!(!started[0].contains("resumed"), "{}", started[0]);
+    assert!(
+        started[1].contains("claude -- 'write the readme' (resumed: conversation c-"),
+        "{}",
+        started[1]
+    );
+    let tasks = events(&crystal, &["-n", "agent", "-k", "task.*"]);
+    assert_eq!(names(&tasks), ["task.opened", "task.closed"]);
+    assert_eq!(
+        crystal.listed("agent")["task"]["outcome"]["summary"],
+        "wrote it"
+    );
+    crash(daemon);
+}
+
+#[test]
+fn send_wait_to_an_agent_stopped_idle_waits_for_the_turn_it_starts() {
+    let crystal = Crystal::new();
+    let bin = fake_slow_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let daemon = stopped_slow_claude(&crystal, &path);
+
+    let out = crystal
+        .command(&["send", "agent", "now the docs", "--wait"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+    assert_eq!(prompts(&crystal), "now the docs\n");
+    crash(daemon);
+}
+
+#[test]
+fn keys_sent_to_an_agent_stopped_idle_go_once_it_takes_them() {
+    let crystal = Crystal::new();
+    let bin = fake_slow_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let daemon = stopped_slow_claude(&crystal, &path);
+
+    let out = crystal
+        .command(&["send-keys", "agent", "hi"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    shows_on_screen(&crystal, "agent", "> hi");
+    crystal.ok(&["send-keys", "agent", "Enter"]);
+    eventually("it took them", || prompts(&crystal) == "hi\n");
+    crash(daemon);
+}
+
+#[test]
+fn an_enter_the_agent_missed_is_pressed_again() {
+    let crystal = Crystal::new();
+    let bin = fake_slow_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    crystal.stage("slow-paste");
+    let out = crystal
+        .command(&["new", "-d", "-n", "agent", "claude"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eventually("it's at its prompt", || {
+        crystal.listed("agent")["activity"] == "idle"
+    });
+
+    crystal.ok(&["send", "agent", "write the readme"]);
+    assert_eq!(prompts(&crystal), "write the readme\n");
+    assert_eq!(
+        written(&crystal.dir.path().join("lost")),
+        "write the readme\n"
+    );
+}
+
+#[test]
+fn a_prompt_the_agent_never_takes_fails_the_send() {
+    let crystal = Crystal::new();
+    let bin = fake_slow_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    crystal.stage("deaf");
+    let out = crystal
+        .command(&["new", "-d", "-n", "agent", "claude"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eventually("it's at its prompt", || {
+        crystal.listed("agent")["activity"] == "idle"
+    });
+
+    // It sits in its prompt: the sender is told so, rather than that it went.
+    let stalled = "agent_prompt_stalled: agent didn't take what it was sent: Enter was pressed 3 \
+                   times, and it neither started on it nor changed its screen, so it may still \
+                   be in its input: `crystal read agent` before sending it again";
+    for wait in [false, true] {
+        let mut args = vec!["send", "agent", "write the readme"];
+        if wait {
+            args.push("--wait");
+        }
+        let out = crystal.run(&args);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "{err}");
+        assert!(err.contains(stalled), "{err}");
+        assert!(out.stdout.is_empty());
+    }
+    assert!(
+        crystal
+            .ok(&["read", "agent"])
+            .contains("> write the readme")
+    );
+    assert_eq!(prompts(&crystal), "");
 }
 
 /// A stand-in for Claude Code that tells crystal it has started through

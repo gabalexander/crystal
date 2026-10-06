@@ -162,8 +162,13 @@ MB with its MCP servers. Once an agent has sat at its prompt for half an hour (`
 typing into it, crystal stops it. It stays in the list, its row saying `stopped idle`, and comes back in its
 conversation as soon as you go to it: once the sidebar's selection rests on it a moment, or `crystal attach`
 reaches it, as well as on `Enter` or `crystal respawn`. A message `crystal send` gives it, another agent's or
-the reply box's, starts it again too, and reaches it once it's back at its prompt. A crash or a reboot leaves
-it stopped, to come back the same way. Only an agent that can come back where it was is stopped: Claude Code,
+the reply box's, starts it again too, and keys `crystal send-keys` presses, and reaches it once it takes keys:
+back at its prompt, reading the terminal a key at a time, its screen held still. Claude Code says it has
+started a moment before its prompt reads keys, and what's typed sooner reaches it in one piece, the Enter lost
+in the paste. Then `send` watches it take the message, as it does any agent at its prompt (see
+[Sending](driving.md#sending)). It carries on as if it had never stopped, under its id: its task, closed before
+it stopped, stays closed, and the `session.started` it's told with says what picked it up, `(resumed:
+conversation …)`. A crash or a reboot leaves it stopped, to come back the same way. Only an agent that can come back where it was is stopped: Claude Code,
 Codex or another agent once crystal knows its conversation, or an agent that said how to resume it. A turn that
 ended while you were away waits for you (`✓`) however long it takes, and so does one asking you something;
 background tasks and sessions with their task open are never stopped. Nor is an agent with work going on

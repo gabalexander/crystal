@@ -59,6 +59,7 @@ const SHIPPED: &[&str] = &[
     "ea8bcded7c8c1a1cf324217afc51057b7ab9e89f90fe77b4c657c492f6b3f138",
     "aaeadda2ffaa79fd64552cffecfc6b78aede68a6710a74f022c1f82bc27b0e5d",
     "32a119df51443c2a6750e79be1b9d64d70d8fb4da788ec6e7253a65bb6b78486",
+    "53c6376aac93389b452ca8ebf604ef0597e604cc3a3d683bf327269e05e81410",
 ];
 
 /// What installing the skill comes to, given what's at its path already.

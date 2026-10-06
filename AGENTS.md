@@ -111,8 +111,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   `--interrupt`), `wait`, `read` (`--ansi`, `--unwrap`, `--since`), `clear`, `process-info`, `result`, `answer`
   and `interrupt`, for driving one session from another or a script; waits listen to the daemon's events about
   their session, or their task, and `wait --output` has the daemon look at its screen, asking again when a
-  handover cuts it; `send --wait` listening from before it sends, a prompt its agent isn't seen starting on in
-  five seconds, its screen unchanged since the text showed, a `Stalled`, which `crystal` exits 3 for, and one
+  handover cuts it; `send`'s `agent_prompt_stalled:` from the daemon, an agent at its prompt that never took
+  the text, a `Stalled`, which `crystal` exits 3 for; `send --wait` listening from before it sends, its
+  `--timeout` counted from then, a prompt its agent isn't seen starting on in five seconds, its screen
+  unchanged since the text showed, a `Stalled` too, unless the daemon watched it taken, and one
   whose screen changed taken, its turn over once the screen holds still (`Moves`, unit-tested); a task waited
   for by its number until it closes, whichever session works on it, and `--until closed`; `task --wait`'s run,
   done or failed; a wait that gives up is a `TimedOut`, which `crystal` exits 2 for
@@ -438,7 +440,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   them again; answers Claude Code's hook as it reads or edits a file with what the memory has about it (see
   `recall.rs`), the sessions not held while it looks,
   stops sessions left idle past `[sessions] stop_idle_after`, agents and with `stop_idle_terminals` terminals,
-  unless what runs under them holds them, and starts one again for `crystal send` to reach, has the sessions
+  unless what runs under them holds them, and starts one again for `crystal send` or `send-keys` to reach,
+  under its id, its task as it was, typing once it takes keys (see `typing.rs`), and watches an agent at its
+  prompt take what `send` types, Enter pressed again while it doesn't, has the sessions
   running keep the history `scrollback_lines` says, and keeps the list of projects sessions ran in, telling
   each one that goes on it or off it;
   after a cold restart, puts the sessions written down back in their places and starts them again, agents
@@ -554,7 +558,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   an agent by its program's name, the catalog's or one its rules give, or by the npm package its rules name,
   or by `CRYSTAL_AGENT` in its environment for a wrapper that hides it; and the processes in the foreground
   process group, each with its command and working directory, for `crystal process-info`
-- `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
+- `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own; an agent at
+  its prompt typed into as a `Delivery` says, Enter once the text shows, again while it neither starts on it
+  nor changes its screen, a few times, then stalled; and an agent crystal stopped idle, started again, ready
+  to be typed into once it's at its prompt, takes keys and its screen holds still (`Waking`); pure, so it's
+  unit-tested
 - `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, its screen (120 by 40 until a viewer
   sizes it), viewers (the user, or a program, which doesn't count as watching) and listeners, the output lately
   in an `OutputRing` and reading the screen as `crystal read` asks, the waits for output looking at it, clearing
@@ -567,7 +575,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   agent is to name it or has been asked to, the name Claude Code gives its conversation, whether its agent is
   blocked on the user, how long its agent has sat idle (nobody watching or typing, its turn seen, or with
   nothing under its shell), what its agent left running that wakes it (a job cut loose from its terminal, a
-  wakeup or cron it scheduled), where a terminal stopped idle starts again, the model its agent runs on and
+  wakeup or cron it scheduled), where a terminal stopped idle starts again, how many turns its agent has begun
+  and whether its terminal takes keys as they come, for a send to tell its prompt taken and a woken agent
+  ready, what picked it up as it started again, the model its agent runs on and
   what was reported for its
   row, why its screen reads the way it does (`crystal agent explain`), and what has changed in it (its agent's
   activity, a task's runs, its bell rung or a copy its program made while nobody watched) for the daemon to
@@ -783,7 +793,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   client's and the agent kept warm, and the machine's memory and cores; CPU as the time each process had since
   an earlier look, kept by the daemon (`Earlier`) by pid and start, over the time between, in percent of a core;
   and what runs under a session's program (`ps` on a Mac), a job cut loose from its terminal among it, for
-  whether an idle one may be stopped; the counting pure, so it's unit-tested
+  whether an idle one may be stopped, a process that has ended but isn't reaped yet left out; the counting
+  pure, so it's unit-tested
 - `src/rerank.rs`: the reranker: every passage and the query in one prompt, each marked at its end, the
   projector over the model's state at the marks, and each passage's cosine with the query
 - `src/secrets.rs`: taking credentials out of text before memory keeps it or the distiller reads it
