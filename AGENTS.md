@@ -793,7 +793,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   client's and the agent kept warm, and the machine's memory and cores; CPU as the time each process had since
   an earlier look, kept by the daemon (`Earlier`) by pid and start, over the time between, in percent of a core;
   and what runs under a session's program (`ps` on a Mac), a job cut loose from its terminal among it, for
-  whether an idle one may be stopped; the counting pure, so it's unit-tested
+  whether an idle one may be stopped, a process that has ended but isn't reaped yet left out; the counting
+  pure, so it's unit-tested
 - `src/rerank.rs`: the reranker: every passage and the query in one prompt, each marked at its end, the
   projector over the model's state at the marks, and each passage's cosine with the query
 - `src/secrets.rs`: taking credentials out of text before memory keeps it or the distiller reads it

@@ -632,11 +632,17 @@ fn members() -> Option<Vec<Member>> {
 }
 
 /// A process as its `/proc/<pid>/stat` line says, past the program's name
-/// in brackets: its state, its parent, its group, then its session.
+/// in brackets: its state, its parent, its group, then its session. One
+/// that has ended, a zombie its parent hasn't waited for yet, runs nothing
+/// and holds nothing: `None`, as a job killed under an agent that reaps
+/// late would otherwise hold it for good.
 #[cfg(any(target_os = "linux", test))]
 fn member_in_stat(pid: u32, stat: &str) -> Option<Member> {
     let (_, after) = stat.rsplit_once(')')?;
-    let mut fields = after.split_whitespace().skip(1);
+    let mut fields = after.split_whitespace();
+    if ended(fields.next()?) {
+        return None;
+    }
     let parent = fields.next()?.parse().ok()?;
     let session: u32 = fields.nth(1)?.parse().ok()?;
     Some(Member {
@@ -661,7 +667,8 @@ fn members() -> Option<Vec<Member>> {
 }
 
 /// What `ps -axo pid=,ppid=,stat=` printed, a process a line. A line that
-/// doesn't read is passed over.
+/// doesn't read is passed over, and so is a process that has ended, as
+/// [`member_in_stat`] passes it over.
 #[cfg(any(not(target_os = "linux"), test))]
 fn members_from_ps(listed: &str) -> Vec<Member> {
     listed
@@ -670,7 +677,11 @@ fn members_from_ps(listed: &str) -> Vec<Member> {
             let mut fields = line.split_whitespace();
             let pid = fields.next()?.parse().ok()?;
             let parent = fields.next()?.parse().ok()?;
-            let leads_session = fields.next().is_some_and(|stat| stat.contains('s'));
+            let stat = fields.next().unwrap_or_default();
+            if ended(stat) {
+                return None;
+            }
+            let leads_session = stat.contains('s');
             Some(Member {
                 pid,
                 parent,
@@ -678,6 +689,12 @@ fn members_from_ps(listed: &str) -> Vec<Member> {
             })
         })
         .collect()
+}
+
+/// Whether a process in the state `state`, as `/proc` or `ps` say it, has
+/// ended: a zombie, or dead.
+fn ended(state: &str) -> bool {
+    state.starts_with(['Z', 'X', 'x'])
 }
 
 /// How big a page of memory is, in bytes.
@@ -1000,6 +1017,20 @@ mod tests {
         let stat = "21 (node) S 20 20 20 34816 20 4194560 100";
         assert!(!member_in_stat(21, stat).unwrap().leads_session);
         assert_eq!(member_in_stat(1, "garbage"), None);
+    }
+
+    #[test]
+    fn a_job_that_has_ended_holds_nothing_before_it_is_reaped() {
+        // The job 23, killed, is a zombie until the agent 20 waits for it:
+        // its session is still its own.
+        let stat = "23 (sleep) Z 20 23 23 0 -1 4227076 0";
+        assert_eq!(member_in_stat(23, stat), None);
+        let listed = " 20  10 Ss+
+ 23  20 Zs
+ 24  20 Z
+";
+        let members = members_from_ps(listed);
+        assert_eq!(under_in(&members, 20), Under::default());
     }
 
     #[test]
