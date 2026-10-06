@@ -3529,15 +3529,25 @@ impl Crystal {
 
     /// Like [`Crystal::start_daemon`], with `env` added to its environment,
     /// and waits until it's listening: a command run before that would start
-    /// a daemon of its own, without `env`.
+    /// a daemon of its own, without `env`. One that isn't in time is killed,
+    /// rather than left running with the test's output open, which would
+    /// keep whatever reads it waiting.
     fn start_daemon_with(&self, env: &[(&str, &str)]) -> std::process::Child {
-        let daemon = self
+        let mut daemon = self
             .command(&["daemon"])
             .envs(env.iter().copied())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        eventually("the daemon is listening", || self.listening());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.listening() {
+            if Instant::now() >= deadline {
+                let _ = daemon.kill();
+                let _ = daemon.wait();
+                panic!("timed out waiting until the daemon is listening");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
         daemon
     }
 
