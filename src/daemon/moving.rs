@@ -12,7 +12,7 @@
 //! starts it there. Adapted from docket's `docket worktree`.
 
 use super::Daemon;
-use crate::events::{Event, Kind};
+use crate::events::Event;
 use crate::git::Checkout;
 use crate::handover::HandedMove;
 use crate::output::errln;
@@ -160,7 +160,7 @@ impl Daemon {
                 let recalled = std::mem::take(ended.recalled());
                 started.recalled().carry_on(recalled);
                 self.events
-                    .emit(Event::about_session(Kind::SessionStarted, &started.info()));
+                    .emit(Event::started(&started.info(), started.resumed()));
                 started
             }
             Err(err) => {

@@ -396,7 +396,9 @@ pub struct Event {
     /// renamed tab's old name, the number a tab had before it moved or of
     /// the tab in front before, the number of the tab a session moved
     /// from, or the session or project the user was on before; the ids of
-    /// the entries of memory merged into one.
+    /// the entries of memory merged into one; what picked a session's
+    /// agent up where it was as it started again, `conversation` and its
+    /// id, or the command that resumes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -737,6 +739,15 @@ impl Event {
 
     /// `session` couldn't start again after a restart, for the reason its
     /// state gives, which its status says.
+    /// `session` started, or started again, its agent picked up where it
+    /// was by `resumed`, when it was: see [`Event::from`].
+    pub fn started(session: &SessionInfo, resumed: Option<&str>) -> Event {
+        Event {
+            from: resumed.map(String::from),
+            ..Event::about_session(Kind::SessionStarted, session)
+        }
+    }
+
     pub fn start_failed(session: &SessionInfo) -> Event {
         let mut event = Event::about_session(Kind::SessionStartFailed, session);
         if let (Some(about), State::Failed { why }) = (&mut event.session, &session.state) {
@@ -1178,11 +1189,17 @@ impl Event {
         let said = |text: Option<&str>| text.map(|text| format!(": {text}")).unwrap_or_default();
         match self.kind {
             Kind::SessionStarted | Kind::SessionOpenedInTerminal => {
-                self.session.as_ref().map_or(String::new(), |session| {
+                let command = self.session.as_ref().map_or(String::new(), |session| {
                     let command: Vec<String> =
                         session.command.iter().map(|a| shell::quote(a)).collect();
                     command.join(" ")
-                })
+                });
+                // Its command is the one it was first started with; picked
+                // up where it was, it isn't asked its first prompt again.
+                match &self.from {
+                    Some(resumed) => format!("{command} (resumed: {resumed})"),
+                    None => command,
+                }
             }
             Kind::SessionUnarchived => "back from the archive".to_string(),
             Kind::SessionRenamed => format!("was {}", self.from.as_deref().unwrap_or("?")),
@@ -2192,6 +2209,21 @@ mod tests {
         for kind in Kind::ALL {
             assert!(!kind.about().is_empty(), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn a_session_started_again_says_what_picked_it_up() {
+        let mut first = session();
+        first.command = vec!["claude".into(), "--".into(), "fix the tests".into()];
+        let started = Event::started(&first, None);
+        assert_eq!(started.line(), "claude: claude -- 'fix the tests'");
+        let resumed = Event::started(&first, Some("conversation c-1"));
+        assert_eq!(
+            resumed.line(),
+            "claude: claude -- 'fix the tests' (resumed: conversation c-1)"
+        );
+        let json = serde_json::to_value(&resumed).unwrap();
+        assert_eq!(json["from"], "conversation c-1");
     }
 
     #[test]

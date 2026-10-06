@@ -581,6 +581,9 @@ enum Command {
         timeout: Option<f64>,
     },
     /// Type text into a session and press Enter, the way a person would.
+    /// An agent at its prompt is watched until it takes it, Enter pressed
+    /// again while it doesn't: one that never does has stalled, which
+    /// exits 3.
     Send {
         name: String,
 
@@ -610,7 +613,8 @@ enum Command {
         #[arg(long)]
         wait: bool,
 
-        /// With --wait, give up after this many seconds.
+        /// With --wait, give up after this many seconds, counted from
+        /// before the text goes.
         #[arg(long, value_name = "SECONDS", requires = "wait")]
         timeout: Option<f64>,
     },

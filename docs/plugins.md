@@ -223,7 +223,7 @@ runs the action its handlers give a link, to try them.
 
 | Event | When |
 |---|---|
-| `session.started` | a session starts, or starts again |
+| `session.started` | a session starts, or starts again: picked up where it was, its `from` says what picked it up, `conversation` and its id or the command that resumes it |
 | `session.renamed` | a session gets another name |
 | `session.working` | a session's agent starts working on a turn |
 | `session.waiting` | a session's agent comes to wait on you |

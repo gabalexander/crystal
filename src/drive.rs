@@ -104,12 +104,19 @@ pub struct Sending {
     pub timeout: Option<Duration>,
 }
 
+/// What the daemon's refusal starts with when an agent at its prompt never
+/// took what it was typed: `crystal` exits 3 for it, as for [`Stalled`].
+const PROMPT_STALLED: &str = "agent_prompt_stalled:";
+
 /// Types `text` into the session called `name`, as `sending` says. Run in
-/// a session, the message says it comes from that session.
+/// a session, the message says it comes from that session. An agent at its
+/// prompt is watched by the daemon until it takes it: one that never does
+/// has [`Stalled`].
 pub fn send(socket: &Path, name: &str, text: &str, sending: Sending) -> Result<()> {
     if sending.interrupt {
         stop_run(socket, name)?;
     }
+    let deadline = deadline(sending.timeout.filter(|_| sending.wait));
     // Listening from before it goes, so a turn however short is heard, and
     // nothing said about the turn before is taken for it.
     let turn = match sending.wait {
@@ -123,11 +130,45 @@ pub fn send(socket: &Path, name: &str, text: &str, sending: Sending) -> Result<(
         from: env::own_session_id(socket),
         force: sending.force,
     };
-    ask(socket, &request)?;
+    let sent = match deadline {
+        Some(deadline) => ask_before(socket, request, deadline),
+        None => Some(ask(socket, &request)),
+    };
+    match sent {
+        Some(Ok(_)) => {}
+        Some(Err(err)) => {
+            return match err.to_string() {
+                said if said.starts_with(PROMPT_STALLED) => Err(Stalled(said).into()),
+                _ => Err(err),
+            };
+        }
+        None => {
+            let seconds = sending.timeout.unwrap_or_default().as_secs_f64();
+            let said = format!("{name} hadn't taken what it was sent after {seconds}s");
+            return Err(TimedOut(said).into());
+        }
+    }
     match turn {
-        Some(turn) => turn.prompted(sending.timeout),
+        // The daemon watched an agent at its prompt take it.
+        Some(turn) => {
+            let watched = sending.enter && turn.at_prompt();
+            turn.prompted(sending.timeout, deadline, !watched)
+        }
         None => Ok(()),
     }
+}
+
+/// Asks the daemon at `socket` `request`, giving up on its answer at
+/// `deadline` with `None`: what it was asked goes on all the same.
+fn ask_before(socket: &Path, request: Request, deadline: Instant) -> Option<Result<Response>> {
+    let (answered, answer) = std::sync::mpsc::channel();
+    let socket = socket.to_path_buf();
+    thread::spawn(move || {
+        // Nobody may be listening any more.
+        let _ = answered.send(ask(&socket, &request));
+    });
+    let left = deadline.saturating_duration_since(Instant::now());
+    answer.recv_timeout(left).ok()
 }
 
 /// Stops the run the background task `name` is in the middle of, if it's
@@ -385,15 +426,27 @@ impl<'a> Turn<'a> {
         Ok(Turn { watch, before })
     }
 
+    /// Whether its agent sat at its prompt before anything was sent.
+    fn at_prompt(&self) -> bool {
+        matches!(self.before, Some(Activity::Idle | Activity::Done))
+    }
+
     /// Waits for the turn a prompt just sent starts to end, and prints how
     /// it ended. Whatever the agent said about the turn before ends nothing:
     /// one that wasn't working has [`START_GRACE`] to be seen starting on
-    /// the prompt, or to change its screen, or it has [`Stalled`]. One that
-    /// was takes the prompt once its turn is over, and that turn's end may
-    /// be the wait's.
-    fn prompted(self, timeout: Option<Duration>) -> Result<()> {
+    /// the prompt, or to change its screen, or with `stalls` it has
+    /// [`Stalled`]; without, the daemon has seen it take the prompt. One
+    /// that was working takes the prompt once its turn is over, and that
+    /// turn's end may be the wait's. It gives up at `deadline`, `timeout`
+    /// after the send began.
+    fn prompted(
+        self,
+        timeout: Option<Duration>,
+        deadline: Option<Instant>,
+        stalls: bool,
+    ) -> Result<()> {
         let name = self.watch.name;
-        match self.settled(deadline(timeout), true)? {
+        match self.settled(deadline, stalls)? {
             Some(settled) => say(&settled, false),
             None => timed_out(name, timeout),
         }

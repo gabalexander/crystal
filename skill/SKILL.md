@@ -52,10 +52,10 @@ a background task too, once its run ends.
 crystal send reviewer "Now check the tests too" --wait
 ```
 
-`--wait` waits for the turn that text starts, then prints how it ended. An agent neither seen starting on it
-nor changing its screen within five seconds has stalled: `send` fails with an error starting
-`agent_prompt_stalled:` and exits 3. It may have taken the text all the same, so `read` it before sending it
-again. Then read the answer:
+`--wait` waits for the turn that text starts, then prints how it ended. An agent that never takes the text,
+neither starting on it nor changing its screen though Enter was pressed again, has stalled: `send`, with
+`--wait` or not, fails with an error starting `agent_prompt_stalled:` and exits 3. The text may be sitting in
+its input, or it may have taken it all the same, so `read` it before sending it again. Then read the answer:
 
 ```sh
 crystal read reviewer --lines 40
@@ -209,7 +209,7 @@ crystal wait t12 --timeout 3600                       # until task t12 closes: p
 crystal wait reviewer --until waiting,closed          # until it asks something, or its task closes
 ```
 
-- A wait that runs out of time exits 2; `send --wait` whose agent never started on the text exits 3
+- A wait that runs out of time exits 2; `send` whose agent never took the text exits 3
   (`agent_prompt_stalled:`); anything else that goes wrong exits 1. `--quiet` prints nothing.
 - `closed` is a task closing, done, failed or cancelled, which it prints; a session that ends or is killed
   with its task open closes it, failed or cancelled.

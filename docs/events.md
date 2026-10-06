@@ -46,7 +46,8 @@ Each line of `--json` is one event, the same JSON the log keeps and plugins get:
 going back), `at` (milliseconds since the Unix epoch), its name as `event`, the `project` it's about, the
 `session` (its `name`, `id`, `command`, `cwd`, `project`, `worktree`, `branch`, `activity`, `task`, and its
 number as `task_id`, `status`, as `ls` words it, and `reporter` while an agent that reports for itself holds it), and what its kind carries:
-`from` (a renamed session's old name, what its agent was doing before, or the agent that let go; a renamed
+`from` (a renamed session's old name, what its agent was doing before, or the agent that let go; what picked a
+session started again up where it was, `conversation` and its id or the command that resumes it; a renamed
 tab's old name, a moved tab's number before, the number of the tab a session moved from, or the session or
 project you were on before), `tab` (the tab, as [`crystal layout --json`](tui.md#tabs) has it), `task` (with
 its `id`, `pending`, `waiting` and, once closed, its `outcome` and the `artifacts` kept with it), `run`
