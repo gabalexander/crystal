@@ -6,6 +6,11 @@
 //! In each project's directory: `wiki.json`, the page's text and diagrams
 //! at a commit; `build.json`, how the build that writes it is going; and
 //! `build.log`.
+//!
+//! The index its links come from, where each thing the prose names is
+//! defined, is [`index`].
+
+pub mod index;
 
 use crate::state;
 use std::path::{Path, PathBuf};
@@ -21,4 +26,10 @@ pub const BUILD_FILE: &str = "build.json";
 /// was, its name and a hash of its path.
 pub fn dir(socket: &Path, project: &Path) -> PathBuf {
     state::wikis_dir(socket).join(state::project_slug(project))
+}
+
+/// Where the index of the project whose main worktree is `project` keeps
+/// what it read between builds, in its wiki's directory.
+pub fn index_dir(socket: &Path, project: &Path) -> PathBuf {
+    dir(socket, project).join("index")
 }

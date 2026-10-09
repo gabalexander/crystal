@@ -2110,6 +2110,29 @@ enum WikiCommand {
         #[arg(value_name = "DIR")]
         out: PathBuf,
     },
+    /// Build the index the wiki's links come from, where everything in the
+    /// project's code is defined, and say how each of its languages was
+    /// indexed (by a SCIP indexer, its grammar or its keywords) and why;
+    /// or say what each span given would link to.
+    Index {
+        /// Code spans to look up, as the wiki's prose writes them:
+        /// `Session::stop`, `src/daemon.rs`, `[sessions] stop_idle_after`.
+        #[arg(value_name = "SPAN")]
+        spans: Vec<String>,
+
+        /// A file the spans are about, preferred where a span could name
+        /// several things.
+        #[arg(long, value_name = "PATH")]
+        near: Vec<String>,
+
+        /// The commit to index [default: the project's HEAD]
+        #[arg(long, value_name = "REV")]
+        commit: Option<String>,
+
+        /// Print the report and the lookups as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3005,6 +3028,21 @@ fn run(cli: Cli) -> Result<()> {
                 plugins::ensure_enabled(&config::Config::load()?, "wiki")?;
                 wiki_site::export(&socket, dir, &out)?
             }
+            WikiCommand::Index {
+                spans,
+                near,
+                commit,
+                json,
+            } => wiki::index::cli::run(
+                &socket,
+                wiki::index::cli::Asked {
+                    dir,
+                    commit,
+                    spans,
+                    near,
+                    json,
+                },
+            )?,
         },
         Command::Mermaid {
             file,

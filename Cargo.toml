@@ -31,6 +31,17 @@ similar = "3.2.0"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 toml = "1.1.6"
 toml_edit = "0.25.15"
+# The wiki's index reads definitions out of Rust, Go, Python, TypeScript and
+# JavaScript, Java, C and C++ with their tree-sitter grammars, about 8 MB of
+# the binary; other languages are read by their keywords.
+tree-sitter = "0.26.13"
+tree-sitter-c = "0.24.2"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-go = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
 unicode-width = "0.2"
 
 # On a Mac, the models that search memory by meaning run on its GPU.

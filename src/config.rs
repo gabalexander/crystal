@@ -10,6 +10,7 @@ use crate::profile::Profile;
 use crate::tui::keymap::{KeySettings, Keymap};
 use crate::tui::rows;
 use crate::vt;
+use crate::wiki::index::IndexSettings;
 use anyhow::{Context, Result, bail};
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
@@ -946,8 +947,8 @@ impl Default for UpdateSettings {
     }
 }
 
-/// How the wiki's chat answers a question about the code: see
-/// [`crate::wiki_ask`].
+/// How the wiki's chat answers a question about the code (see
+/// [`crate::wiki_ask`]), and how its index is built.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WikiSettings {
@@ -955,6 +956,9 @@ pub struct WikiSettings {
     pub ask_model: String,
     /// The most one question may spend, in US dollars.
     pub ask_budget_usd: f64,
+    /// How the index the wiki's links come from is built: `[wiki.index]`
+    /// in the file. See [`crate::wiki::index`].
+    pub index: IndexSettings,
 }
 
 impl Default for WikiSettings {
@@ -962,6 +966,7 @@ impl Default for WikiSettings {
         WikiSettings {
             ask_model: "sonnet".to_string(),
             ask_budget_usd: 0.5,
+            index: IndexSettings::default(),
         }
     }
 }
@@ -1960,6 +1965,24 @@ back_to = "build"
     }
 
     #[test]
+    fn the_wiki_s_index_is_built_by_a_table_of_its_own() {
+        let index = parse("").unwrap().wiki.index;
+        assert!(index.precise);
+        assert_eq!(index.indexer_timeout_secs, 900);
+        assert_eq!(
+            index.exclude,
+            ["vendor", "third_party", "node_modules", "testdata"]
+        );
+        let config =
+            "[wiki.index]\nprecise = false\nindexer_memory_mb = 2048\nexclude = [\"gen\"]\n";
+        let index = parse(config).unwrap().wiki.index;
+        assert!(!index.precise);
+        assert_eq!((index.indexer_memory_mb, index.max_file_kb), (2048, 1024));
+        assert_eq!(index.exclude, ["gen"]);
+        assert!(parse("[wiki.index]\nprecis = false\n").is_err());
+    }
+
+    #[test]
     fn memory_embeds_here_unless_told_gemini_at_a_size_it_was_measured_at() {
         let memory = parse("").unwrap().memory;
         assert_eq!(memory.embedder, Embedder::Local);
@@ -2377,6 +2400,10 @@ back_to = "build"
             wiki: WikiSettings {
                 ask_model: "opus".into(),
                 ask_budget_usd: 2.0,
+                index: IndexSettings {
+                    precise: false,
+                    ..IndexSettings::default()
+                },
             },
             profiles: vec![Profile {
                 name: "review".into(),
