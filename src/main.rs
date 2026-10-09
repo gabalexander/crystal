@@ -96,6 +96,10 @@ mod update;
 mod usage_cli;
 mod viewer;
 mod vt;
+mod wiki;
+mod wiki_ask;
+mod wiki_server;
+mod wiki_site;
 mod work;
 mod worktree_cli;
 mod worktree_hooks;
@@ -910,6 +914,17 @@ enum Command {
     Agent {
         #[command(subcommand)]
         command: Option<AgentCommand>,
+    },
+    /// The wiki of a project's code, one page with its diagrams, in the
+    /// browser: serve the wikis of this server's projects, open one, or
+    /// write one out as a site of its own.
+    Wiki {
+        /// The project's directory [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR", global = true)]
+        dir: Option<PathBuf>,
+
+        #[command(subcommand)]
+        command: WikiCommand,
     },
     /// Draw a mermaid diagram as text, the way crystal's previews draw it:
     /// a diagram, or each ```mermaid fence of a markdown file. One that
@@ -2065,6 +2080,39 @@ enum ProjectCommand {
 }
 
 #[derive(Subcommand)]
+enum WikiCommand {
+    /// Serve the wikis of this server's projects to the browser, on
+    /// 127.0.0.1, with the chat that answers questions about their code,
+    /// until it's stopped. Prints where.
+    Serve {
+        /// The port [default: 7347, or a free one when it's taken]
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// Open the browser on the project's wiki too.
+        #[arg(long)]
+        open: bool,
+
+        /// Run as the server `crystal wiki open` starts in the background,
+        /// which stops once the daemon has.
+        #[arg(long, hide = true, conflicts_with = "open")]
+        helper: bool,
+    },
+    /// Open the project's wiki in the browser, or the list of wikis for a
+    /// project with none, starting a server in the background first if
+    /// none is running. Over ssh, print its address and how to reach it.
+    Open,
+    /// Write the project's wiki out as a site of its own, which works
+    /// opened from its files and on any static host, like GitHub Pages:
+    /// index.html with the wiki in it, wiki.json, and assets/.
+    Export {
+        /// Where to write it.
+        #[arg(value_name = "DIR")]
+        out: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum ProfileCommand {
     /// Show a profile: its agent, where it starts, and the command it runs
     /// for a task.
@@ -2948,6 +2996,16 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Wiki { dir, command } => match command {
+            WikiCommand::Serve { port, open, helper } => {
+                wiki_server::serve(&socket, port, dir, open, helper)?
+            }
+            WikiCommand::Open => wiki_server::open(&socket, dir)?,
+            WikiCommand::Export { out } => {
+                plugins::ensure_enabled(&config::Config::load()?, "wiki")?;
+                wiki_site::export(&socket, dir, &out)?
+            }
+        },
         Command::Mermaid {
             file,
             width,

@@ -478,11 +478,13 @@ const PLAIN_GIT: [(&str, &str); 2] = [
 /// No sound from any daemon a test starts, whatever its config says; and
 /// none of memory's models, which search by meaning is on for by default: a
 /// cache with none of them in it, and no daemon downloading them as it
-/// starts (a test that asks for them gives a cache of its own).
-const QUIET: [(&str, &str); 3] = [
+/// starts (a test that asks for them gives a cache of its own). Nor the
+/// wiki's mermaid.
+const QUIET: [(&str, &str); 4] = [
     ("CRYSTAL_NO_SOUND", "1"),
     ("XDG_CACHE_HOME", "/nonexistent/crystal-tests/cache"),
     ("CRYSTAL_NO_MODEL_DOWNLOAD", "1"),
+    ("CRYSTAL_NO_MERMAID_DOWNLOAD", "1"),
 ];
 
 /// The `CRYSTAL_*` variables the tests were run with: those of the crystal
@@ -15347,11 +15349,12 @@ command = ["sh", "show.sh"]
     crystal.ok(&["plugin", "enable", "board"]);
 
     let mut tui = crystal.tui();
-    // Down past crystal's own eight, to the pane under board.
+    // Down past crystal's own nine and the wiki's three actions, to the pane
+    // under board.
     let open = |tui: &mut Terminal| {
         tui.type_keys("X");
         tui.shows("installed");
-        tui.type_keys("jjjjjjjjj\r");
+        tui.type_keys("jjjjjjjjjjjjj\r");
         tui.shows("the board says hi");
         tui.shows("board · The board");
     };
@@ -15806,8 +15809,8 @@ fn a_plugin_for_a_newer_crystal_is_listed_but_can_t_be_turned_on() {
     tui.type_keys("X");
     tui.shows("● handoff");
     tui.shows(&format!("○ future          {why}"));
-    // Down past crystal's own eight, to future.
-    tui.type_keys("jjjjjjjj ");
+    // Down past crystal's own nine and the wiki's three actions, to future.
+    tui.type_keys("jjjjjjjjjjjj ");
     tui.shows(&format!("future can't be turned on: {why}"));
     tui.type_keys("\x1b");
     drop(tui);
@@ -16258,10 +16261,11 @@ command = ["sh", "show.sh"]
     crystal.ok(&["new", "-d", "-n", "agent", "sleep", "30"]);
     let mut tui = crystal.tui();
     tui.shows("agent");
-    // Down past crystal's own eight, to the pane under board.
+    // Down past crystal's own nine and the wiki's three actions, to the pane
+    // under board.
     tui.type_keys("X");
     tui.shows("installed");
-    tui.type_keys("jjjjjjjjj\r");
+    tui.type_keys("jjjjjjjjjjjjj\r");
     tui.shows("the board says hi");
     tui.hides("crystal's own");
     let layout = crystal.ok(&["layout"]);
@@ -19667,4 +19671,488 @@ fn crystal_mcp_ends_quietly_once_claude_stops_reading() {
     writeln!(input, "{ping}").unwrap();
     drop(input);
     stopped_quietly(&["mcp"], &child.wait_with_output().unwrap());
+}
+
+/// What crystal names a project's directory in its state, as
+/// `state::project_slug` does: its name and the FNV-1a hash of its path.
+fn project_slug(project: &Path) -> String {
+    let name: String = (project.file_name().unwrap().to_string_lossy().chars())
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in project.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{name}-{hash:016x}")
+}
+
+/// A project outside git, with a file in it, and a wiki of it where
+/// `crystal wiki build` would have written one for `crystal`'s server.
+/// Returns the project's directory, as crystal names it, and its wiki's key.
+fn project_with_a_wiki(crystal: &Crystal) -> (PathBuf, String) {
+    let root = crystal.dir.path().join("app");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/x.rs"), "fn x() {}\n").unwrap();
+    std::fs::write(crystal.dir.path().join("secret"), "not for the wiki\n").unwrap();
+    let root = std::fs::canonicalize(root).unwrap();
+    let key = project_slug(&root);
+    let wiki = serde_json::json!({
+        "version": 1,
+        "repo": {"name": "acme/app", "root": root, "commit": "0123456789abcdef",
+                 "branch": null, "web_url": null, "code_url": null},
+        "generated": {"at": "2026-10-09T12:00:00Z", "by": "test", "model": "none",
+                      "cost_usd": 0, "crystal": "0.3.0"},
+        "overview": {"summary_md": "An app. See [x](code:src/x.rs#L1).",
+                     "diagram": {"mermaid": "flowchart TD\n  a --> b", "caption": "x"}},
+        "sections": [{"id": "starting", "title": "Starting", "summary_md": "How it starts.",
+                      "diagram": null, "subsections": [
+                          {"id": "x", "title": "The x", "body_md": "The </script> body.",
+                           "diagram": null, "files": ["src/x.rs"]}]}]
+    });
+    let dir = crystal.dir.path().join("crystal.wiki").join(&key);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("wiki.json"),
+        serde_json::to_string_pretty(&wiki).unwrap(),
+    )
+    .unwrap();
+    (root, key)
+}
+
+/// A `crystal wiki serve` of the test's own, on a free port, stopped as
+/// the test ends.
+struct WikiServer {
+    child: std::process::Child,
+    port: u16,
+    /// Kept open: a server whose output has gone stops.
+    _out: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl WikiServer {
+    fn start(crystal: &Crystal, env: &[(&str, &str)]) -> WikiServer {
+        use std::io::BufRead;
+        let mut child = crystal
+            .command(&["wiki", "serve", "--port", "0"])
+            .envs(env.iter().copied())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut first = String::new();
+        out.read_line(&mut first).unwrap();
+        let port = first
+            .split("http://127.0.0.1:")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|port| port.parse().ok())
+            .unwrap_or_else(|| panic!("it didn't say where: {first:?}"));
+        WikiServer {
+            child,
+            port,
+            _out: out,
+        }
+    }
+
+    /// Sends `request` as it is, its `Host` this server's unless it says
+    /// one, and gives the status and the answer, its head and its body.
+    fn send(&self, request: &str) -> (u16, String, String) {
+        send_http(self.port, request)
+    }
+
+    fn get(&self, path: &str) -> (u16, String, String) {
+        self.send(&format!("GET {path} HTTP/1.1\r\n\r\n"))
+    }
+
+    fn origin(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+impl Drop for WikiServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Sends `request` to 127.0.0.1:`port` as it is, with a `Host` of
+/// 127.0.0.1 unless it has one, and reads the answer until the server
+/// closes: its status, its head and its body.
+fn send_http(port: u16, request: &str) -> (u16, String, String) {
+    let request = match request.to_ascii_lowercase().contains("\r\nhost:") {
+        true => request.to_string(),
+        false => request.replacen("\r\n", &format!("\r\nHost: 127.0.0.1:{port}\r\n"), 1),
+    };
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut answer = Vec::new();
+    stream.read_to_end(&mut answer).unwrap();
+    let answer = String::from_utf8_lossy(&answer).into_owned();
+    let (head, body) = answer.split_once("\r\n\r\n").unwrap_or((&answer, ""));
+    let status = head
+        .split(' ')
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status, head.to_string(), body.to_string())
+}
+
+/// The events of a `text/event-stream`, each its name and its data.
+fn server_events(body: &str) -> Vec<(String, serde_json::Value)> {
+    body.split("\n\n")
+        .filter_map(|event| {
+            let name = event
+                .lines()
+                .find_map(|line| line.strip_prefix("event: "))?;
+            let data = event.lines().find_map(|line| line.strip_prefix("data: "))?;
+            Some((name.to_string(), serde_json::from_str(data).unwrap()))
+        })
+        .collect()
+}
+
+#[test]
+fn wiki_serve_serves_the_wikis_and_refuses_what_isn_t_its_own() {
+    let crystal = Crystal::new();
+    let (_, key) = project_with_a_wiki(&crystal);
+    let server = WikiServer::start(&crystal, &[]);
+
+    let (status, head, page) = server.get(&format!("/p/{key}/"));
+    assert_eq!(status, 200, "{head}");
+    assert!(
+        head.contains("Content-Type: text/html; charset=utf-8"),
+        "{head}"
+    );
+    assert!(page.contains("assets/app.js"), "{page}");
+    let (status, head, _) = server.get(&format!("/p/{key}"));
+    assert_eq!(status, 301);
+    assert!(head.contains(&format!("Location: /p/{key}/")), "{head}");
+
+    let (status, _, wiki) = server.get(&format!("/p/{key}/wiki.json"));
+    assert_eq!(status, 200);
+    let kept = crystal
+        .dir
+        .path()
+        .join("crystal.wiki")
+        .join(&key)
+        .join("wiki.json");
+    assert_eq!(wiki, std::fs::read_to_string(&kept).unwrap());
+    for (path, kind) in [
+        ("/assets/app.js".to_string(), "text/javascript"),
+        (format!("/p/{key}/assets/style.css"), "text/css"),
+    ] {
+        let (status, head, _) = server.get(&path);
+        assert_eq!(status, 200, "{path}");
+        assert!(head.contains(&format!("Content-Type: {kind}")), "{head}");
+    }
+
+    // The list: a page for a browser, JSON for a page's search.
+    let (_, _, home) = server.send("GET / HTTP/1.1\r\nAccept: text/html\r\n\r\n");
+    assert!(
+        home.contains(&format!("<a href=\"/p/{key}/\">acme/app</a>")),
+        "{home}"
+    );
+    let (_, _, listed) = server.get("/");
+    let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    assert_eq!(listed[0]["name"], "acme/app");
+    assert_eq!(listed[0]["url"], format!("/p/{key}/"));
+    let (_, _, listed) = server.get("/projects.json");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&listed).unwrap()[0]["key"],
+        key
+    );
+
+    let (status, _, said) = server.get(&format!("/p/{key}/api/status"));
+    assert_eq!(status, 200);
+    let said: serde_json::Value = serde_json::from_str(&said).unwrap();
+    assert_eq!(said["building"], false);
+    assert_eq!(said["updated"], "2026-10-09T12:00:00Z");
+    assert_eq!(said["stale"], false, "no git to say");
+
+    // Mermaid isn't downloaded in tests, and the page is told so.
+    let (status, _, said) = server.get("/assets/mermaid.min.js");
+    assert_eq!(status, 503);
+    assert!(said.contains("CRYSTAL_NO_MERMAID_DOWNLOAD"), "{said}");
+
+    // Nothing but what it serves.
+    assert_eq!(server.get("/assets/../../etc/passwd").0, 400);
+    assert_eq!(server.get("/p/..%2F..%2Fsecret/wiki.json").0, 400);
+    assert_eq!(server.get(&format!("/p/{key}/assets/../wiki.json")).0, 400);
+    assert_eq!(server.get("/etc/passwd").0, 404);
+    assert_eq!(server.get("/p/nobody/").0, 404);
+    let (status, _, said) =
+        server.send("GET /projects.json HTTP/1.1\r\nHost: evil.example\r\n\r\n");
+    assert_eq!(status, 403);
+    assert!(said.contains("127.0.0.1 and localhost only"), "{said}");
+    assert_eq!(
+        server.send("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").0,
+        200
+    );
+}
+
+#[test]
+fn wiki_ask_streams_claude_s_answer_what_it_reads_and_how_it_ended() {
+    let crystal = Crystal::new();
+    let (root, key) = project_with_a_wiki(&crystal);
+    let bin = crystal.dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    // Claude Code headless, as the chat runs it: it notes its arguments and
+    // the question, reads a file, and answers in pieces.
+    script(
+        &bin.join("claude"),
+        r#"printf '%s\n' "$@" > args
+cat > question
+echo '{"type":"system","subtype":"init","session_id":"0b5c9e2a-77"}'
+echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"It is "}}}'
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"'"$PWD"'/src/x.rs"}}]}}'
+echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"[x](code:src/x.rs#L1)."}}}'
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"It is [x](code:src/x.rs#L1)."}]}}'
+echo '{"type":"result","subtype":"success","is_error":false,"session_id":"0b5c9e2a-77","total_cost_usd":0.03}'
+"#,
+    );
+    let path = path_with(&bin);
+    let server = WikiServer::start(&crystal, &[("PATH", &path)]);
+    let ask = |body: &str, origin: Option<&str>| {
+        let origin = origin
+            .map(|origin| format!("Origin: {origin}\r\n"))
+            .unwrap_or_default();
+        server.send(&format!(
+            "POST /p/{key}/api/ask HTTP/1.1\r\n{origin}Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        ))
+    };
+    let origin = server.origin();
+
+    let question = r#"{"question":"What is x?","conversation":null,"section":"x"}"#;
+    let (status, head, body) = ask(question, Some(&origin));
+    assert_eq!(status, 200, "{head}{body}");
+    assert!(head.contains("Content-Type: text/event-stream"), "{head}");
+    let events = server_events(&body);
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["delta", "tool", "delta", "done"], "{body}");
+    assert_eq!(events[0].1["text"], "It is ");
+    assert_eq!(events[1].1["name"], "Read");
+    assert_eq!(
+        events[1].1["path"], "src/x.rs",
+        "from the repository's root"
+    );
+    assert_eq!(events[2].1["text"], "[x](code:src/x.rs#L1).");
+    assert_eq!(events[3].1["conversation"], "0b5c9e2a-77");
+    assert_eq!(events[3].1["cost_usd"], 0.03);
+
+    // It ran in the project, read only, told the wiki's outline and the
+    // section being read, the question on its input.
+    assert_eq!(
+        std::fs::read_to_string(root.join("question")).unwrap(),
+        "What is x?"
+    );
+    let args = std::fs::read_to_string(root.join("args")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    let after = |flag: &str| args[args.iter().position(|arg| *arg == flag).unwrap() + 1];
+    assert_eq!(after("--permission-mode"), "dontAsk");
+    assert_eq!(after("--model"), "sonnet");
+    assert!(args.contains(&"--strict-mcp-config"), "{args:?}");
+    let prompt = args.join("\n");
+    assert!(prompt.contains("the code of acme/app"), "{prompt}");
+    assert!(prompt.contains("The user is reading \"The x\", under \"Starting\""));
+    assert!(!args.contains(&"--resume"));
+
+    // A follow-up, in its conversation.
+    let follow_up = r#"{"question":"And then?","conversation":"0b5c9e2a-77"}"#;
+    let (status, _, body) = ask(follow_up, Some(&origin));
+    assert_eq!(status, 200);
+    assert_eq!(server_events(&body).last().unwrap().0, "done");
+    let args = std::fs::read_to_string(root.join("args")).unwrap();
+    assert!(args.contains("--resume\n0b5c9e2a-77\n"), "{args}");
+
+    // Only from the server's own page.
+    assert_eq!(ask(question, None).0, 403);
+    assert_eq!(ask(question, Some("https://evil.example")).0, 403);
+    // A question it can't take, and one Claude fails, say why.
+    let (_, _, body) = ask(r#"{"question":"  "}"#, Some(&origin));
+    assert_eq!(
+        server_events(&body)[0],
+        (
+            "error".to_string(),
+            serde_json::json!({"message": "the question is empty"})
+        )
+    );
+    assert_eq!(ask("not json", Some(&origin)).0, 400);
+    script(
+        &bin.join("claude"),
+        "cat > /dev/null\necho 'Error: Invalid API key' >&2\nexit 1\n",
+    );
+    let (_, _, body) = ask(question, Some(&origin));
+    let events = server_events(&body);
+    assert_eq!(events.len(), 1, "{body}");
+    assert_eq!(events[0].0, "error");
+    assert_eq!(
+        events[0].1["message"],
+        "claude failed: Error: Invalid API key"
+    );
+}
+
+#[test]
+fn wiki_open_api_opens_a_file_of_the_repository_in_the_editor_at_its_line() {
+    let crystal = Crystal::new();
+    let (root, key) = project_with_a_wiki(&crystal);
+    let editor = crystal.dir.path().join("editor");
+    let opened = crystal.dir.path().join("opened");
+    script(
+        &editor,
+        &format!(
+            "printf '%s\\n' \"$PWD\" \"$@\" > {0}.new && mv {0}.new {0}\n",
+            opened.display()
+        ),
+    );
+    let server = WikiServer::start(&crystal, &[("VISUAL", editor.to_str().unwrap())]);
+    let open = |query: &str, from: &str| {
+        server.send(&format!(
+            "GET /p/{key}/api/open?{query} HTTP/1.1\r\nSec-Fetch-Site: {from}\r\n\r\n"
+        ))
+    };
+
+    let (status, head, body) = open("path=src%2Fx.rs&line=12", "same-origin");
+    assert_eq!(status, 204, "{head}{body}");
+    // A terminal's editor, in a session of its own in the project.
+    eventually("the editor has the file open", || opened.exists());
+    let file = root.join("src/x.rs");
+    assert_eq!(
+        std::fs::read_to_string(&opened).unwrap(),
+        format!("{}\n+12\n{}\n", root.display(), file.display())
+    );
+    assert!(crystal.ok(&["ls"]).contains("x.rs"));
+
+    assert_eq!(open("path=..%2Fsecret&line=1", "same-origin").0, 404);
+    assert_eq!(open("path=src%2Fgone.rs", "same-origin").0, 404);
+    assert_eq!(open("path=src%2Fx.rs", "cross-site").0, 403);
+}
+
+#[test]
+fn wiki_export_writes_a_site_that_works_from_its_files() {
+    let crystal = Crystal::new();
+    let (root, key) = project_with_a_wiki(&crystal);
+    let out = crystal.dir.path().join("site");
+    let done = crystal
+        .command(&[
+            "wiki",
+            "export",
+            out.to_str().unwrap(),
+            "-C",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&done.stderr);
+    assert!(done.status.success(), "{said}");
+    assert!(String::from_utf8_lossy(&done.stdout).contains("wrote app's wiki to"));
+    // Without mermaid, which tests never download, the diagrams stay text.
+    assert!(
+        said.contains("the diagrams are left as their source"),
+        "{said}"
+    );
+
+    let kept = crystal
+        .dir
+        .path()
+        .join("crystal.wiki")
+        .join(&key)
+        .join("wiki.json");
+    let wiki = std::fs::read_to_string(kept).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(out.join("wiki.json")).unwrap(),
+        wiki
+    );
+    for file in [
+        "assets/app.js",
+        "assets/style.css",
+        "assets/index.html",
+        ".nojekyll",
+    ] {
+        assert!(out.join(file).exists(), "{file}");
+    }
+    let index = std::fs::read_to_string(out.join("index.html")).unwrap();
+    let start = index
+        .find(r#"<script type="application/json" id="wiki-data">"#)
+        .unwrap();
+    let inline = &index[start..];
+    let inline = &inline[inline.find('>').unwrap() + 1..inline.find("</script>").unwrap()];
+    let inlined: serde_json::Value = serde_json::from_str(inline).unwrap();
+    assert_eq!(
+        inlined,
+        serde_json::from_str::<serde_json::Value>(&wiki).unwrap()
+    );
+    assert!(index.find("wiki-data").unwrap() < index.find("</head>").unwrap());
+
+    let elsewhere = crystal.dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let said = crystal.fails(&["wiki", "export", "out", "-C", elsewhere.to_str().unwrap()]);
+    assert!(
+        said.contains("elsewhere has no wiki yet: `crystal wiki build` writes one"),
+        "{said}"
+    );
+}
+
+#[test]
+fn wiki_open_starts_a_server_once_and_over_ssh_says_how_to_reach_it() {
+    let crystal = Crystal::new();
+    let (root, key) = project_with_a_wiki(&crystal);
+    let over_ssh = [("SSH_TTY", "/dev/ttys999")];
+    let open = || {
+        let out = crystal
+            .command(&["wiki", "open", "-C", root.to_str().unwrap()])
+            .envs(over_ssh)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let said = open();
+    let url = said.lines().last().unwrap().to_string();
+    let port: u16 = url
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|port| port.parse().ok())
+        .unwrap_or_else(|| panic!("{said}"));
+    assert_eq!(url, format!("http://127.0.0.1:{port}/p/{key}/"));
+    assert!(
+        said.contains(&format!("ssh -L {port}:127.0.0.1:{port} ")),
+        "{said}"
+    );
+    let serving = crystal.dir.path().join("crystal.wiki/serve.json");
+    let pid =
+        serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&serving).unwrap())
+            .unwrap()["pid"]
+            .as_i64()
+            .unwrap();
+    let helper = scopeguard(pid);
+    assert_eq!(
+        send_http(port, &format!("GET /p/{key}/ HTTP/1.1\r\n\r\n")).0,
+        200
+    );
+
+    // Once one runs, it's the one opened.
+    assert_eq!(open().lines().last().unwrap(), url);
+    drop(helper);
+}
+
+/// Kills the process `pid` as it goes: a server a test started in the
+/// background.
+fn scopeguard(pid: i64) -> impl Drop {
+    struct Kill(i64);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = Command::new("kill").arg(self.0.to_string()).status();
+        }
+    }
+    Kill(pid)
 }

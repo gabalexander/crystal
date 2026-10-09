@@ -130,6 +130,13 @@ fn projects_dir(socket: &Path) -> PathBuf {
     kept(socket, "projects", "projects")
 }
 
+/// Where the daemon at `socket` keeps its projects' wikis, a directory
+/// each (see [`crate::wiki::dir`]), and where `crystal wiki serve` says
+/// which port it's on.
+pub fn wikis_dir(socket: &Path) -> PathBuf {
+    kept(socket, "wiki", "wiki")
+}
+
 /// Where the daemon at `socket` keeps `file`: in its server's directory
 /// ([`socket::server_of`]), or for a socket given by its path, beside it,
 /// named after it with `extension`.
@@ -158,7 +165,7 @@ pub fn servers_dir() -> PathBuf {
 
 /// A directory name for a project: its own name, so a person can find it,
 /// and a hash of its whole path, since two projects can share a name.
-fn project_slug(project: &Path) -> String {
+pub fn project_slug(project: &Path) -> String {
     let name = project
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())

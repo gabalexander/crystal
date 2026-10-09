@@ -48,40 +48,80 @@ pub const PROJECT_DIR: &str = ".crystal/plugins";
 pub struct BuiltIn {
     pub name: &'static str,
     pub description: &'static str,
+    /// What the plugins view runs for it.
+    pub actions: &'static [BuiltInAction],
+}
+
+/// One of the actions of one of crystal's own plugins: a crystal command,
+/// run in the background in the selected session's worktree.
+pub struct BuiltInAction {
+    pub id: &'static str,
+    pub title: &'static str,
+    /// The command's arguments, after `crystal`.
+    pub args: &'static [&'static str],
 }
 
 pub const BUILT_IN: &[BuiltIn] = &[
     BuiltIn {
         name: "tasks",
         description: "sessions with something to do, closed with `crystal done`",
+        actions: &[],
     },
     BuiltIn {
         name: "handoff",
         description: "notes a worktree keeps for the sessions after, `crystal handoff`",
+        actions: &[],
     },
     BuiltIn {
         name: "backlog",
         description: "each project's list of things to do later",
+        actions: &[],
     },
     BuiltIn {
         name: "memory",
         description: "what a project's sessions learned, shown to the next ones",
+        actions: &[],
     },
     BuiltIn {
         name: "profiles",
         description: "saved ways of starting an agent",
+        actions: &[],
     },
     BuiltIn {
         name: "github",
         description: "pull requests and issues, from GitHub or GitLab",
+        actions: &[],
     },
     BuiltIn {
         name: "flows",
         description: "chains of tasks on one goal, with gates",
+        actions: &[],
     },
     BuiltIn {
         name: "notifications",
         description: "a notification when a session needs you",
+        actions: &[],
+    },
+    BuiltIn {
+        name: "wiki",
+        description: "a page about each project's code, with diagrams and a chat, in the browser",
+        actions: &[
+            BuiltInAction {
+                id: "build",
+                title: "build the project's wiki",
+                args: &["wiki", "build"],
+            },
+            BuiltInAction {
+                id: "update",
+                title: "update it for what changed",
+                args: &["wiki", "update"],
+            },
+            BuiltInAction {
+                id: "open",
+                title: "open it in the browser",
+                args: &["wiki", "open"],
+            },
+        ],
     },
 ];
 
@@ -712,6 +752,64 @@ pub fn start_action(
     Ok((child, format!("{label}: {}", action.title)))
 }
 
+/// Starts the action `action` of crystal's own plugin `name` in the
+/// background: the crystal command it is, for the daemon at `socket`, run
+/// in `dir`. What it says on its standard error goes in the plugin's log,
+/// and what it prints is read by [`finish_built_in`]. Gives the child and
+/// what to call the action.
+pub fn start_built_in(
+    socket: &Path,
+    name: &str,
+    action: &str,
+    dir: &Path,
+) -> Result<(Child, String)> {
+    let plugin = (BUILT_IN.iter())
+        .find(|plugin| plugin.name == name)
+        .with_context(|| format!("{name} isn't one of crystal's own plugins"))?;
+    let action = (plugin.actions.iter())
+        .find(|each| each.id == action)
+        .with_context(|| format!("{name} has no action {action}"))?;
+    let id = Id::own(name);
+    log(
+        socket,
+        &id,
+        &format!("{}: crystal {}", action.id, action.args.join(" ")),
+    );
+    let child = Command::new(std::env::current_exe()?)
+        .arg("--socket")
+        .arg(socket)
+        .args(action.args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(open_log(socket, &id)?)
+        .spawn()
+        .with_context(|| format!("couldn't run crystal {}", action.args.join(" ")))?;
+    Ok((child, format!("{name}: {}", action.title)))
+}
+
+/// Waits for an action [`start_built_in`] started, putting what it
+/// printed in the plugin `name`'s log, and gives whether it worked and the
+/// last line it printed.
+pub fn finish_built_in(
+    socket: &Path,
+    name: &str,
+    mut child: Child,
+) -> Result<(bool, Option<String>)> {
+    use std::io::Read;
+    let mut printed = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut printed);
+    }
+    let status = child.wait()?;
+    for line in printed.lines() {
+        log(socket, &Id::own(name), line);
+    }
+    let last = printed.lines().rev().find(|line| !line.trim().is_empty());
+    let last = last.map(|line| crate::printable::line(line.trim()).into_owned());
+    Ok((status.success(), last))
+}
+
 /// The plugin `id`, the user's own or a project's, if it's there.
 pub fn find_id(id: &Id) -> Option<Installed> {
     let plugins = match &id.project {
@@ -1126,5 +1224,35 @@ mod tests {
         let state_var = Some(state.display().to_string());
         assert!(env.contains(&("CRYSTAL_PLUGIN_STATE_DIR".into(), state_var)));
         assert!(state.is_dir());
+    }
+
+    #[test]
+    fn the_wiki_runs_crystal_s_own_wiki_commands() {
+        let wiki = BUILT_IN
+            .iter()
+            .find(|plugin| plugin.name == "wiki")
+            .unwrap();
+        let actions: Vec<(&str, &[&str])> = (wiki.actions.iter())
+            .map(|action| (action.id, action.args))
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                ("build", &["wiki", "build"][..]),
+                ("update", &["wiki", "update"][..]),
+                ("open", &["wiki", "open"][..]),
+            ]
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("crystal.sock");
+        let refused = |name: &str, action: &str| {
+            let started = start_built_in(&socket, name, action, dir.path());
+            format!("{:#}", started.err().unwrap())
+        };
+        assert_eq!(refused("wiki", "burn"), "wiki has no action burn");
+        assert_eq!(
+            refused("todo", "open"),
+            "todo isn't one of crystal's own plugins"
+        );
     }
 }

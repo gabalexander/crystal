@@ -72,6 +72,9 @@ crystal layout                              # the TUI's tabs and how each splits
 crystal layout apply dev.json               # lay them out as a file says, starting what isn't there
 crystal skill --install                     # teach Claude Code to drive crystal
 crystal integration install                 # hooks or plugins for the agents installed here
+crystal wiki open                           # this project's wiki in your browser, served in the background
+crystal wiki serve                          # serve every project's wiki, and its chat, until ctrl+c
+crystal wiki export site                    # write the wiki out as a site, for GitHub Pages or a folder
 crystal mermaid docs/flow.md                # draw a page's mermaid diagrams as text
 crystal mermaid --open docs/flow.md         # or have mermaid draw them in your browser
 crystal ssh box                             # crystal's TUI on another machine
@@ -96,7 +99,7 @@ and `completions` in [installing crystal](install.md); `server` and `ssh` in [ot
 servers](servers.md); `config` and `profile` in [settings](configuration.md); `integration` in [agents you
 start yourself](agents.md#agents-you-start-yourself); `open` and `mermaid` in [files an agent shows
 you](code.md#files-an-agent-shows-you) and [the file finder](code.md#the-file-finder-and-the-tree-browser);
-and `guide` prints [the guide](guide.md).
+`wiki` in [the wiki](wiki.md); and `guide` prints [the guide](guide.md).
 
 A command whose output is cut short by what reads it, like `head -1` in `crystal ls | head -1` or `grep -m1
 task.closed` reading `crystal events --follow`, stops there and exits 0, saying nothing, so a script under `set

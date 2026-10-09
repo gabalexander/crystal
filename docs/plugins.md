@@ -3,7 +3,7 @@
 <sub>[← README](../README.md#documentation)</sub>
 
 Most of what crystal does beyond running sessions is a plugin you can switch off: tasks, handoff notes, the
-backlog, memory, profiles, GitHub and GitLab, flows and notifications. Plugins of your own add actions, panes
+backlog, memory, profiles, GitHub and GitLab, flows, notifications and the wiki. Plugins of your own add actions, panes
 over the TUI or among its panes, hooks on what happens, commands to run as the daemon starts and links to open
 their own way, and use crystal through its own command line, like any script would. A project can ship its own
 in its repository, which you turn on for it alone.
@@ -47,11 +47,13 @@ crystal plugin enable lint --project               # a plugin the project ships,
 | `github` | [pull requests and issues](code.md#pull-requests-and-issues), on GitHub or GitLab: their marks on worktree lines, `o`, `O` and `i`; switched off, crystal never runs `gh` or `glab` |
 | `flows` | [flows](flows.md): `g` and `f`, runs in the sidebar and the new-session panel, and `crystal flow` |
 | `notifications` | telling you when a session needs you, with a notification and a sound |
+| `wiki` | [the wiki](wiki.md): a page about each project's code in the browser, `crystal wiki`, and its actions in `X`: build, update and open |
 
 crystal's own plugins are on until you switch one off. Then everything it adds is gone: its keys (`?` stops
 listing them), what it shows in the sidebar and the new-session panel, what it tells agents, and the work it
 does in the background. Its commands still run, to say that it's off and how to turn it on. `X` in the TUI lists
-every plugin, and `Space` switches the one the bar is on, straight away. Either way it's written to the config
+every plugin, and `Space` switches the one the bar is on, straight away; `Enter` on one of its actions, like the
+wiki's, runs it in the background, in the selected session's worktree, and says how it went on the footer. Either way it's written to the config
 file, keeping your comments:
 
 ```toml

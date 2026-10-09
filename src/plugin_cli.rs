@@ -884,7 +884,10 @@ read -r _
 
 /// `crystal plugin log`.
 pub fn log(socket: &Path, id: &Id) -> Result<()> {
-    find(id)?;
+    // One of crystal's own logs what its actions printed.
+    if !plugins::is_built_in(&id.name) {
+        find(id)?;
+    }
     match fs::read_to_string(plugins::log_path(socket, id)) {
         Ok(text) => out!("{text}")?,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {

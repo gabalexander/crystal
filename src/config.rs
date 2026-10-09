@@ -93,6 +93,8 @@ pub struct Config {
     /// Whether the TUI says when a newer crystal is out: `[update]` in the
     /// file.
     pub update: UpdateSettings,
+    /// How the wiki's chat answers: `[wiki]` in the file.
+    pub wiki: WikiSettings,
     /// Saved ways to start an agent, offered first in the new-session
     /// panel: `[[profile]]` tables in the file. See [`crate::profile`].
     #[serde(rename = "profile", skip_serializing_if = "Vec::is_empty")]
@@ -944,6 +946,26 @@ impl Default for UpdateSettings {
     }
 }
 
+/// How the wiki's chat answers a question about the code: see
+/// [`crate::wiki_ask`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WikiSettings {
+    /// The model that answers, as `claude --model` takes it.
+    pub ask_model: String,
+    /// The most one question may spend, in US dollars.
+    pub ask_budget_usd: f64,
+}
+
+impl Default for WikiSettings {
+    fn default() -> WikiSettings {
+        WikiSettings {
+            ask_model: "sonnet".to_string(),
+            ask_budget_usd: 0.5,
+        }
+    }
+}
+
 /// What crystal does with sessions left alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1127,6 +1149,7 @@ impl Default for Config {
             forge: ForgeSettings::default(),
             sessions: SessionSettings::default(),
             update: UpdateSettings::default(),
+            wiki: WikiSettings::default(),
             profiles: Vec::new(),
             flows: Vec::new(),
             projects: Vec::new(),
@@ -1921,6 +1944,22 @@ back_to = "build"
     }
 
     #[test]
+    fn the_wiki_s_chat_answers_by_its_own_table() {
+        let wiki = parse("").unwrap().wiki;
+        assert_eq!(
+            (wiki.ask_model.as_str(), wiki.ask_budget_usd),
+            ("sonnet", 0.5)
+        );
+        let wiki = parse("[wiki]\nask_model = \"haiku\"\nask_budget_usd = 0.1\n");
+        let wiki = wiki.unwrap().wiki;
+        assert_eq!(
+            (wiki.ask_model.as_str(), wiki.ask_budget_usd),
+            ("haiku", 0.1)
+        );
+        assert!(parse("[wiki]\nask_budget = 1\n").is_err());
+    }
+
+    #[test]
     fn memory_embeds_here_unless_told_gemini_at_a_size_it_was_measured_at() {
         let memory = parse("").unwrap().memory;
         assert_eq!(memory.embedder, Embedder::Local);
@@ -2335,6 +2374,10 @@ back_to = "build"
                 restore_screens: true,
             },
             update: UpdateSettings { check: false },
+            wiki: WikiSettings {
+                ask_model: "opus".into(),
+                ask_budget_usd: 2.0,
+            },
             profiles: vec![Profile {
                 name: "review".into(),
                 description: Some("A second pair of eyes".into()),

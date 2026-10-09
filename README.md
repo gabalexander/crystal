@@ -119,6 +119,7 @@ what to start, the keys that matter most and what agents call.
 | [Flows](docs/flows.md) | chains of tasks on one goal, with gates where you look before it goes on |
 | [Memory](docs/memory.md) | what a project's sessions learned, what an agent is shown, search by meaning (here or with Gemini), the distiller |
 | [Events and the timeline](docs/events.md) | the event log, `crystal events`, listening on the socket, and the timeline |
+| [The wiki](docs/wiki.md) | a page about a project's code with its diagrams, in your browser, its chat, and exporting it as a site |
 | [Plugins](docs/plugins.md) | crystal's own and yours: actions, panes, hooks on events, link handlers, and the list of events |
 | [Settings](docs/configuration.md) | every setting, backups, themes, the tab bar and the window, the settings view, profiles |
 | [The command line](docs/cli.md) | every command at a glance, `crystal new` and `attach` |

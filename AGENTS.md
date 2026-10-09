@@ -159,8 +159,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `docs/`: the rest of the documentation, which the README lists, a page a topic: installing (`install.md`),
   the TUI (`tui.md`), its keys (`keys.md`), sessions, the command line (`cli.md`), projects and worktrees,
   diffs, files and pull requests (`code.md`), agents, agents driving agents (`driving.md`), tasks and the
-  backlog, flows, memory, events, plugins, settings (`configuration.md`), other machines and servers
-  (`servers.md`), how it works and the roadmap
+  backlog, flows, memory, the wiki (`wiki.md`), events, plugins, settings (`configuration.md`), other machines
+  and servers (`servers.md`), how it works and the roadmap
 - `packaging/homebrew/`: the Homebrew formula for a tap, `crystal.rb`, installing a release's archive for the
   machine, and `formula.sh`, which fills in a release's version and checksums; `flake.nix` builds crystal
   from source with Nix
@@ -393,11 +393,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     expired marked, the entry the bar is on with what's gone, the filter, the entry's file opened in the
     editor (Enter), in the worktree it was said in while that's there, forgetting and promoting after a `y`,
     its kind changed with `c` and the key of the kind, and its drawing
-  - `plugins_view.rs`: the plugins view (`X`): every plugin, on or off, with installed ones' actions, panes and
-    link handlers, and those the selected session's project ships under its name, which the view turns off
-    but leaves the command line to turn on; its keys and drawing; the event loop does the switching, runs
-    actions and opens plugins' panes where their manifests place them, through the layout commands for those
-    among the panes
+  - `plugins_view.rs`: the plugins view (`X`): every plugin, on or off, with crystal's own actions (the
+    wiki's), installed ones' actions, panes and link handlers, and those the selected session's project ships
+    under its name, which the view turns off but leaves the command line to turn on; its keys and drawing; the
+    event loop does the switching, runs actions and opens plugins' panes where their manifests place them,
+    through the layout commands for those among the panes
   - `timeline.rs`: the timeline (`a`, and `I` for the selected session's): the event log of everything or
     of one scope, a session, its task or its project, read back a page at a time, the newest first, and
     followed while it's open, `Ctrl+S` going through the selection's scopes, filtered as you type and by
@@ -637,6 +637,27 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/mermaid_cli.rs`: `crystal mermaid`: a diagram, or a markdown file's, drawn on standard output, in ASCII
   with `--ascii` or `mermaid_ascii`; or with `--open`, put on a page in the state directory, named by its hash,
   for mermaid to draw in the browser
+- `src/wiki.rs`: a project's wiki: where it's kept, a directory a project in the server's state (`wiki.json`,
+  `build.json`, `build.log`)
+- `src/wiki_server.rs`: `crystal wiki serve` and `open`: the wikis served on 127.0.0.1 with `std::net`, a thread
+  a connection and one request each: the list of wikis (a page, or JSON), a wiki's page, `wiki.json` and its
+  status (its build, and whether its branch moved on), the page's files by name among those built in, a
+  question streamed back, and a file in the repository opened in the user's editor (one with a window as it
+  is, a terminal's in a session of its own, focused in the TUI); a `Host` other than 127.0.0.1 or localhost
+  refused, and a question or an open from another site's page; `serve.json` saying which port, pid and crystal
+  serve a server's wikis, `open` starting one in the background (`serve --helper`, which stops once the daemon
+  has), stopping one of another crystal, and over ssh printing the address and the `ssh -L` line; the reading
+  and routing pure, so they're unit-tested
+- `src/wiki_ask.rs`: the wiki's chat: one `claude -p` a question in the project's main worktree, read only
+  (`dontAsk`, Read, Grep, Glob, `git log` and `git ls-files`), no MCP, no hooks, the user's settings alone,
+  `[wiki]`'s model and budget, the wiki's outline and the section read in full appended to its system prompt,
+  a follow-up resumed; its stream-json read into the page's events (`delta`, `tool`, `done`, `error`), sent as
+  server-sent events, a comment while it thinks, and it stopped once the page has gone; the reading pure, so
+  it's unit-tested
+- `src/wiki_site.rs`: the wiki's page as crystal ships it, `assets/wiki/` built in (a test keeps `PAGE_FILES`
+  the directory's files), mermaid downloaded once at a pinned version into the cache, its SHA-256 checked
+  (`CRYSTAL_NO_MERMAID_DOWNLOAD` keeps it from downloading), and `crystal wiki export`: `index.html` with the
+  wiki inlined, safe from its text, `wiki.json` and `assets/`
 - `src/spending.rs`: what background tasks have spent today, kept in the database by the day: the TUI footer's
   `$X today`, and what `daily_budget_usd` is held against
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends; their
@@ -835,7 +856,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/sound.rs`: the sounds (`assets/sounds/`, herdr's): which plays for an agent asking or done, the user's own
   files and the agents they're off for (`[sound]`), and playing one with the system's player, off the thread
   that asked, stopped if it hangs
-- `src/plugins.rs`: plugins: the registry of crystal's own, `enabled`, the gate every one of them goes through
+- `src/plugins.rs`: plugins: the registry of crystal's own, with the actions the plugins view runs for them
+  (crystal commands, in the background, what they print in the plugin's log), `enabled`, the gate every one of
+  them goes through
   (each module's `enabled` asks it), finding installed plugins and those a project ships in its
   `.crystal/plugins/` (each known by its `Id`, its name and the project's), why one can't run here (it doesn't
   fit, or its build failed) or be switched on, switching one in the config's `[plugins]`, or a project's in
