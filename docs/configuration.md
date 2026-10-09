@@ -53,6 +53,7 @@ that makes no sense is said there too, and the settings stay as they were until 
 | `[mouse]` | | `capture`, whether the TUI takes the mouse from your terminal (`true`); `copy_on_select`, whether a selection is copied as you let go or waits in copy mode for `y` (`true`); `scroll_lines`, how far a notch of the wheel scrolls a pane, up to 100, or how many arrow keys it sends a pager (`3`); `scrollbars`, a scrollbar beside each pane (`true`); `attach_capture`, whether `crystal attach` takes the mouse, for the wheel to scroll a session's history and a drag to select (`false`): [the mouse](tui.md#the-mouse) |
 | `[clipboard]` | | `allow_programs`, whether what a program in a session copies goes on your clipboard (`true`): [copying](tui.md#zoom-copy-mode-and-search) |
 | `[update]` | | `check`, whether the TUI looks once a day for a [newer crystal](install.md#updating) (`true`) |
+| `[wiki]` | | how the [wiki's chat](wiki.md#asking-about-the-code) answers: `ask_model`, the model, as `claude --model` takes it (`"sonnet"`), and `ask_budget_usd`, the most a question may spend (`0.5`) |
 
 `notify_command` is for telling you some other way, like a message to your phone. It runs with
 `CRYSTAL_NOTICE` (the line a notification would show), `CRYSTAL_NOTICE_SESSION` (the session's name),
@@ -71,7 +72,7 @@ does something a plugin adds, `[memory]` each time a task closes or a search run
 background task's run starts, `[handoff]` each time a note is written, `[sessions]` every 15 seconds and as it
 starts sessions again (`restore_screens` every second), a flow
 each time one starts, `[[project]]` each time a project's commands run,
-`name_from_prompt` and `name_by_agent` each time they name a session, `resume_reported_agents` as it starts
+`name_from_prompt` and `name_by_agent` each time they name a session, `[wiki]` each time a question is asked, `resume_reported_agents` as it starts
 sessions again,
 `[clipboard]` each time a program copies out of sight,
 `scrollback_lines` as each session starts and every 15 seconds for the sessions running, and `mermaid_ascii` as
@@ -262,7 +263,7 @@ bar.
 | Look | the [theme](#themes), whether it follows your system's appearance (the row says which theme each side is) and the theme for each side; the [tab bar](#terminals-the-window-and-the-tab-bar)'s place, whether it's left out with one tab, and its separator; the window's title; the [sidebar](tui.md#the-sidebar)'s width, whether it starts folded, what folding keeps, whether what needs you is pinned, whether what waits goes first ([the order](tui.md#the-order)), and how narrow a terminal shows [one column](tui.md#on-a-phone); whether keys pressed show at the footer (`show_keys`), and whether [mermaid diagrams](code.md#the-file-finder-and-the-tree-browser) are drawn in ASCII |
 | Sessions | what the [new-session panel](sessions.md#starting-a-session) offers first, naming sessions for their prompt, how long an agent may sit [idle](sessions.md#archiving-and-idle-agents) and whether a terminal is stopped too, whether an agent is kept warm for the next session, how far apart agents start again after a [crash or a reboot](sessions.md#after-a-restart) and whether one resumes as it said; a new terminal's shell, whether it's a login shell and where it starts; how much each session's history keeps, the running ones' too, and whether a terminal shows it again after a crash or a reboot; and the branch new worktrees start from, where they go and whether one its last session is killed from is removed |
 | Mouse | [the mouse](tui.md#the-mouse), and whether programs' copies go on [your clipboard](tui.md#zoom-copy-mode-and-search) |
-| Tasks | the permission mode [background tasks](tasks.md#background-tasks) start in, and what a run and a day may spend |
+| Tasks | the permission mode [background tasks](tasks.md#background-tasks) start in, and what a run and a day may spend; the model the [wiki's chat](wiki.md#asking-about-the-code) asks and what a question may spend |
 | Memory | how memory learns ([the distiller](memory.md#the-distiller), its model and what it may spend), whether it searches [by meaning](memory.md#search-by-meaning), with the model here or [Gemini](memory.md#gemini-instead-of-the-model-here) and at how many dimensions, and reranks, and whether Claude Code is shown what's known about a file as it reads it |
 | Integrations | the agents installed here that crystal can [hook](agents.md#hooks-in-other-agents-own-settings): below |
 | Keys | every key `[keys]` gives, each given by pressing it: below |
@@ -272,8 +273,8 @@ through them forward and back: the [themes](#themes) (the row says which of the 
 a notification, the times an agent may sit idle (off, 15 minutes, 30, an hour, two or eight), the spacing of
 restarts, the permission modes (`default`, `acceptEdits`, `auto`, `dontAsk` and `plan`), the budgets, and the
 rest. A setting that's text, like the window's title, the shell or the base branch, is typed in: `enter` opens
-it, `enter` again writes it, and `esc` leaves it as it was; emptied, a command, the agent, the base branch or the
-distiller's model goes back to its default. `del` on any row takes its line out of the file, for its default.
+it, `enter` again writes it, and `esc` leaves it as it was; emptied, a command, the agent, the base branch, the
+distiller's model or the wiki chat's goes back to its default. `del` on any row takes its line out of the file, for its default.
 Each change is written to the file at once, keeping the rest of it as you wrote it, comments and all, and counts
 straight away: the TUI repaints in a new theme, and the daemon reads the rest as it goes. A change crystal
 couldn't read isn't written, and the view says why. On a screen too short for a tab's rows, the view scrolls to

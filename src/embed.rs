@@ -779,8 +779,14 @@ pub fn as_embed(models: &Option<Shared>) -> Option<&dyn Embed> {
 
 /// Where the models are kept: crystal's models directory in its cache.
 pub fn models_dir() -> Option<PathBuf> {
+    Some(crystal_cache()?.join("models"))
+}
+
+/// crystal's directory in the user's cache, where what it downloads is
+/// kept: the models, and the wiki's mermaid.
+pub fn crystal_cache() -> Option<PathBuf> {
     let cache = cache_dir(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))?;
-    Some(cache.join("crystal").join("models"))
+    Some(cache.join("crystal"))
 }
 
 /// `$XDG_CACHE_HOME`, or else `~/.cache`.

@@ -12,7 +12,7 @@ pub(crate) mod appearance;
 mod archived_view;
 mod away;
 mod backlog_view;
-mod command_line;
+pub(crate) mod command_line;
 mod command_list;
 mod compose;
 pub(crate) mod copy_mode;
@@ -2985,6 +2985,9 @@ impl Tui {
     /// the plugin's log, and says how it went at the bottom.
     fn run_plugin(&mut self, plugin: &Id, action: &str, context: Context) -> Result<()> {
         let context = placed(context)?;
+        if plugins::is_built_in(&plugin.name) {
+            return self.run_built_in(&plugin.name, action, &context);
+        }
         let (mut child, what) = plugins::start_action(&self.socket, plugin, action, &context)?;
         let log = format!("crystal plugin log {}{}", plugin.name, plugin.flag());
         let events = self.events.clone();
@@ -2993,6 +2996,27 @@ impl Tui {
                 Ok(status) if status.success() => format!("ran {what}"),
                 Ok(status) => format!("{what} failed ({status}): `{log}`"),
                 Err(err) => format!("{what}: {err}"),
+            };
+            let _ = events.send(Event::Notice(notice));
+        });
+        Ok(())
+    }
+
+    /// Runs an action of crystal's own plugin `name` in the background, in
+    /// the worktree of `context`, saying how it went with the last line it
+    /// printed: the wiki's address, say.
+    fn run_built_in(&mut self, name: &str, action: &str, context: &Context) -> Result<()> {
+        let dir = context.worktree.clone().unwrap_or_default();
+        let child = plugins::start_built_in(&self.socket, name, action, &dir)?;
+        let (child, what) = child;
+        let (socket, name) = (self.socket.clone(), name.to_string());
+        let events = self.events.clone();
+        thread::spawn(move || {
+            let notice = match plugins::finish_built_in(&socket, &name, child) {
+                Ok((true, Some(said))) => format!("{what}: {said}"),
+                Ok((true, None)) => format!("ran {what}"),
+                Ok((false, _)) => format!("{what} failed: `crystal plugin log {name}`"),
+                Err(err) => format!("{what}: {err:#}"),
             };
             let _ = events.send(Event::Notice(notice));
         });
@@ -3444,7 +3468,13 @@ fn listed_plugins(
         project: None,
         on: plugins::enabled(config, plugin.name),
         trouble: None,
-        actions: Vec::new(),
+        actions: (plugin.actions.iter())
+            .map(|action| plugins_view::Item {
+                id: action.id.to_string(),
+                title: action.title.to_string(),
+                key: None,
+            })
+            .collect(),
         panes: Vec::new(),
         links: Vec::new(),
     });
@@ -3592,7 +3622,7 @@ fn start_dir(config: &Config) -> Option<PathBuf> {
 }
 
 /// `base`, or `base-2`, `base-3`, …, whichever no session has yet.
-fn free_name(base: &str, sessions: &[SessionInfo]) -> String {
+pub(crate) fn free_name(base: &str, sessions: &[SessionInfo]) -> String {
     let taken = |name: &str| sessions.iter().any(|session| session.name == name);
     let mut name = base.to_string();
     let mut number = 1;
@@ -3712,7 +3742,7 @@ fn write_history(path: &Path, text: &str) -> Result<()> {
 /// The user's editor, as a command line to put a file's path after:
 /// `$EDITOR`, which may carry its own arguments, like `code --wait`, or
 /// else `vi`.
-fn editor() -> Result<Vec<String>> {
+pub(crate) fn editor() -> Result<Vec<String>> {
     let editor = std::env::var("EDITOR").unwrap_or_default();
     let editor = if editor.trim().is_empty() {
         "vi".to_string()
@@ -3729,7 +3759,7 @@ fn editor() -> Result<Vec<String>> {
 /// The command that opens `path` in `editor` at `line`: `+12 path`, the way
 /// vi, Emacs, nano and most others take it, but for the editors that take
 /// `path:12`, and VS Code and those made from it, which want `--goto` too.
-fn editor_at(mut editor: Vec<String>, path: String, line: Option<usize>) -> Vec<String> {
+pub(crate) fn editor_at(mut editor: Vec<String>, path: String, line: Option<usize>) -> Vec<String> {
     let Some(line) = line else {
         editor.push(path);
         return editor;

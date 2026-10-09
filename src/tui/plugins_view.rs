@@ -233,15 +233,18 @@ fn is_heading(row: &Row) -> bool {
     matches!(row, Row::Heading(_) | Row::ProjectHeading(_))
 }
 
-/// The list's rows: crystal's own plugins, then the installed ones, then
-/// the project's, each with its actions and panes.
+/// The list's rows: crystal's own plugins, with their actions, then the
+/// installed ones, then the project's, each with its actions and panes.
 fn rows(plugins: &[Listed]) -> Vec<Row> {
     let mut rows = vec![Row::Heading("crystal's own")];
     let own = plugins
         .iter()
         .enumerate()
         .filter(|(_, plugin)| plugin.built_in);
-    rows.extend(own.map(|(index, _)| Row::Plugin(index)));
+    for (index, plugin) in own {
+        rows.push(Row::Plugin(index));
+        rows.extend((0..plugin.actions.len()).map(|action| Row::Action(index, action)));
+    }
     rows.push(Row::Heading("installed"));
     let installed = |plugin: &&Listed| !plugin.built_in && plugin.project.is_none();
     let projects = |plugin: &&Listed| plugin.project.is_some();
@@ -488,6 +491,31 @@ mod tests {
         }
         assert_eq!(press(&mut view, KeyCode::Enter), Outcome::Stay);
         assert_eq!(view.problem(), Some("todo is off: space turns it on"));
+    }
+
+    #[test]
+    fn one_of_crystal_s_own_runs_its_actions_while_it_s_on() {
+        let mut wiki = plugin("wiki", true, true);
+        wiki.actions.push(Item {
+            id: "open".into(),
+            title: "open it in the browser".into(),
+            key: None,
+        });
+        let mut view = PluginsView::new(vec![plugin("memory", true, true), wiki]);
+        press(&mut view, KeyCode::Down);
+        press(&mut view, KeyCode::Down);
+        assert_eq!(view.rows[view.selected], Row::Action(1, 0));
+        assert_eq!(
+            press(&mut view, KeyCode::Enter),
+            Outcome::Run {
+                plugin: "wiki".into(),
+                project: None,
+                action: "open".into()
+            }
+        );
+        view.plugins[1].on = false;
+        assert_eq!(press(&mut view, KeyCode::Enter), Outcome::Stay);
+        assert_eq!(view.problem(), Some("wiki is off: space turns it on"));
     }
 
     #[test]

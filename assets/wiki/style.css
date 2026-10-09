@@ -1,0 +1,11 @@
+/* A stand-in for the wiki's page until its own lands: enough to read it. */
+:root { color-scheme: dark; }
+body { margin: 0; background: #000; color: #fff; font: 14px/28px system-ui, sans-serif; display: flex; gap: 16px; padding: 16px; }
+main, aside { background: #131314; border-radius: 16px; padding: 16px 24px; }
+main { flex: 1; min-width: 0; }
+aside { width: 320px; align-self: flex-start; position: sticky; top: 16px; }
+a { color: #aecbfa; }
+code { font-size: 11px; color: #f1f3f4; background: #36373a; border-radius: 4px; padding: 4px; }
+.diagram { background: #303030; border-radius: 8px; padding: 16px; overflow: auto; }
+.muted { color: #9aa0a6; }
+input { width: 100%; box-sizing: border-box; padding: 8px; border-radius: 8px; border: 1px solid #444; background: #000; color: #fff; }
