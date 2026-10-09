@@ -292,6 +292,9 @@ runs the action its handlers give a link, to try them.
 | `project.added` | a project goes on crystal's list: `crystal project add`, or a session starting in it |
 | `project.removed` | a project is taken off it |
 | `project.focused` | the selection settles on a session in another project: its `from` is the project you were in |
+| `wiki.started` | a [build or an update](wiki.md#writing-it) of a project's wiki starts: its `wiki` has the `commit` it writes from, and whether it's an `update` |
+| `wiki.built` | it ends, the wiki written: its `wiki` says how many `sections` and `subsections` the wiki has, how many it wrote (`written`), what it cost (`cost_usd`) and how long it took (`seconds`) |
+| `wiki.failed` | it stops without writing the wiki, its `wiki`'s `failed` saying why; what it wrote is kept, and `crystal wiki build` carries on from there |
 
 A hook gets the event as a line of JSON on its standard input, the same as the [event log](events.md) keeps it,
 and its name in `CRYSTAL_EVENT`:

@@ -909,6 +909,17 @@
             }
           ],
           "description": "The tab it's about, as `crystal layout --json` has it: as it is now, or as it was, closed; for a session focused or moved, the tab it's in."
+        },
+        "wiki": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WikiAbout"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A build or an update of a project's wiki."
         }
       },
       "required": [
@@ -1187,6 +1198,18 @@
         {
           "const": "project.focused",
           "description": "the selection settles on a session in another project"
+        },
+        {
+          "const": "wiki.started",
+          "description": "a build or an update of a project's wiki starts"
+        },
+        {
+          "const": "wiki.built",
+          "description": "it ends, the wiki written"
+        },
+        {
+          "const": "wiki.failed",
+          "description": "it stops without writing the wiki, keeping what it wrote for the next to carry on"
         }
       ]
     },
@@ -8367,6 +8390,59 @@
         "task"
       ],
       "description": "What a warm agent is started as: what a new session that takes it over is started as, but for its first prompt, which is typed into it then."
+    },
+    "WikiAbout": {
+      "type": "object",
+      "properties": {
+        "commit": {
+          "type": "string"
+        },
+        "update": {
+          "type": "boolean",
+          "description": "Whether it writes only what changed since the wiki's commit.",
+          "default": false
+        },
+        "sections": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "subsections": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "written": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "description": "How many subsections it wrote.",
+          "default": 0
+        },
+        "cost_usd": {
+          "type": "number",
+          "format": "double",
+          "default": 0.0
+        },
+        "seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 0
+        },
+        "failed": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "commit"
+      ],
+      "description": "A build or an update of a project's wiki, as the events about it tell it: the commit it writes from, and once it has ended, how many sections and subsections the wiki has, how many it wrote, what it cost and how long it took; or why it failed."
     },
     "Worktree": {
       "type": "object",

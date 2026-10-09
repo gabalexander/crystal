@@ -916,15 +916,16 @@ enum Command {
         command: Option<AgentCommand>,
     },
     /// The wiki of a project's code, one page with its diagrams, in the
-    /// browser: serve the wikis of this server's projects, open one, or
-    /// write one out as a site of its own.
+    /// browser: write it, or what changed since, say how it stands, serve
+    /// the wikis of this server's projects, open one, or write one out as a
+    /// site of its own.
     Wiki {
         /// The project's directory [default: the current one]
         #[arg(short = 'C', long = "dir", value_name = "DIR", global = true)]
         dir: Option<PathBuf>,
 
         #[command(subcommand)]
-        command: WikiCommand,
+        command: Option<WikiCommand>,
     },
     /// Draw a mermaid diagram as text, the way crystal's previews draw it:
     /// a diagram, or each ```mermaid fence of a markdown file. One that
@@ -2081,6 +2082,39 @@ enum ProjectCommand {
 
 #[derive(Subcommand)]
 enum WikiCommand {
+    /// Write the project's wiki from its default branch: plan its outline,
+    /// write each subsection with its diagram, each section's summary and
+    /// the overview, check every link and diagram, and link the code. A
+    /// build stopped before it ended is carried on.
+    Build {
+        /// Start over, rather than carry on with a build that stopped
+        /// before it ended.
+        #[arg(long)]
+        fresh: bool,
+
+        #[command(flatten)]
+        how: wiki::cli::How,
+    },
+    /// Write again what changed since the wiki's commit: the subsections
+    /// whose files changed, and the summaries and the overview where their
+    /// meaning moved. A project with no wiki yet gets one built.
+    Update {
+        #[command(flatten)]
+        how: wiki::cli::How,
+
+        /// Run as the daemon runs it on its own: only with `[wiki]
+        /// auto_update` on and a wiki there already.
+        #[arg(long, hide = true)]
+        auto: bool,
+    },
+    /// How the project's wiki stands: when it was written, at which
+    /// commit, how far behind its default branch, what it has and what it
+    /// cost. What `crystal wiki` with no command does.
+    Status {
+        /// As JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Serve the wikis of this server's projects to the browser, on
     /// 127.0.0.1, with the chat that answers questions about their code,
     /// until it's stopped. Prints where.
@@ -2997,11 +3031,15 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Wiki { dir, command } => match command {
-            WikiCommand::Serve { port, open, helper } => {
+            Some(WikiCommand::Build { fresh, how }) => wiki::cli::build(&socket, dir, fresh, how)?,
+            Some(WikiCommand::Update { how, auto }) => wiki::cli::update(&socket, dir, how, auto)?,
+            Some(WikiCommand::Status { json }) => wiki::cli::status(&socket, dir, json)?,
+            None => wiki::cli::status(&socket, dir, false)?,
+            Some(WikiCommand::Serve { port, open, helper }) => {
                 wiki_server::serve(&socket, port, dir, open, helper)?
             }
-            WikiCommand::Open => wiki_server::open(&socket, dir)?,
-            WikiCommand::Export { out } => {
+            Some(WikiCommand::Open) => wiki_server::open(&socket, dir)?,
+            Some(WikiCommand::Export { out }) => {
                 plugins::ensure_enabled(&config::Config::load()?, "wiki")?;
                 wiki_site::export(&socket, dir, &out)?
             }

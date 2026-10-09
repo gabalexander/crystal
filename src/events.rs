@@ -97,10 +97,13 @@ pub enum Kind {
     ProjectAdded,
     ProjectRemoved,
     ProjectFocused,
+    WikiStarted,
+    WikiBuilt,
+    WikiFailed,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 67] = [
+    pub const ALL: [Kind; 70] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -168,6 +171,9 @@ impl Kind {
         Kind::ProjectAdded,
         Kind::ProjectRemoved,
         Kind::ProjectFocused,
+        Kind::WikiStarted,
+        Kind::WikiBuilt,
+        Kind::WikiFailed,
     ];
 
     /// Its name, which is how plugins, filters and the log know it.
@@ -240,6 +246,9 @@ impl Kind {
             Kind::ProjectAdded => "project.added",
             Kind::ProjectRemoved => "project.removed",
             Kind::ProjectFocused => "project.focused",
+            Kind::WikiStarted => "wiki.started",
+            Kind::WikiBuilt => "wiki.built",
+            Kind::WikiFailed => "wiki.failed",
         }
     }
 
@@ -324,6 +333,11 @@ impl Kind {
             Kind::ProjectAdded => "a project goes on crystal's list",
             Kind::ProjectRemoved => "a project is taken off it",
             Kind::ProjectFocused => "the selection settles on a session in another project",
+            Kind::WikiStarted => "a build or an update of a project's wiki starts",
+            Kind::WikiBuilt => "it ends, the wiki written",
+            Kind::WikiFailed => {
+                "it stops without writing the wiki, keeping what it wrote for the next to carry on"
+            }
         }
     }
 
@@ -443,6 +457,9 @@ pub struct Event {
     /// in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab: Option<TabLayout>,
+    /// A build or an update of a project's wiki.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wiki: Option<crate::wiki::About>,
 }
 
 /// The session an event is about, as it was then.
@@ -672,6 +689,7 @@ impl Event {
             distill: None,
             file: None,
             tab: None,
+            wiki: None,
         }
     }
 
@@ -1014,6 +1032,28 @@ impl Event {
         Event {
             superseded: Some(superseded),
             ..Event::memory(Kind::MemorySuperseded, project, holder)
+        }
+    }
+
+    /// A build or an update of `project`'s wiki started.
+    pub fn wiki_started(project: PathBuf, wiki: crate::wiki::About) -> Event {
+        Event {
+            wiki: Some(wiki),
+            ..Event::about_project(Kind::WikiStarted, project)
+        }
+    }
+
+    /// A build or an update of `project`'s wiki ended: written, or with
+    /// `wiki`'s `failed`, stopped.
+    pub fn wiki_ended(project: PathBuf, wiki: crate::wiki::About) -> Event {
+        let kind = if wiki.failed.is_some() {
+            Kind::WikiFailed
+        } else {
+            Kind::WikiBuilt
+        };
+        Event {
+            wiki: Some(wiki),
+            ..Event::about_project(kind, project)
         }
     }
 
@@ -1390,6 +1430,11 @@ impl Event {
                 .plugin
                 .as_ref()
                 .map_or(String::new(), |plugin| plugin.why.clone()),
+            Kind::WikiStarted | Kind::WikiBuilt | Kind::WikiFailed => {
+                self.wiki.as_ref().map_or(String::new(), |wiki| {
+                    wiki.line(self.kind == Kind::WikiStarted)
+                })
+            }
             Kind::DaemonHandedOver => self.daemon.as_ref().map_or(String::new(), |daemon| {
                 let from = self.from.as_deref().unwrap_or("?");
                 let sessions = match daemon.sessions {
@@ -1763,6 +1808,28 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             Event::backlog(kind, project::of(dir).path, item)
         }
         Kind::PluginPaused => Event::plugin_paused("example", "it failed 5 times in a row"),
+        Kind::WikiStarted => Event::wiki_started(
+            project::of(dir).path,
+            crate::wiki::About {
+                commit: "22ee18c82b0956c41604769ec94cf6dcb6580ccd".into(),
+                update: true,
+                ..crate::wiki::About::default()
+            },
+        ),
+        Kind::WikiBuilt | Kind::WikiFailed => Event::wiki_ended(
+            project::of(dir).path,
+            crate::wiki::About {
+                commit: "22ee18c82b0956c41604769ec94cf6dcb6580ccd".into(),
+                update: true,
+                sections: 12,
+                subsections: 64,
+                written: 3,
+                cost_usd: 0.84,
+                seconds: 95,
+                failed: (kind == Kind::WikiFailed)
+                    .then(|| "the build reached its budget of $30.00".to_string()),
+            },
+        ),
         Kind::DaemonHandedOver => Event::handed_over("0.3.0", "0.4.0", 3),
         Kind::DaemonRestarted => Event::restarted("0.4.0", 5, vec!["docs".into()]),
         Kind::TabCreated | Kind::TabClosed | Kind::TabFocused | Kind::LayoutUpdated => {

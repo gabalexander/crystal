@@ -93,7 +93,8 @@ pub struct Config {
     /// Whether the TUI says when a newer crystal is out: `[update]` in the
     /// file.
     pub update: UpdateSettings,
-    /// How the wiki's chat answers: `[wiki]` in the file.
+    /// How each project's wiki is written and asked about: `[wiki]` in
+    /// the file.
     pub wiki: WikiSettings,
     /// Saved ways to start an agent, offered first in the new-session
     /// panel: `[[profile]]` tables in the file. See [`crate::profile`].
@@ -946,12 +947,28 @@ impl Default for UpdateSettings {
     }
 }
 
-/// How the wiki's chat answers a question about the code: see
-/// [`crate::wiki_ask`].
+/// How each project's wiki is written, kept up to date and asked about:
+/// see [`crate::wiki`] and [`crate::wiki_ask`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WikiSettings {
-    /// The model that answers, as `claude --model` takes it.
+    /// The model that plans and writes it, as `claude --model` takes it.
+    pub model: String,
+    /// The most one `crystal wiki build` or `update` may spend, in US
+    /// dollars, by Claude's own count: one that reaches it stops, keeping
+    /// what it wrote, for the next to carry on.
+    pub budget_usd: f64,
+    /// How many of its writers write at once.
+    pub concurrency: usize,
+    /// Files left out of every wiki, as globs the way `.gitignore` writes
+    /// them: `vendor/`, `*.pb.go`, `docs/**/*.svg`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+    /// Update a project's wiki, once it has one, in the background as its
+    /// default branch moves.
+    pub auto_update: bool,
+    /// The model that answers the wiki's chat, as `claude --model` takes
+    /// it.
     pub ask_model: String,
     /// The most one question may spend, in US dollars.
     pub ask_budget_usd: f64,
@@ -960,9 +977,41 @@ pub struct WikiSettings {
 impl Default for WikiSettings {
     fn default() -> WikiSettings {
         WikiSettings {
+            model: "sonnet".to_string(),
+            budget_usd: 30.0,
+            concurrency: 4,
+            exclude: Vec::new(),
+            auto_update: true,
             ask_model: "sonnet".to_string(),
             ask_budget_usd: 0.5,
         }
+    }
+}
+
+/// How many of the wiki's writers may write at once.
+pub const WIKI_CONCURRENCY: std::ops::RangeInclusive<usize> = 1..=16;
+
+impl WikiSettings {
+    /// Refuses settings that make no sense.
+    pub fn check(&self) -> Result<()> {
+        if self.model.trim().is_empty() {
+            bail!("[wiki] model is empty: leave it out for sonnet");
+        }
+        if self.budget_usd.is_nan() || self.budget_usd <= 0.0 {
+            bail!("[wiki] budget_usd is {}: it's more than 0", self.budget_usd);
+        }
+        if !WIKI_CONCURRENCY.contains(&self.concurrency) {
+            bail!(
+                "[wiki] concurrency is {}: it's from {} to {}",
+                self.concurrency,
+                WIKI_CONCURRENCY.start(),
+                WIKI_CONCURRENCY.end()
+            );
+        }
+        if self.exclude.iter().any(|glob| glob.trim().is_empty()) {
+            bail!("[wiki] exclude has an empty glob");
+        }
+        Ok(())
     }
 }
 
@@ -1489,6 +1538,7 @@ pub fn from_text(text: &str) -> Result<Config> {
     config.tasks.check()?;
     config.worktrees.check()?;
     config.memory.check()?;
+    config.wiki.check()?;
     Keymap::new(&config.keys).map_err(anyhow::Error::msg)?;
     if !SIDEBAR_WIDTHS.contains(&config.sidebar.width) {
         bail!(
@@ -1944,6 +1994,28 @@ back_to = "build"
     }
 
     #[test]
+    fn the_wiki_is_written_by_sonnet_within_a_budget_a_few_writers_at_once() {
+        let wiki = parse("").unwrap().wiki;
+        assert_eq!((wiki.model.as_str(), wiki.budget_usd), ("sonnet", 30.0));
+        assert_eq!(wiki.concurrency, 4);
+        assert!(wiki.auto_update && wiki.exclude.is_empty());
+        let wiki = parse("[wiki]\nbudget_usd = 12.5\nexclude = [\"vendor/\", \"*.pb.go\"]\n")
+            .unwrap()
+            .wiki;
+        assert_eq!(wiki.budget_usd, 12.5);
+        assert_eq!(wiki.exclude, ["vendor/", "*.pb.go"]);
+        for wrong in [
+            "budget_usd = 0",
+            "concurrency = 0",
+            "concurrency = 40",
+            "model = \"\"",
+            "exclude = [\" \"]",
+        ] {
+            assert!(parse(&format!("[wiki]\n{wrong}\n")).is_err(), "{wrong}");
+        }
+    }
+
+    #[test]
     fn the_wiki_s_chat_answers_by_its_own_table() {
         let wiki = parse("").unwrap().wiki;
         assert_eq!(
@@ -2375,6 +2447,11 @@ back_to = "build"
             },
             update: UpdateSettings { check: false },
             wiki: WikiSettings {
+                model: "opus".into(),
+                budget_usd: 40.0,
+                concurrency: 6,
+                exclude: vec!["tests/fixtures/".into()],
+                auto_update: false,
                 ask_model: "opus".into(),
                 ask_budget_usd: 2.0,
             },

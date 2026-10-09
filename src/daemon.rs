@@ -156,6 +156,8 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
     let events = Arc::new(Bus::new(socket));
     let hooks = plugin_hooks::follow(&events, socket);
     worktree_hooks::follow(&events, socket);
+    // Wikis kept up to date as their default branches move.
+    crate::wiki::auto::follow(socket);
     // A rules file of the user's that can't be used is said in the log,
     // each time it's read.
     agent_rules::log_problems();

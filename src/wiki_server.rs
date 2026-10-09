@@ -892,7 +892,9 @@ fn status(dir: &Path, wiki: &Value) -> Value {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
     let build = build.unwrap_or(Value::Null);
     json!({
-        "building": build["building"].as_bool().unwrap_or(false),
+        // A build that was stopped never wrote down that it had: the lock
+        // it held says for sure.
+        "building": build["building"].as_bool().unwrap_or(false) && wiki::book::building(dir),
         "progress": build["progress"].as_str(),
         "updated": wiki["generated"]["at"].as_str(),
         "stale": stale(wiki),
@@ -1258,6 +1260,10 @@ mod tests {
             r#"{"building":true,"progress":"3/9 subsections"}"#,
         )
         .unwrap();
+        // Written down by a build that was stopped: none is building.
+        let status = super::status(dir.path(), &wiki);
+        assert_eq!(status["building"], json!(false));
+        let _held = wiki::book::lock(dir.path()).unwrap();
         let status = super::status(dir.path(), &wiki);
         assert_eq!(
             (status["building"].clone(), status["progress"].clone()),
