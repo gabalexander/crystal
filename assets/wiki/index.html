@@ -3,16 +3,176 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Wiki</title>
+<meta name="color-scheme" content="dark light">
+<meta name="referrer" content="no-referrer">
+<title>crystal wiki</title>
+<link rel="preload" href="assets/google-sans-flex.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="assets/style.css">
 </head>
-<body>
-<main id="page"><p class="muted">Loading the wiki…</p></main>
-<aside id="chat" hidden>
-  <div id="answers"></div>
-  <form id="ask"><input name="question" placeholder="Ask about this repository" autocomplete="off"></form>
-</aside>
-<script src="assets/mermaid.min.js"></script>
-<script src="assets/app.js"></script>
+<body class="loading">
+<svg width="0" height="0" class="sprite" aria-hidden="true">
+  <defs>
+    <linearGradient id="cw-g-spark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e8a17a"/>
+      <stop offset="1" stop-color="#d97757"/>
+    </linearGradient>
+    <linearGradient id="cw-g-gem-a" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8ab4f8"/><stop offset="1" stop-color="#4f7fe8"/></linearGradient>
+    <linearGradient id="cw-g-gem-b" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#c3e7ff"/><stop offset="1" stop-color="#7cc9ee"/></linearGradient>
+    <linearGradient id="cw-g-gem-c" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#d7aefb"/><stop offset="1" stop-color="#a66df2"/></linearGradient>
+    <linearGradient id="cw-g-gem-d" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5bb974"/><stop offset="1" stop-color="#1e8e7e"/></linearGradient>
+    <linearGradient id="cw-g-gem-e" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f6aea9"/><stop offset="1" stop-color="#ee675c"/></linearGradient>
+    <symbol id="cw-i-gem" viewBox="0 0 32 32">
+      <path d="M2 12 9 4l3 8z" fill="url(#cw-g-gem-a)"/>
+      <path d="M9 4h14l-3 8h-8z" fill="url(#cw-g-gem-b)"/>
+      <path d="M23 4l7 8H20z" fill="url(#cw-g-gem-c)"/>
+      <path d="M2 12h10l4 17z" fill="url(#cw-g-gem-d)"/>
+      <path d="M12 12h8l-4 17z" fill="url(#cw-g-gem-b)"/>
+      <path d="M20 12h10L16 29z" fill="url(#cw-g-gem-e)"/>
+    </symbol>
+    <symbol id="cw-i-spark" viewBox="0 0 24 24"><path d="M12 1.5c.5 5.6 4.9 10 10.5 10.5-5.6.5-10 4.9-10.5 10.5C11.5 16.9 7.1 12.5 1.5 12 7.1 11.5 11.5 7.1 12 1.5z"/></symbol>
+    <symbol id="cw-i-search" viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></symbol>
+    <symbol id="cw-i-moon" viewBox="0 0 24 24"><path d="M12 21q-3.75 0-6.375-2.625T3 12q0-3.75 2.625-6.375T12 3q.35 0 .688.025.337.025.662.075-1.025.725-1.637 1.887Q11.1 6.15 11.1 7.5q0 2.25 1.575 3.825Q14.25 12.9 16.5 12.9q1.375 0 2.525-.613 1.15-.612 1.875-1.637.05.325.075.662Q21 11.65 21 12q0 3.75-2.625 6.375T12 21zm0-2q2.2 0 3.95-1.212 1.75-1.213 2.55-3.163-.5.125-1 .2-.5.075-1 .075-3.075 0-5.238-2.162Q9.1 10.575 9.1 7.5q0-.5.075-1t.2-1q-1.95.8-3.163 2.55Q5 9.8 5 12q0 2.9 2.05 4.95Q9.1 19 12 19z"/></symbol>
+    <symbol id="cw-i-sun" viewBox="0 0 24 24"><path d="M12 15q1.25 0 2.125-.875T15 12q0-1.25-.875-2.125T12 9q-1.25 0-2.125.875T9 12q0 1.25.875 2.125T12 15zm0 2q-2.075 0-3.537-1.463Q7 14.075 7 12t1.463-3.537Q9.925 7 12 7t3.538 1.463Q17 9.925 17 12q0 2.075-1.462 3.537Q14.075 17 12 17zM2 13q-.425 0-.712-.288Q1 12.425 1 12t.288-.713Q1.575 11 2 11h2q.425 0 .713.287Q5 11.575 5 12t-.287.712Q4.425 13 4 13zm18 0q-.425 0-.712-.288Q19 12.425 19 12t.288-.713Q19.575 11 20 11h2q.425 0 .712.287.288.288.288.713t-.288.712Q22.425 13 22 13zm-8-8q-.425 0-.712-.288Q11 4.425 11 4V2q0-.425.288-.713Q11.575 1 12 1t.713.287Q13 1.575 13 2v2q0 .425-.287.712Q12.425 5 12 5zm0 18q-.425 0-.712-.288Q11 22.425 11 22v-2q0-.425.288-.712Q11.575 19 12 19t.713.288Q13 19.575 13 20v2q0 .425-.287.712Q12.425 23 12 23zM5.65 7.05 4.575 6q-.3-.275-.288-.7.013-.425.288-.725.3-.3.725-.3t.7.3L7.05 5.65q.275.3.275.7 0 .4-.275.7-.275.3-.687.287-.413-.012-.713-.287zM18 19.425l-1.05-1.075q-.275-.3-.275-.712 0-.413.275-.688.275-.3.688-.287.412.012.712.287L19.425 18q.3.275.288.7-.013.425-.288.725-.3.3-.725.3t-.7-.3zM16.95 7.05q-.3-.275-.287-.688.012-.412.287-.712L18 4.575q.275-.3.7-.288.425.013.725.288.3.3.3.725t-.3.7L18.35 7.05q-.3.275-.7.275-.4 0-.7-.275zM4.575 19.425q-.3-.3-.3-.725t.3-.7l1.075-1.05q.3-.275.713-.275.412 0 .687.275.3.275.288.688-.013.412-.288.712L6 19.425q-.275.3-.7.288-.425-.013-.725-.288z"/></symbol>
+    <symbol id="cw-i-contrast" viewBox="0 0 24 24"><path d="M12 22q-2.075 0-3.9-.788-1.825-.787-3.175-2.137-1.35-1.35-2.137-3.175Q2 14.075 2 12t.788-3.9q.787-1.825 2.137-3.175 1.35-1.35 3.175-2.138Q9.925 2 12 2t3.9.787q1.825.788 3.175 2.138 1.35 1.35 2.137 3.175Q22 9.925 22 12t-.788 3.9q-.787 1.825-2.137 3.175-1.35 1.35-3.175 2.137Q14.075 22 12 22zm1-2.075q2.975-.375 4.988-2.613Q20 15.075 20 12t-2.012-5.313Q15.975 4.45 13 4.075z"/></symbol>
+    <symbol id="cw-i-help" viewBox="0 0 24 24"><path d="M11.95 18q.525 0 .888-.363.362-.362.362-.887t-.362-.888q-.363-.362-.888-.362t-.887.362q-.363.363-.363.888t.363.887q.362.363.887.363zm-.9-3.85h1.85q0-.825.188-1.3.187-.475 1.062-1.3.65-.65 1.025-1.238.375-.587.375-1.412 0-1.4-1.025-2.15T12.1 6q-1.425 0-2.312.75-.888.75-1.238 1.8l1.65.65q.125-.45.563-.975Q11.2 7.7 12.1 7.7q.8 0 1.2.437.4.438.4.963 0 .5-.3.937-.3.438-.75.813-1.1.975-1.35 1.475-.25.5-.25 1.825zM12 22q-2.075 0-3.9-.788-1.825-.787-3.175-2.137-1.35-1.35-2.137-3.175Q2 14.075 2 12t.788-3.9q.787-1.825 2.137-3.175 1.35-1.35 3.175-2.138Q9.925 2 12 2t3.9.787q1.825.788 3.175 2.138 1.35 1.35 2.137 3.175Q22 9.925 22 12t-.788 3.9q-.787 1.825-2.137 3.175-1.35 1.35-3.175 2.137Q14.075 22 12 22zm0-2q3.35 0 5.675-2.325Q20 15.35 20 12q0-3.35-2.325-5.675Q15.35 4 12 4 8.65 4 6.325 6.325 4 8.65 4 12q0 3.35 2.325 5.675Q8.65 20 12 20z"/></symbol>
+    <symbol id="cw-i-share" viewBox="0 0 24 24"><path d="M18 22q-1.25 0-2.125-.875T15 19q0-.175.025-.363.025-.187.075-.337l-7.05-4.1q-.425.375-.95.588Q6.575 15 6 15q-1.25 0-2.125-.875T3 12q0-1.25.875-2.125T6 9q.575 0 1.1.212.525.213.95.588l7.05-4.1q-.05-.15-.075-.337Q15 5.175 15 5q0-1.25.875-2.125T18 2q1.25 0 2.125.875T21 5q0 1.25-.875 2.125T18 8q-.575 0-1.1-.213-.525-.212-.95-.587L8.9 11.3q.05.15.075.337Q9 11.825 9 12t-.025.362q-.025.188-.075.338l7.05 4.1q.425-.375.95-.588Q17.425 16 18 16q1.25 0 2.125.875T21 19q0 1.25-.875 2.125T18 22zm0-16q.425 0 .712-.287Q19 5.425 19 5t-.288-.713Q18.425 4 18 4t-.712.287Q17 4.575 17 5t.288.713Q17.575 6 18 6zM6 13q.425 0 .713-.288Q7 12.425 7 12t-.287-.713Q6.425 11 6 11t-.713.287Q5 11.575 5 12t.287.712Q5.575 13 6 13zm12 7q.425 0 .712-.288Q19 19.425 19 19t-.288-.712Q18.425 18 18 18t-.712.288Q17 18.575 17 19t.288.712Q17.575 20 18 20z"/></symbol>
+    <symbol id="cw-i-link" viewBox="0 0 24 24"><path d="M11 17H7q-2.075 0-3.537-1.463Q2 14.075 2 12t1.463-3.538Q4.925 7 7 7h4v2H7q-1.25 0-2.125.875T4 12q0 1.25.875 2.125T7 15h4zm-3-4v-2h8v2zm5 4v-2h4q1.25 0 2.125-.875T20 12q0-1.25-.875-2.125T17 9h-4V7h4q2.075 0 3.538 1.462Q22 9.925 22 12q0 2.075-1.462 3.537Q19.075 17 17 17z"/></symbol>
+    <symbol id="cw-i-zoom" viewBox="0 0 24 24"><path d="m19.6 21-6.3-6.3q-.75.6-1.725.95Q10.6 16 9.5 16q-2.725 0-4.612-1.887Q3 12.225 3 9.5q0-2.725 1.888-4.613Q6.775 3 9.5 3t4.613 1.887Q16 6.775 16 9.5q0 1.1-.35 2.075-.35.975-.95 1.725l6.3 6.3zM9.5 14q1.875 0 3.188-1.312Q14 11.375 14 9.5q0-1.875-1.312-3.188Q11.375 5 9.5 5 7.625 5 6.312 6.312 5 7.625 5 9.5q0 1.875 1.312 3.188Q7.625 14 9.5 14zm-1-1.5v-2h-2v-2h2v-2h2v2h2v2h-2v2z"/></symbol>
+    <symbol id="cw-i-zoom-out" viewBox="0 0 24 24"><path d="m19.6 21-6.3-6.3q-.75.6-1.725.95Q10.6 16 9.5 16q-2.725 0-4.612-1.887Q3 12.225 3 9.5q0-2.725 1.888-4.613Q6.775 3 9.5 3t4.613 1.887Q16 6.775 16 9.5q0 1.1-.35 2.075-.35.975-.95 1.725l6.3 6.3zM9.5 14q1.875 0 3.188-1.312Q14 11.375 14 9.5q0-1.875-1.312-3.188Q11.375 5 9.5 5 7.625 5 6.312 6.312 5 7.625 5 9.5q0 1.875 1.312 3.188Q7.625 14 9.5 14zm-3-3.5v-2h6v2z"/></symbol>
+    <symbol id="cw-i-fit" viewBox="0 0 24 24"><path d="M3 21v-6h2v2.6l3.1-3.1 1.4 1.4L6.4 19H9v2zm12 0v-2h2.6l-3.1-3.1 1.4-1.4 3.1 3.1V15h2v6zM8.1 9.5 5 6.4V9H3V3h6v2H6.4l3.1 3.1zm7.8 0-1.4-1.4L17.6 5H15V3h6v6h-2V6.4z"/></symbol>
+    <symbol id="cw-i-close" viewBox="0 0 24 24"><path d="M6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5l5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6z"/></symbol>
+    <symbol id="cw-i-panel" viewBox="0 0 24 24"><path d="M8 6l7 6-7 6z"/><path d="M18 4h2v16h-2z"/></symbol>
+    <symbol id="cw-i-send" viewBox="0 0 24 24"><path d="M3 20V4l19 8zm2-3 11.85-5L5 7v3.5l6 1.5-6 1.5zm0 0V7v6.5z"/></symbol>
+    <symbol id="cw-i-stop" viewBox="0 0 24 24"><path d="M7 7h10v10H7z"/></symbol>
+    <symbol id="cw-i-new" viewBox="0 0 24 24"><path d="M5 21q-.825 0-1.413-.587Q3 19.825 3 19V5q0-.825.587-1.413Q4.175 3 5 3h8.925l-2 2H5v14h14v-6.95l2-2V19q0 .825-.587 1.413Q19.825 21 19 21zm4-6v-4.25l9.175-9.175q.3-.3.675-.45.375-.15.75-.15.4 0 .763.15.362.15.662.45L22.425 3q.275.3.425.662.15.363.15.738t-.137.737q-.138.363-.438.663L13.25 15zM21.025 4.4l-1.4-1.4zM11 13h1.4l5.8-5.8-.7-.7-.725-.7L11 11.575zm6.5-6.5-.725-.7.725.7.7.7z"/></symbol>
+    <symbol id="cw-i-menu" viewBox="0 0 24 24"><path d="M3 18v-2h18v2zm0-5v-2h18v2zm0-5V6h18v2z"/></symbol>
+    <symbol id="cw-i-file" viewBox="0 0 24 24"><path d="M6 22q-.825 0-1.412-.587Q4 20.825 4 20V4q0-.825.588-1.413Q5.175 2 6 2h8l6 6v12q0 .825-.587 1.413Q18.825 22 18 22zm7-13V4H6v16h12V9zM6 4v5-5 16V4z"/></symbol>
+    <symbol id="cw-i-open" viewBox="0 0 24 24"><path d="M5 21q-.825 0-1.413-.587Q3 19.825 3 19V5q0-.825.587-1.413Q4.175 3 5 3h7v2H5v14h14v-7h2v7q0 .825-.587 1.413Q19.825 21 19 21zm4.7-5.3-1.4-1.4L17.6 5H14V3h7v7h-2V6.4z"/></symbol>
+    <symbol id="cw-i-github" viewBox="0 0 16 16"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></symbol>
+    <symbol id="cw-i-gitlab" viewBox="0 0 24 24"><path d="m23.6 9.6-.03-.09-3.26-8.5a.85.85 0 0 0-1.62.09l-2.2 6.74H7.5L5.3 1.1a.85.85 0 0 0-1.62-.09L.43 9.5l-.03.09a6.06 6.06 0 0 0 2 7l.01.01.03.02 4.98 3.73 2.46 1.86 1.5 1.13a1 1 0 0 0 1.22 0l1.5-1.13 2.46-1.86 5.01-3.75h.01a6.06 6.06 0 0 0 2.02-7z"/></symbol>
+  </defs>
+</svg>
+
+<a class="skip" href="#cw-doc-body">Skip to content</a>
+
+<header class="top">
+  <div class="brand">
+    <button class="round only-narrow" id="cw-outline-btn" type="button" aria-label="On this page" aria-controls="cw-outline" aria-expanded="false"><svg class="icon"><use href="#cw-i-menu"/></svg></button>
+    <a class="logo" id="cw-logo" aria-label="crystal wiki">
+      <svg class="logo-mark" aria-hidden="true"><use href="#cw-i-gem"/></svg>
+      <span class="logo-name">crystal</span><span class="logo-sub">wiki</span>
+    </a>
+  </div>
+  <div class="find" role="search">
+    <input id="cw-find" type="search" placeholder="Find repos and sections" autocomplete="off" spellcheck="false" aria-label="Find repos and sections" aria-controls="cw-find-results" aria-expanded="false" role="combobox" aria-autocomplete="list">
+    <svg class="icon find-icon" aria-hidden="true"><use href="#cw-i-search"/></svg>
+    <div class="find-results" id="cw-find-results" role="listbox" hidden></div>
+  </div>
+  <div class="actions">
+    <button class="round only-narrow phone-find" id="cw-find-btn" type="button" aria-label="Find" title="Find"><svg class="icon"><use href="#cw-i-search"/></svg></button>
+    <div class="menu-wrap">
+      <button class="round" id="cw-theme-btn" type="button" aria-label="Theme" aria-haspopup="menu" aria-expanded="false" title="Theme"><svg class="icon"><use href="#cw-i-moon"/></svg></button>
+      <div class="menu" id="cw-theme-menu" role="menu" hidden>
+        <button type="button" role="menuitemradio" data-theme="dark"><svg class="icon"><use href="#cw-i-moon"/></svg>Dark</button>
+        <button type="button" role="menuitemradio" data-theme="light"><svg class="icon"><use href="#cw-i-sun"/></svg>Light</button>
+        <button type="button" role="menuitemradio" data-theme="system"><svg class="icon"><use href="#cw-i-contrast"/></svg>System</button>
+      </div>
+    </div>
+    <button class="round" id="cw-help-btn" type="button" aria-label="Help" title="Help"><svg class="icon"><use href="#cw-i-help"/></svg></button>
+    <button class="pill" id="cw-share-btn" type="button" title="Copy a link to the section in view"><svg class="icon"><use href="#cw-i-share"/></svg><span>Share</span></button>
+    <button class="pill accent" id="cw-chat-btn" type="button" aria-controls="cw-chat" aria-pressed="true"><svg class="icon"><use href="#cw-i-spark"/></svg><span>Chat</span></button>
+  </div>
+</header>
+
+<div class="layout" id="cw-layout">
+  <nav class="outline" id="cw-outline" aria-label="On this page">
+    <div class="outline-title">On this page</div>
+    <ol class="outline-list" id="cw-outline-list"></ol>
+    <div class="outline-foot" id="cw-outline-foot">
+      <div class="foot-row"><span>Updated on</span><span id="cw-updated"></span></div>
+      <div class="foot-row"><span>Commit</span><span id="cw-commit"></span></div>
+      <div class="drawer-tools only-phone">
+        <button class="pill" type="button" data-act="theme"><svg class="icon"><use href="#cw-i-contrast"/></svg><span>Theme</span></button>
+        <button class="pill" type="button" data-act="help"><svg class="icon"><use href="#cw-i-help"/></svg><span>Help</span></button>
+      </div>
+      <p class="ai-note" id="cw-ai-note">Written by AI, which can make mistakes, so double-check it.</p>
+    </div>
+  </nav>
+  <div class="scrim" id="cw-scrim" hidden></div>
+
+  <main class="doc" id="cw-doc">
+    <div class="doc-head" id="cw-doc-head">
+      <h1 id="cw-title">crystal wiki</h1>
+      <span class="badge" id="cw-badge" hidden><svg class="icon"><use href="#cw-i-spark"/></svg>Made with Claude</span>
+      <span class="status" id="cw-status" hidden></span>
+      <a class="repo-link" id="cw-repo-link" hidden target="_blank" rel="noopener noreferrer"></a>
+    </div>
+    <div class="doc-body" id="cw-doc-body" tabindex="-1">
+      <div class="placeholder"><div class="spinner"></div></div>
+    </div>
+  </main>
+
+  <aside class="chat" id="cw-chat" aria-label="Chat about this repository">
+    <div class="chat-head">
+      <button class="round small" id="cw-chat-new" type="button" title="New conversation" aria-label="New conversation" hidden><svg class="icon"><use href="#cw-i-new"/></svg></button>
+      <button class="round small" id="cw-chat-close" type="button" title="Hide the chat" aria-label="Hide the chat"><svg class="icon"><use href="#cw-i-panel"/></svg></button>
+    </div>
+    <div class="chat-log" id="cw-chat-log" aria-live="polite">
+      <div class="chat-empty" id="cw-chat-empty">
+        <svg class="chat-spark" aria-hidden="true"><use href="#cw-i-spark"/></svg>
+        <div class="chat-hello">Hi there!</div>
+        <div class="chat-sub">Ask me any questions about the codebase</div>
+        <div class="chat-static" id="cw-chat-static" hidden>Asking needs <code>crystal wiki serve</code>, which reads the code to answer.</div>
+      </div>
+    </div>
+    <form class="chat-form" id="cw-chat-form">
+      <textarea id="cw-chat-input" rows="1" placeholder="Ask about this repository" aria-label="Ask about this repository"></textarea>
+      <button class="send" id="cw-chat-send" type="submit" aria-label="Ask" title="Ask"><svg class="icon"><use href="#cw-i-send"/></svg></button>
+    </form>
+    <p class="chat-note">Claude reads this repository to answer, and can make mistakes, so double-check it.</p>
+  </aside>
+</div>
+
+<dialog class="zoom" id="cw-zoom" aria-label="Diagram">
+  <div class="zoom-bar">
+    <div class="zoom-caption" id="cw-zoom-caption"></div>
+    <div class="zoom-tools">
+      <span class="zoom-hint">Drag to pan, ⌘ or Ctrl and scroll to zoom</span>
+      <button class="round small" id="cw-zoom-out" type="button" aria-label="Zoom out" title="Zoom out (−)"><svg class="icon"><use href="#cw-i-zoom-out"/></svg></button>
+      <button class="round small" id="cw-zoom-in" type="button" aria-label="Zoom in" title="Zoom in (+)"><svg class="icon"><use href="#cw-i-zoom"/></svg></button>
+      <button class="round small" id="cw-zoom-fit" type="button" aria-label="Fit" title="Fit (0)"><svg class="icon"><use href="#cw-i-fit"/></svg></button>
+      <button class="round close" id="cw-zoom-close" type="button" autofocus aria-label="Close" title="Close (Esc)"><svg class="icon"><use href="#cw-i-close"/></svg></button>
+    </div>
+  </div>
+  <div class="zoom-stage" id="cw-zoom-stage"><div class="zoom-content" id="cw-zoom-content"></div></div>
+</dialog>
+
+<dialog class="help" id="cw-help" aria-labelledby="cw-help-title">
+  <button class="round close" id="cw-help-close" type="button" aria-label="Close" title="Close (Esc)"><svg class="icon"><use href="#cw-i-close"/></svg></button>
+  <h2 id="cw-help-title">About this wiki</h2>
+  <p id="cw-help-made">crystal wrote this page about the repository from its code, with Claude.</p>
+  <h3>Reading it</h3>
+  <ul>
+    <li>The outline on the left follows you down the page; click an entry to go there.</li>
+    <li>Click a name in <code>code</code> to open the file at that line in your editor; <kbd>⌘</kbd> or <kbd>Ctrl</kbd> and click opens it on the forge, at the commit the page was made from.</li>
+    <li>The magnifier on a diagram opens it large: drag to move it, <kbd>⌘</kbd> or <kbd>Ctrl</kbd> and scroll (or pinch) to zoom.</li>
+    <li>Share copies a link to the section you're reading; the link beside each heading copies its own.</li>
+    <li>Chat answers questions about the code, reading it as it goes, with the section in view as context.</li>
+  </ul>
+  <h3>Keys</h3>
+  <dl class="keys">
+    <div><dt><kbd>/</kbd></dt><dd>Find a section or a repository</dd></div>
+    <div><dt><kbd>c</kbd></dt><dd>Show or hide the chat</dd></div>
+    <div><dt><kbd>j</kbd> <kbd>k</kbd></dt><dd>Next or previous section</dd></div>
+    <div><dt><kbd>Esc</kbd></dt><dd>Close what's open</dd></div>
+  </dl>
+  <h3>Keeping it fresh</h3>
+  <p><code>crystal wiki update</code> brings the page up to date with the code; <code>crystal wiki serve</code> shows it, with the chat; <code>crystal wiki export</code> writes it out as a static site.</p>
+</dialog>
+
+<div class="toast" id="cw-toast" role="status" aria-live="polite" hidden></div>
+
+<script src="assets/markdown.js" defer></script>
+<script src="assets/app.js" defer></script>
 </body>
 </html>

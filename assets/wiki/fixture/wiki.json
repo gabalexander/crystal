@@ -1,0 +1,244 @@
+{
+  "version": 1,
+  "repo": {
+    "name": "gabalexander/crystal",
+    "root": "/Users/you/src/crystal",
+    "commit": "22ee18c82b0956c41604769ec94cf6dcb6580ccd",
+    "branch": "master",
+    "web_url": "https://github.com/gabalexander/crystal",
+    "code_url": "https://github.com/gabalexander/crystal/blob/{commit}/{path}"
+  },
+  "generated": {
+    "at": "2026-10-09T12:00:00Z",
+    "by": "Claude Sonnet 5.5",
+    "model": "claude-sonnet-5-5",
+    "cost_usd": 4.2,
+    "crystal": "0.3.0"
+  },
+  "overview": {
+    "summary_md": "crystal is a terminal workspace for running many coding agents at once. A background daemon owns every agent's terminal, so an agent keeps working when its window closes, and one TUI shows them all: a sidebar listing each project, worktree and session with what the agent in it is doing, and the selected session live beside it.\n\nAgents report what they're doing through hooks crystal adds to them, or crystal reads it off their screens with a rules file per agent, so the sidebar can say which are working, which wait on you and which are done. Every command, [`crystal send`](code:src/drive.rs#L1) and [`crystal attach`](code:src/attach.rs#L1) among them, is a client of the daemon over a Unix socket, which is how one agent drives another.\n\nOn top of that sit tasks, work given to an agent that stays open until it runs `crystal done`; a memory of what each project's sessions learned, which agents are shown as they start and as they open a file; and an event log that scripts and plugins follow.\n\nRead on: [Sessions and the daemon](#sessions-and-the-daemon), [Knowing what agents do](#knowing-what-agents-do), [The TUI](#the-tui), and [Tasks, memory and events](#tasks-memory-and-events).\n",
+    "diagram": {
+      "mermaid": "flowchart TD\n  user[\"User<br/>(a terminal)\"] -->|keys, mouse| tui[\"TUI<br/>(src/tui/mod.rs)\"]\n  cli[\"crystal commands<br/>(src/main.rs)\"] -->|one JSON line each| sock[\"Unix socket<br/>(src/socket.rs)\"]\n  tui -->|requests, attach| sock\n  sock --> daemon[\"Daemon<br/>(src/daemon.rs)\"]\n  daemon -->|owns PTYs| sessions[\"Sessions<br/>(src/session.rs)\"]\n  sessions -->|run| agents[\"Agents<br/>(Claude Code, Codex, ...)\"]\n  agents -.->|crystal hook| daemon\n  daemon -->|emit| bus[\"Event bus<br/>(src/event_log.rs)\"]\n  bus -.->|subscribe| tui\n  bus -->|events hooks| plugins[\"Plugins<br/>(src/plugin_hooks.rs)\"]\n  daemon -->|state| db[\"SQLite<br/>(src/db.rs)\"]",
+      "caption": "crystal's daemon between its clients and the agents it runs"
+    }
+  },
+  "sections": [
+    {
+      "id": "sessions-and-the-daemon",
+      "title": "Sessions and the daemon",
+      "summary_md": "Everything crystal runs belongs to one long-lived process, the daemon, started by [`daemon::run`](code:src/daemon.rs#L130-L275). It listens on a Unix socket, owns a PTY for every session, keeps each session's screen up to date, and writes down what it needs to start them all again in its SQLite database ([`Db`](code:src/db.rs#L323)). The TUI and every command are clients: each connects, sends one request and reads one response, starting the daemon first if nobody is listening.\n\nBecause the daemon holds the terminals, closing the TUI, or the terminal it ran in, stops nothing. Upgrading crystal doesn't either: the daemon runs the new binary in its own process with `exec`, keeping its children and their descriptors, and the new crystal carries on from a state file the old one handed it.\n",
+      "diagram": {
+        "mermaid": "sequenceDiagram\n  participant Client as crystal (client)\n  participant Daemon as daemon\n  participant Session as session (PTY)\n  Client->>Daemon: Request, one JSON line\n  Daemon->>Daemon: same version? (Daemon::serve)\n  Daemon->>Session: spawn, write keys, read screen\n  Session-->>Daemon: output, exit status\n  Daemon-->>Client: Response, one JSON line",
+        "caption": "A request's trip from a client through the daemon to a session"
+      },
+      "subsections": [
+        {
+          "id": "the-daemon-and-its-socket",
+          "title": "The daemon and its socket",
+          "files": [
+            "src/daemon.rs",
+            "src/client.rs",
+            "src/protocol.rs",
+            "src/socket.rs"
+          ],
+          "diagram": {
+            "mermaid": "flowchart TD\n  conn[\"Connection<br/>(UnixListener::incoming)\"] -->|admitted by the gate| serve[\"Daemon::serve<br/>(src/daemon.rs)\"]\n  serve -->|another version| refuse[\"Response::Error<br/>(version_mismatch)\"]\n  serve -->|Attach| attach[\"attach<br/>(streams the screen)\"]\n  serve -->|Subscribe| events[\"stream_events<br/>(the event bus)\"]\n  serve -->|Handover| hand[\"hand_over<br/>(exec the new crystal)\"]\n  serve -->|anything else| handle[\"Daemon::handle<br/>(one response)\"]",
+            "caption": "How the daemon routes a request"
+          },
+          "body_md": "A client finds the socket with [`socket::chosen`](code:src/socket.rs#L25): `-S` and `--server` on the command line, then `CRYSTAL_SOCKET`, then `CRYSTAL_SERVER`, and otherwise the default server's socket in [`socket::dir`](code:src/socket.rs#L69). It asks with [`client::ask`](code:src/client.rs#L31), which writes the request as one line of JSON and reads one line back; asked to, it first starts the daemon with [`start_daemon`](code:src/client.rs#L703) and waits up to [`START_TIMEOUT`](code:src/client.rs#L26) for it to listen.\n\nThe daemon gets ready before it listens. [`daemon::run`](code:src/daemon.rs#L130-L275) leaves the client's terminal with `setsid`, opens the database (a daemon that can't keep its state doesn't start, rather than run with none and write over it), then binds the socket with [`listen`](code:src/daemon.rs#L283), which removes a socket left behind by a daemon that crashed but refuses one somebody still answers on. It starts the event bus, the plugins' hooks and the worktree hooks, puts the sessions written down back in their places, and then takes connections, each answered on a thread of its own by [`Daemon::answer`](code:src/daemon.rs#L383).\n\n[`Daemon::serve`](code:src/daemon.rs#L394-L459) reads the request with [`protocol::recv_request`](code:src/protocol.rs#L1943) and checks its version first: a crystal of another version gets [`version_mismatch`](code:src/daemon.rs#L4844)'s message telling the user to run `crystal restart-server`, except for a shutdown and a handover, which every version must understand. Most requests go to [`Daemon::handle`](code:src/daemon.rs#L2256) and get one [`Response`](code:src/protocol.rs#L732); a few take the connection over and answer as they go:\n\n| Request | What the connection becomes |\n|---|---|\n| `Attach` | the session's screen, then its output as it comes, and the viewer's keys back |\n| `Subscribe` | the events the filter takes, from [`Daemon::stream_events`](code:src/daemon.rs#L3378) |\n| `TakeLayoutOrders` | a TUI taking layout commands from the command line |\n| `WaitOutput` | a wait for a pattern on the session's screen |\n| `Handover` | the daemon handing itself over to a new crystal |\n\nEvery message is a variant of [`Request`](code:src/protocol.rs#L25) or [`Response`](code:src/protocol.rs#L732), and their JSON Schema, which a test keeps in step with the types, is [`docs/crystal-api.schema.json`](code:docs/crystal-api.schema.json).\n"
+        },
+        {
+          "id": "a-sessions-terminal-and-screen",
+          "title": "A session's terminal and screen",
+          "files": [
+            "src/session.rs",
+            "src/vt.rs",
+            "src/output_ring.rs",
+            "src/viewer.rs"
+          ],
+          "diagram": {
+            "mermaid": "flowchart LR\n  prog[\"Program<br/>(an agent or a shell)\"] -->|writes| pty[\"PTY master<br/>(portable_pty)\"]\n  pty -->|16 KiB reads| pump[\"Term::pump<br/>(src/session.rs)\"]\n  pump --> screen[\"vt::Screen<br/>(src/vt.rs)\"]\n  pump --> ring[\"OutputRing<br/>(src/output_ring.rs)\"]\n  pump -->|the same bytes| viewers[\"Viewers<br/>(src/viewer.rs)\"]\n  screen -.->|answers its questions| pty",
+            "caption": "Where a session's output goes"
+          },
+          "body_md": "[`Session::spawn`](code:src/session.rs#L466-L520) opens a PTY at [`UNSEEN_SIZE`](code:src/session.rs#L64), 120 columns by 40 rows, which stays its size until a viewer sizes it. The program starts with its environment cleared and set to the one [`env::for_session`](code:src/env.rs#L62) builds, which names the session in `CRYSTAL_SESSION` so its hooks can find it. The daemon drops its copy of the terminal's other end at once, so that the program's exit ends the output, and waits for the program by its pid, the same way a daemon it's handed over to does.\n\nA thread runs [`Term::pump`](code:src/session.rs#L2747-L2766) for each session, reading 16 KiB at a time through [`handover::readers`](code:src/handover.rs#L326), which a handover can stop mid-read. Each read goes through [`Screen::take`](code:src/session.rs#L2793) under the screen's lock:\n\n- the daemon's own [`vt::Screen`](code:src/vt.rs#L113), an `alacritty_terminal` grid with its history, takes it first; it's what `crystal read`, the rules that read agents' screens and a new viewer catching up all see;\n- the [`OutputRing`](code:src/output_ring.rs#L25) keeps the last [`MOST`](code:src/output_ring.rs#L15) bytes with a mark each second, for `crystal read --since` ([`OutputRing::since`](code:src/output_ring.rs#L108));\n- every [`Viewer`](code:src/viewer.rs#L13) gets the same bytes, so its own screen stays in step: `crystal attach` and the TUI's panes are both viewers.\n\nA program asking its terminal something (where the cursor is, what colours it has) is answered from the daemon's screen, and the answer written back to the PTY, so a program asks no viewer and never gets two answers. The screen also counts bells and keeps the last text a program asked to copy (OSC 52), for a viewer to pass on.\n"
+        },
+        {
+          "id": "handing-the-daemon-over",
+          "title": "Handing the daemon over",
+          "files": [
+            "src/handover.rs",
+            "src/daemon.rs",
+            "src/client.rs"
+          ],
+          "diagram": {
+            "mermaid": "flowchart TD\n  ask[\"crystal restart-server<br/>(src/client.rs)\"] -->|Request::Handover| check[\"handover::check<br/>(reads its FORMAT?)\"]\n  check -->|no| cold[\"Restart cold<br/>(sessions from SQLite)\"]\n  check -->|yes| gate[\"Gate::close<br/>(new connections wait)\"]\n  gate --> save[\"save_sessions_and_runs<br/>(src/db.rs)\"]\n  save --> state[\"handover::State<br/>(an unlinked file)\"]\n  state -->|exec, same pid| next[\"daemon::run<br/>(the new crystal)\"]\n  next --> adopt[\"take_over<br/>(Session::adopt)\"]\n  state -.->|exec fails| cold",
+            "caption": "What restart-server does to a running daemon"
+          },
+          "body_md": "`crystal restart-server` asks the running daemon to become the newly installed crystal: [`restart_daemon`](code:src/client.rs#L625) sends `Request::Handover` with the new binary and the [`FORMAT`](code:src/handover.rs#L52) it reads, from [`hand_over`](code:src/client.rs#L654). The daemon's side is [`Daemon::hand_over`](code:src/daemon.rs#L1054-L1092).\n\nWhat can be refused is refused before anything changes: [`handover::check`](code:src/handover.rs#L140) runs the new binary to ask which format it reads, and a different one sends the client back to restart the daemon cold, the way it always did. Otherwise the gate closes ([`Gate::close`](code:src/handover.rs#L391)): connections that come in now wait for the next crystal, and requests already being answered get up to [`HANDOVER_GRACE`](code:src/daemon.rs#L121) to finish.\n\n[`exec_handed_over`](code:src/daemon.rs#L1096-L1168) then gets everything ready:\n\n1. the sessions and flow runs are written to the database first, with [`save_sessions_and_runs`](code:src/db.rs#L477), so whatever goes wrong from here, the next daemon starts them again;\n2. helpers like the distiller are waited for, and every output reader is stopped;\n3. each session gives up what carries it on with [`Session::hand_over`](code:src/session.rs#L2116): its PTY's descriptor, its screen and history, its agent's state;\n4. all of it goes into a [`State`](code:src/handover.rs#L57), written by [`handover::write`](code:src/handover.rs#L154) to a file that's unlinked as soon as it's made, so the sessions' environments are never left on disk;\n5. the descriptors to keep are marked with [`keep_across_exec`](code:src/handover.rs#L183), and [`handover::exec`](code:src/handover.rs#L220) runs the new crystal in this process.\n\nThe pid stays the same, so every program the daemon started is still its child and waiting for one still says how it ended; the listening socket never closes, so a client only waits. The new crystal's [`daemon::run`](code:src/daemon.rs#L130) reads the state and calls [`take_over`](code:src/daemon.rs#L1174), which brings each session back with [`Session::adopt`](code:src/session.rs#L2179) and answers the clients that asked. herdr hands its sockets to a new process instead; that keeps the old daemon alive until the new one has taken over, but its programs stop being the daemon's children, which is why crystal execs.\n"
+        }
+      ]
+    },
+    {
+      "id": "knowing-what-agents-do",
+      "title": "Knowing what agents do",
+      "summary_md": "The sidebar's mark for a session, working, waiting on you, done, comes from two places. Agents that take hooks report as they go: crystal launches Claude Code with hooks of its own that run `crystal hook claude`, which tells the daemon each time a turn starts, a tool runs, a permission is asked for or the turn ends. Everything else, and what hooks never say (a turn cut short with Esc), is read off the agent's screen by a rules file for that agent.\n\nGoing the other way, `crystal send` types into an agent the way a person would, and watches that it took the text.\n",
+      "diagram": {
+        "mermaid": "flowchart LR\n  hooks[\"Hooks<br/>(src/hook.rs)\"] -->|AgentEvent| state[\"Session status<br/>(src/session.rs)\"]\n  rules[\"Screen rules<br/>(src/agent_rules.rs)\"] -->|Looks| state\n  state --> sidebar[\"Sidebar mark<br/>(src/tui/status.rs)\"]\n  state --> notify[\"Notifications<br/>(src/notify.rs)\"]\n  send[\"crystal send<br/>(src/drive.rs)\"] -->|typing| agent[\"Agent's PTY\"]",
+        "caption": "The two ways crystal learns what an agent is doing"
+      },
+      "subsections": [
+        {
+          "id": "hooks-tell-the-daemon",
+          "title": "Hooks tell the daemon",
+          "files": [
+            "src/agents.rs",
+            "src/hook.rs",
+            "src/subagents.rs",
+            "src/asking.rs"
+          ],
+          "diagram": {
+            "mermaid": "flowchart LR\n  claude[\"Claude Code<br/>(hooks via --settings)\"] -->|runs| hook[\"crystal hook claude<br/>(src/hook.rs)\"]\n  hook -->|stdin JSON| map[\"hook_event<br/>(src/agents.rs)\"]\n  map -->|request| daemon[\"Daemon<br/>(src/daemon.rs)\"]\n  daemon --> status[\"Status<br/>(working, asking, done)\"]\n  hook -.->|PreToolUse on a file| recall[\"Recall<br/>(src/recall.rs)\"]",
+            "caption": "A hook's trip from Claude Code to the session's status"
+          },
+          "body_md": "crystal adds its hooks to Claude Code with `--settings` as it builds the command line in [`agents::argv`](code:src/agents.rs#L135), so the user's settings files are never touched and their own hooks run alongside. It listens to the events in [`CLAUDE_HOOK_EVENTS`](code:src/agents.rs#L29-L38), each running the command [`hook_command`](code:src/agents.rs#L70) writes: `crystal hook claude`.\n\n[`hook::run`](code:src/hook.rs#L33) must never get in the agent's way, so it prints nothing unless what it prints is meant as input, and gives up quietly on any error. It finds its session from `CRYSTAL_SESSION` (outside crystal there's nobody to tell), reads the event's JSON from standard input, and tells the daemon. [`hook_event`](code:src/agents.rs#L390-L424) reads what each event means:\n\n| Claude Code's event | What it tells crystal |\n|---|---|\n| `UserPromptSubmit` | a turn started |\n| `PostToolUse` | a tool finished, so the agent is at work |\n| `PermissionRequest`, a `permission_prompt` notification | the agent is asking the user |\n| `Stop` | the turn ended |\n| `SubagentStart`, `SubagentStop` | a subagent started or stopped |\n\nA turn that ends with subagents still running isn't the agent done: [`Subagents`](code:src/subagents.rs#L47) holds the turn open until they've stopped and the agent hasn't taken their work up within [`DRAINED_FOR`](code:src/subagents.rs#L38). What the turn's last message said decides whether a session with its task open needs the user: [`asking::judge`](code:src/asking.rs#L105) reads it with no model, erring towards asking.\n\nOne hook works the other way. As Claude Code is about to read or edit a file with one of [`CLAUDE_FILE_TOOLS`](code:src/agents.rs#L43), its `PreToolUse` hook asks the daemon what the project's memory says about that file, and prints it as context for Claude to read (see [Project memory](#project-memory)).\n"
+        },
+        {
+          "id": "reading-the-screen",
+          "title": "Reading the screen",
+          "files": [
+            "src/agent_rules.rs",
+            "src/agent_screen.rs",
+            "agents/claude.toml"
+          ],
+          "diagram": {
+            "mermaid": "flowchart TD\n  screen[\"Rows, title, progress<br/>(vt::Screen)\"] --> read[\"agent_screen::read<br/>(src/agent_screen.rs)\"]\n  files[\"Rules files<br/>(agents/*.toml)\"] -->|Registry::load| registry[\"Registry<br/>(src/agent_rules.rs)\"]\n  registry -->|for_program| read\n  read -->|working, waiting, settled| watch[\"ScreenWatch<br/>(holds for two checks)\"]\n  watch -->|AgentEvent| status[\"Session status\"]",
+            "caption": "Reading an agent's state off its screen"
+          },
+          "body_md": "Agents draw tell-tale text while they work or wait: a spinner at the start of the terminal's title, \"esc to interrupt\" under the prompt, a question with numbered choices. That text changes between versions, so it isn't in the code: each agent has a rules file in `agents/`, adapted from herdr's detection rules, bundled into crystal by [`agent_rules::bundled`](code:src/agent_rules.rs#L907). A file of the user's own in the config's `agents` directory takes the place of the bundled one, or adds an agent; [`Registry::load`](code:src/agent_rules.rs#L779) reads them, and a broken one is said in the log and passed over.\n\nA rule says what the screen looks like when it matches (working, waiting or settled), how much it counts, where to look and what to look for. Claude Code's first rule, in [`agents/claude.toml`](code:agents/claude.toml#L7-L13), reads the spinner in the title:\n\n```toml\n[[rules]]\nid = \"osc_title_working\"\nlooks = \"working\"\npriority = 1100\nregion = \"title\"\nregex = ['^[\\x{2800}-\\x{28FF}\\x{25D0}-\\x{25D3}] ']\n```\n\n[`agent_screen::read`](code:src/agent_screen.rs#L31) finds the rules for the program in front ([`Registry::for_program`](code:src/agent_rules.rs#L850)) and [`AgentRules::read`](code:src/agent_rules.rs#L581) tries them by priority, giving one of the [`Looks`](code:src/agent_screen.rs#L18), or nothing when the screen says nothing either way, like a menu over the prompt. A [`ScreenWatch`](code:src/agent_screen.rs#L45) counts a new look only once it has held for two checks in a row, so a screen caught halfway through a redraw doesn't flip the session's mark.\n\n`crystal agent explain` shows a session's reading rule by rule, through [`AgentRules::explain`](code:src/agent_rules.rs#L593): which rules matched, which didn't and why.\n"
+        },
+        {
+          "id": "typing-into-an-agent",
+          "title": "Typing into an agent",
+          "files": [
+            "src/typing.rs",
+            "src/drive.rs",
+            "src/messages.rs"
+          ],
+          "diagram": {
+            "mermaid": "stateDiagram-v2\n  [*] --> Typed: text pasted\n  Typed --> Entered: Enter, after ENTER_PAUSE\n  Entered --> Taken: a turn starts, or the screen changes\n  Entered --> Entered: Enter again, up to ENTERS times\n  Entered --> Stalled: never taken\n  Taken --> [*]\n  Stalled --> [*]",
+            "caption": "How a send to an agent at its prompt goes"
+          },
+          "body_md": "A program can only tell typing from pasting by how fast the keys come, and agents like Claude Code take a burst of text ending in Enter for a paste: the Enter goes into the prompt instead of sending it. So [`typing::keystrokes`](code:src/typing.rs#L34) marks the text as a bracketed paste when the program asked for that, and the Enter goes on its own, [`ENTER_PAUSE`](code:src/typing.rs#L23) later.\n\nAn agent at its prompt doesn't always take what's typed: it may still be drawing, or a dialog may have opened over the prompt. A [`Delivery`](code:src/typing.rs#L142) watches what happens after the Enter. A turn starting, or the screen changing, means the agent took the text; neither means Enter again, up to [`ENTERS`](code:src/typing.rs#L119) times, and then the send is stalled, which `crystal send` exits 3 for, so a script can tell it from a timeout (2).\n\nAn agent crystal stopped for being idle is started again for a send to reach. [`Waking`](code:src/typing.rs#L81) decides when it's ready to be typed into: at its prompt, taking keys, its screen held still.\n\nWhat one session sends another goes through `src/messages.rs` first: the text tidied and cut to 8 KiB, a line ahead of it naming the session that sent it, at most 20 sends a minute, and a message that only acknowledges (`ok`, `thanks`) refused, so two agents can't thank each other forever.\n"
+        }
+      ]
+    },
+    {
+      "id": "the-tui",
+      "title": "The TUI",
+      "summary_md": "`crystal` with no command runs the TUI ([`tui::run`](code:src/tui/mod.rs#L409)): a sidebar with every session, the selected one live in a pane beside it, and any others split off into panes of their own, in tabs that each keep their own. It's one event loop over one channel of events. The state and how keys change it live in [`App`](code:src/tui/app.rs#L1325), which does no I/O, so every key can be tested; drawing only reads the state.\n",
+      "diagram": {
+        "mermaid": "flowchart LR\n  input[\"Input reader<br/>(crossterm)\"] -->|Key, Mouse, Paste| chan[\"One channel<br/>(src/tui/mod.rs)\"]\n  poller[\"Session poller<br/>(asks the daemon)\"] -->|Sessions| chan\n  panes[\"Pane viewers<br/>(src/tui/pane.rs)\"] -->|Output| chan\n  chan --> app[\"App<br/>(src/tui/app.rs)\"]\n  app -->|Action| io[\"The loop's I/O<br/>(start, attach, kill)\"]\n  app --> draw[\"ui::draw<br/>(src/tui/ui.rs)\"]",
+        "caption": "The TUI's event loop"
+      },
+      "subsections": [
+        {
+          "id": "the-event-loop-and-the-state",
+          "title": "The event loop and the state",
+          "files": [
+            "src/tui/mod.rs",
+            "src/tui/app.rs",
+            "src/tui/ui.rs"
+          ],
+          "diagram": {
+            "mermaid": "flowchart TD\n  key[\"Key pressed<br/>(Event::Key)\"] --> on_key[\"App::on_key<br/>(src/tui/app.rs)\"]\n  on_key -->|state only| state[\"App's state<br/>(tabs, selection, views)\"]\n  on_key -->|needs the world| action[\"Action<br/>(Start, Kill, Attach, ...)\"]\n  action --> loop[\"Event loop<br/>(src/tui/mod.rs)\"]\n  loop -->|request| daemon[\"Daemon\"]\n  state --> draw[\"ui::draw<br/>(reads, never writes)\"]",
+            "caption": "How a key becomes a change of state or an action"
+          },
+          "body_md": "[`tui::run`](code:src/tui/mod.rs#L409-L470) refuses to start without a terminal, loads the config, and lists the sessions, which starts the daemon if it isn't running. Then it starts the threads that feed its one `mpsc` channel of [`Event`](code:src/tui/mod.rs#L176)s: the input reader, the session poller, the forge poller for pull requests and issues, the worktree lister, the counter of each worktree's uncommitted changes, the resource poller, the config file's watcher, and a viewer for each pane.\n\nThe loop takes an event, updates the state and draws. A key goes to [`App::on_key`](code:src/tui/app.rs#L4092). Most keys only change the state: the selection, a view opened, a split resized. A key that needs the outside world comes back as an [`Action`](code:src/tui/app.rs#L431) instead, such as starting a session somewhere, killing one or opening a file in the editor, and the event loop carries it out. Keeping I/O out of `App` is what lets its thousands of lines of state changes be unit-tested without a daemon or a terminal.\n\n[`ui::draw`](code:src/tui/ui.rs#L489) lays out the tab bar, the sidebar, the panes and the footer from the state, without boxes: thin rules and the theme's colours tell the parts apart. Each pane's [`Pane`](code:src/tui/pane.rs#L19) is a viewer of its session, its own screen drawn with the screen widget, and copy mode over it while that's on.\n"
+        },
+        {
+          "id": "tabs-and-split-panes",
+          "title": "Tabs and split panes",
+          "files": [
+            "src/tui/tabs.rs",
+            "src/tui/split_tree.rs"
+          ],
+          "diagram": {
+            "mermaid": "classDiagram\n  class Tabs {\n    tabs: Vec~Tab~\n    current: usize\n  }\n  class Tab {\n    sessions: Vec~String~\n    selected: Option~String~\n    panes: SplitTree\n    floating: Option~String~\n  }\n  class SplitTree {\n    layout(area)\n    split(at, way, ratio, new)\n    close(pane)\n    resize(pane, toward, cells)\n  }\n  class Pane {\n    Selection\n    Session(name)\n  }\n  Tabs \"1\" --> \"many\" Tab\n  Tab --> SplitTree\n  SplitTree --> Pane",
+            "caption": "Tabs, their split trees and panes"
+          },
+          "body_md": "Each [`Tab`](code:src/tui/tabs.rs#L29-L60) is a space of its own: its sessions (every session is in exactly one tab), its selection, its tree of panes and the session floating over them. [`Tabs`](code:src/tui/tabs.rs#L160) keeps them in order with the one in front. The sidebar shows only the front tab's sessions, so going to another tab changes what the sidebar lists. Tabs are kept in the database as a JSON document; [`tabs::read`](code:src/tui/tabs.rs#L450) also reads the shape from before panes were a tree.\n\nA tab's panes are a [`SplitTree`](code:src/tui/split_tree.rs#L99): each split cuts its room in two, side by side or one above the other ([`Way`](code:src/tui/split_tree.rs#L38)), at a ratio, as deep as the user likes. One [`Pane`](code:src/tui/split_tree.rs#L26) follows the sidebar's selection; each of the others keeps a session of its own.\n\n- [`SplitTree::layout`](code:src/tui/split_tree.rs#L199) gives each pane its rectangle for an area of the screen;\n- [`SplitTree::split`](code:src/tui/split_tree.rs#L241) and [`SplitTree::close`](code:src/tui/split_tree.rs#L256) change the tree, a closed pane's sibling taking its room;\n- [`SplitTree::resize`](code:src/tui/split_tree.rs#L344) moves the nearest border on the way asked, within each pane's least size.\n\nAll of it is pure, so it's unit-tested, and folds into a value the database keeps.\n"
+        },
+        {
+          "id": "the-sidebar",
+          "title": "The sidebar",
+          "files": [
+            "src/tui/sidebar.rs",
+            "src/tui/groups.rs",
+            "src/tui/rows.rs",
+            "src/tui/status.rs"
+          ],
+          "diagram": {
+            "mermaid": "flowchart TD\n  list[\"SessionInfo list<br/>(from the daemon)\"] --> order[\"groups::order<br/>(attention or stable, by hand)\"]\n  order --> rows[\"groups::rows<br/>(project, worktree, session)\"]\n  layout[\"sidebar rows setting<br/>(src/tui/rows.rs)\"] --> draw[\"sidebar::draw<br/>(src/tui/sidebar.rs)\"]\n  rows --> draw\n  draw --> marks[\"session_mark and ago<br/>(what it does, since when)\"]",
+            "caption": "From the daemon's list of sessions to the sidebar's rows"
+          },
+          "body_md": "The sidebar lists every session of the front tab under its project, then its worktree. [`groups::order`](code:src/tui/groups.rs#L190) sorts them: agents before terminals in each worktree, then by attention (those needing the user first) or stable, as `[sidebar] order` says, then as the user moved projects and sessions by hand ([`ByHand`](code:src/tui/groups.rs#L108)), then as they were made. [`groups::rows`](code:src/tui/groups.rs#L246) turns that into [`Row`](code:src/tui/groups.rs#L31)s: headings, worktree lines, sessions, each flow run's steps under it, and linked worktrees with nothing running at the end of their project.\n\n[`sidebar::draw`](code:src/tui/sidebar.rs#L61) draws them. Each session gets a mark for what it's doing from [`session_mark`](code:src/tui/sidebar.rs#L1438) and how long ago that changed from [`ago`](code:src/tui/sidebar.rs#L1561); sessions that need the user are also pinned at the top, with the tab each is in. What goes on a session's lines is the user's to lay out: `[sidebar] rows` names tokens like the agent's model, the branch or the task, read and checked in `src/tui/rows.rs`, and whatever doesn't fit the width is left out rather than wrapped.\n"
+        }
+      ]
+    },
+    {
+      "id": "tasks-memory-and-events",
+      "title": "Tasks, memory and events",
+      "summary_md": "Three things are built on the sessions. A task is a session started with something to do, numbered like `t12`, which stays open until its agent runs `crystal done`. The memory keeps what each project's sessions learned, distilled from what a closed task did, and shows it to the agents that come after. And everything that happens is an event, numbered, written to a log, streamed to subscribers and handed to plugins.\n",
+      "diagram": {
+        "mermaid": "flowchart LR\n  task[\"Task<br/>(src/tasks.rs)\"] -->|crystal done| closed[\"Closed task<br/>(src/work.rs)\"]\n  closed -->|transcript| distill[\"Distiller<br/>(src/distill.rs)\"]\n  distill -->|lessons| memory[\"Memory<br/>(src/memory.rs)\"]\n  memory -.->|recall on a file| agent[\"The next agent\"]\n  closed -->|task.closed| bus[\"Event bus<br/>(src/event_log.rs)\"]\n  bus --> plugins[\"Plugins<br/>(src/plugin_hooks.rs)\"]",
+        "caption": "How a closed task feeds the memory and the event log"
+      },
+      "subsections": [
+        {
+          "id": "tasks-and-crystal-done",
+          "title": "Tasks and crystal done",
+          "files": [
+            "src/tasks.rs",
+            "src/work.rs",
+            "src/task.rs",
+            "src/claude_stream.rs"
+          ],
+          "diagram": {
+            "mermaid": "flowchart TD\n  new[\"crystal tasks new<br/>(src/work.rs)\"] -->|numbered t12| start[\"Session with a task<br/>(src/daemon.rs)\"]\n  start -->|told about crystal done| agent[\"Agent works\"]\n  agent -->|turn ends, task open| remind[\"REMINDER<br/>(src/tasks.rs)\"]\n  remind --> agent\n  agent -->|crystal done| close[\"Request::Close<br/>(work::done)\"]\n  close --> history[\"Project history<br/>(src/db.rs)\"]",
+            "caption": "A task's life"
+          },
+          "body_md": "A task is told about closing itself as it starts: [`tasks::instructions`](code:src/tasks.rs#L48) writes the paragraph its agent reads, and acceptance criteria given with `--accept` go under the goal ([`with_criteria`](code:src/tasks.rs#L121)), at most [`MAX_CRITERIA_BYTES`](code:src/tasks.rs#L80) of them. An agent that ends a turn with its task still open and says nothing clear is sent the [`REMINDER`](code:src/tasks.rs#L70) through its `Stop` hook, once.\n\n[`work::done`](code:src/work.rs#L31-L53) is what the agent runs: it finds its own session, makes any `--artifact` paths absolute (the daemon reads them, wherever it runs) and sends `Request::Close`. The daemon closes the task, keeps the artifacts beside it, writes it into the project's history, tells `task.closed`, and has the distiller read what was done.\n\nA background task is Claude Code with no terminal at all. [`Task`](code:src/task.rs#L65) runs `claude -p` with the arguments in [`claude_stream::ARGS`](code:src/claude_stream.rs#L34), writing the prompt and every follow-up to its standard input and reading its stream-json events back ([`claude_stream::read`](code:src/claude_stream.rs#L145)), which it draws as a transcript on the session's screen. A permission Claude asks for arrives as a [`PermissionRequest`](code:src/claude_stream.rs#L127), goes to the user like any other session's question, and their answer goes back as a control message ([`claude_stream::answer`](code:src/claude_stream.rs#L82)).\n"
+        },
+        {
+          "id": "project-memory",
+          "title": "Project memory",
+          "files": [
+            "src/memory.rs",
+            "src/distill.rs",
+            "src/recall.rs",
+            "src/mcp.rs"
+          ],
+          "diagram": {
+            "mermaid": "flowchart TD\n  closed[\"Closed task<br/>(transcript)\"] --> run[\"distill::run<br/>(claude -p, Haiku)\"]\n  run -->|at most MAX_DISTILLED| add[\"Store::add<br/>(src/memory.rs)\"]\n  add -->|same said again| seen[\"Seen again<br/>(no new entry)\"]\n  add -->|corrects an older one| retire[\"Store::retire / update\"]\n  add --> fts[\"FTS5 index + vectors\"]\n  fts -->|search| mcp[\"memory_search<br/>(src/mcp.rs)\"]\n  fts -->|about_file| recall[\"Recall<br/>(src/recall.rs)\"]",
+            "caption": "How lessons get into the memory and back out"
+          },
+          "body_md": "Every project's entries live in one SQLite database in crystal's state directory, the [`Store`](code:src/memory.rs#L964), with an FTS5 index ranked by bm25 so a search finds an entry by any of its words or a word they stem from; with search by meaning on, each entry also has a vector, and the two rankings are merged. Anyone can add: the user, an agent with `crystal remember`, and the distiller. [`Store::add`](code:src/memory.rs#L993) never keeps the same thing twice: said again, in the same words or (with the models) in others, it's the one entry seen again.\n\nThe distiller runs after a task closes. [`distill::run`](code:src/distill.rs#L733) hands a tool-less `claude -p` the end of the transcript and the entries nearest in meaning to what the session said, with [`SYSTEM_PROMPT`](code:src/distill.rs#L157) telling it to keep lessons alone (decisions, gotchas, commands that work) and never progress or status. It keeps at most [`MAX_DISTILLED`](code:src/distill.rs#L62) and gives up after [`TIMEOUT`](code:src/distill.rs#L69). What it keeps can correct what was kept before: an older entry is rewritten in place ([`Store::update`](code:src/memory.rs#L1244)) or retired for the new one ([`Store::retire`](code:src/memory.rs#L1319)), kept apart with why.\n\nAgents get it back three ways: a paragraph of the most relevant entries as they start; the `memory_search` and `memory_show` tools of [`crystal mcp`](code:src/mcp.rs#L1); and recall, as Claude Code opens a file. Recall asks [`Store::about_file`](code:src/memory.rs#L2090) for the few entries about that file the session hasn't been shown yet ([`Recalled`](code:src/recall.rs#L54) remembers what it was shown), and waits at most [`recall::WAIT`](code:src/recall.rs#L47) so a slow lookup never holds the agent up.\n"
+        },
+        {
+          "id": "events-and-plugins",
+          "title": "Events and plugins",
+          "files": [
+            "src/events.rs",
+            "src/event_log.rs",
+            "src/plugin_hooks.rs"
+          ],
+          "diagram": {
+            "mermaid": "flowchart LR\n  daemon[\"Daemon<br/>(src/daemon.rs)\"] -->|emit| bus[\"Bus::emit<br/>(src/event_log.rs)\"]\n  bus -->|seq, add_event| log[\"events table<br/>(src/db.rs)\"]\n  bus -->|filter matches| subs[\"Subscribers<br/>(TUI, crystal events)\"]\n  bus -->|its own thread| hooks[\"Plugin hooks<br/>(src/plugin_hooks.rs)\"]\n  hooks -->|stdin, CRYSTAL_EVENT_JSON| plugin[\"A plugin's command\"]\n  subs -.->|falls behind| dropped[\"Dropped\"]",
+            "caption": "Where an event goes"
+          },
+          "body_md": "Whatever happens to a session, a task, a flow, a worktree, the memory or the backlog is an [`Event`](code:src/events.rs#L378) of some [`Kind`](code:src/events.rs#L32). The kinds are a public contract plugins listen for: a kind is added, never renamed, and a test keeps the table of them in `docs/plugins.md` in step with the code.\n\nEvery event goes through the daemon's one [`Bus`](code:src/event_log.rs#L49). [`Bus::emit`](code:src/event_log.rs#L113-L135) numbers it with a `seq` that never goes back, stamps the time, writes it to the `events` table, and offers it to each subscriber whose filter takes it. A subscriber too slow to keep up, its [`BACKLOG`](code:src/event_log.rs#L35) full, is dropped rather than allowed to hold the daemon up; it reconnects and asks for what it missed by `seq`. The log is pruned by age every [`PRUNE_EVERY`](code:src/event_log.rs#L31) and kept to [`MOST`](code:src/event_log.rs#L28) events.\n\nSubscribers are the TUI, `crystal events --follow`, `crystal wait` and the plugins. [`plugin_hooks::follow`](code:src/plugin_hooks.rs#L48) subscribes for them: each plugin's `[[events]]` hooks run one at a time on a thread of the plugin's own, so a slow plugin delays only itself, with the event as JSON on standard input, in `CRYSTAL_EVENT_JSON`, and in words in `CRYSTAL_EVENT_TEXT`. A plugin whose hooks fail [`FAILURES_TO_PAUSE`](code:src/plugin_hooks.rs#L42) times in a row is paused, with a `plugin.paused` event saying so.\n"
+        }
+      ]
+    }
+  ]
+}

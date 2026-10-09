@@ -658,6 +658,12 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   the directory's files), mermaid downloaded once at a pinned version into the cache, its SHA-256 checked
   (`CRYSTAL_NO_MERMAID_DOWNLOAD` keeps it from downloading), and `crystal wiki export`: `index.html` with the
   wiki inlined, safe from its text, `wiki.json` and `assets/`
+- `assets/wiki/`: the wiki's page, after Google's Code Wiki, plain HTML, CSS and JavaScript: the outline following
+  the reader, diagram cards drawn by mermaid as they come near and zoomed with pan and zoom, Find, Share, the
+  theme, the chat's answers streaming in, a phone's one column; `markdown.js`, a small, safe renderer of the
+  wiki's markdown and its `code:` links; its fonts under the OFL; and, not built in, `fixture/wiki.json` (a
+  wiki about crystal by hand), `dev/` (a stand-in server, a synthetic wiki, a timing in headless Chrome) and
+  `test/markdown.test.js`; see its README
 - `src/spending.rs`: what background tasks have spent today, kept in the database by the day: the TUI footer's
   `$X today`, and what `daily_budget_usd` is held against
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends; their
@@ -920,6 +926,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   frame scrubbed of them last, since ratatui hands a zero-width one on to the terminal. A background task's
   transcript, the window's title, notifications, session names, reports, the backlog, memory and what the CLI
   prints for people go through it
+- `tests/wiki_web.rs`: the wiki's page: its files referring to one another, the fixture and the synthetic wiki
+  keeping to the contract of a `wiki.json`, and the markdown renderer's checks under node, where it's installed
 - `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon (and read its database
   beside its socket to see what it wrote down), every command they run without the `CRYSTAL_*` variables of a
   crystal session they may be run in (`outside_crystal`), with a config of

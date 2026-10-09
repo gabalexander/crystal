@@ -23,11 +23,35 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
-/// The page's own files, by their names under `assets/`.
+/// The page's own files, by their names under `assets/`: the page, its
+/// markdown renderer, its script and stylesheet, and its fonts with their
+/// licences (Google Sans Flex and Google Sans Code, under the SIL Open Font
+/// License, which asks that the licence go with them).
 pub const PAGE_FILES: &[(&str, &[u8])] = &[
     ("index.html", include_bytes!("../assets/wiki/index.html")),
     ("app.js", include_bytes!("../assets/wiki/app.js")),
+    ("markdown.js", include_bytes!("../assets/wiki/markdown.js")),
     ("style.css", include_bytes!("../assets/wiki/style.css")),
+    (
+        "google-sans-flex.woff2",
+        include_bytes!("../assets/wiki/google-sans-flex.woff2"),
+    ),
+    (
+        "google-sans-code-400.woff2",
+        include_bytes!("../assets/wiki/google-sans-code-400.woff2"),
+    ),
+    (
+        "google-sans-code-500.woff2",
+        include_bytes!("../assets/wiki/google-sans-code-500.woff2"),
+    ),
+    (
+        "OFL-google-sans-flex.txt",
+        include_bytes!("../assets/wiki/OFL-google-sans-flex.txt"),
+    ),
+    (
+        "OFL-google-sans-code.txt",
+        include_bytes!("../assets/wiki/OFL-google-sans-code.txt"),
+    ),
 ];
 
 /// The page's own file called `name`, if there's one.
@@ -252,12 +276,18 @@ pub fn export(socket: &Path, dir: Option<PathBuf>, out: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// What `assets/wiki/` has beside the page, for working on it, which
+    /// isn't built in: its README, the fixture it's built against, its
+    /// development scripts and its tests.
+    const NOT_THE_PAGE: &[&str] = &["README.md", "dev", "fixture", "test"];
+
     #[test]
     fn every_file_in_assets_wiki_is_built_in() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/wiki");
         let mut files: Vec<String> = fs::read_dir(&dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !NOT_THE_PAGE.contains(&name.as_str()))
             .collect();
         files.sort();
         let mut built_in: Vec<String> = PAGE_FILES

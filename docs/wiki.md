@@ -43,6 +43,14 @@ crystal runs on another machine: forward the port from yours, then open the link
 http://127.0.0.1:7347/p/app-1f6c0e8a9b2d4c11/
 ```
 
+The page follows Code Wiki's: the outline at the left lights up the part you're reading and opens its
+subsections; each part has a diagram card, whose magnifier (or a click on it) opens the diagram large, to drag
+and zoom with ⌘ or Ctrl and the wheel, or a pinch. Find at the top (`/`) searches this page's parts and the
+other wikis; Share copies a link to the part in view, and the link beside each heading its own; the theme is
+dark, light or the system's, remembered in the browser; `c` shows or hides the chat, `j` and `k` go to the next
+or previous part, and the help button says all of this. On a phone it's one column, the outline and the chat behind
+buttons.
+
 A link into the code opens the file at its line in your editor: `$VISUAL`, or else `$EDITOR`, or `vi`. An editor
 with a window of its own, like VS Code, Cursor, Zed or Sublime Text, starts as it is; one that runs in a
 terminal, like Vim or Helix, starts in a session of its own in the project, as the TUI starts one for a file,
