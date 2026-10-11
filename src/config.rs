@@ -93,8 +93,6 @@ pub struct Config {
     /// Whether the TUI says when a newer crystal is out: `[update]` in the
     /// file.
     pub update: UpdateSettings,
-    /// How the wiki's chat answers: `[wiki]` in the file.
-    pub wiki: WikiSettings,
     /// Saved ways to start an agent, offered first in the new-session
     /// panel: `[[profile]]` tables in the file. See [`crate::profile`].
     #[serde(rename = "profile", skip_serializing_if = "Vec::is_empty")]
@@ -946,26 +944,6 @@ impl Default for UpdateSettings {
     }
 }
 
-/// How the wiki's chat answers a question about the code: see
-/// [`crate::wiki_ask`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct WikiSettings {
-    /// The model that answers, as `claude --model` takes it.
-    pub ask_model: String,
-    /// The most one question may spend, in US dollars.
-    pub ask_budget_usd: f64,
-}
-
-impl Default for WikiSettings {
-    fn default() -> WikiSettings {
-        WikiSettings {
-            ask_model: "sonnet".to_string(),
-            ask_budget_usd: 0.5,
-        }
-    }
-}
-
 /// What crystal does with sessions left alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1149,7 +1127,6 @@ impl Default for Config {
             forge: ForgeSettings::default(),
             sessions: SessionSettings::default(),
             update: UpdateSettings::default(),
-            wiki: WikiSettings::default(),
             profiles: Vec::new(),
             flows: Vec::new(),
             projects: Vec::new(),
@@ -1449,7 +1426,9 @@ pub fn path() -> PathBuf {
 /// switch nothing, without a word.
 pub fn check_plugins(config: &Config, installed: &[String]) -> Result<()> {
     for name in config.plugins.keys() {
-        let known = plugins::is_built_in(name) || installed.iter().any(|plugin| plugin == name);
+        let known = plugins::is_built_in(name)
+            || plugins::GONE.contains(&name.as_str())
+            || installed.iter().any(|plugin| plugin == name);
         if !known {
             let built_in: Vec<&str> = plugins::BUILT_IN.iter().map(|plugin| plugin.name).collect();
             bail!(
@@ -1466,7 +1445,7 @@ pub fn check_plugins(config: &Config, installed: &[String]) -> Result<()> {
 /// The settings `text`, a config file's contents, holds; or an error that
 /// says what doesn't make sense in it.
 pub fn from_text(text: &str) -> Result<Config> {
-    let table: toml::Table = toml::from_str(text)?;
+    let mut table: toml::Table = toml::from_str(text)?;
     // Profiles were called presets for a while; say so rather than only
     // that `preset` is a key crystal doesn't know.
     if table.contains_key("preset") {
@@ -1476,6 +1455,11 @@ pub fn from_text(text: &str) -> Result<Config> {
     // how it learns.
     if matches!(table.get("memory"), Some(toml::Value::Boolean(_))) {
         bail!("`memory` is now a plugin: put `memory = …` under a `[plugins]` line instead");
+    }
+    // The wiki left crystal for lattice, a tool of its own; the table that
+    // set its chat is passed over rather than refusing the file.
+    if matches!(table.get("wiki"), Some(toml::Value::Table(_))) {
+        table.remove("wiki");
     }
     let config: Config = table.try_into()?;
     if config.scrollback_lines > vt::MAX_HISTORY_LINES {
@@ -1769,6 +1753,18 @@ where = "worktree"
     }
 
     #[test]
+    fn the_wiki_s_leftover_settings_are_passed_over() {
+        let text =
+            "[plugins]\nwiki = false\n\n[wiki]\nask_model = \"haiku\"\nask_budget_usd = 0.1\n";
+        let config = parse(text).unwrap();
+        assert!(check_plugins(&config, &[]).is_ok());
+        let mut kept = Config::default();
+        kept.plugins.insert("wiki".into(), false);
+        assert_eq!(config, kept);
+        assert!(parse("wiki = true\n").is_err());
+    }
+
+    #[test]
     fn a_leftover_memory_setting_says_where_it_went() {
         let err = parse("memory = false\n").unwrap_err();
         assert!(format!("{err:#}").contains("`[plugins]`"), "{err:#}");
@@ -1941,22 +1937,6 @@ back_to = "build"
         assert_eq!(config.memory.distill_model, "sonnet");
         assert_eq!(config.memory.distill_budget_usd, 1.0);
         assert!(parse("[memory]\ndistil = false\n").is_err());
-    }
-
-    #[test]
-    fn the_wiki_s_chat_answers_by_its_own_table() {
-        let wiki = parse("").unwrap().wiki;
-        assert_eq!(
-            (wiki.ask_model.as_str(), wiki.ask_budget_usd),
-            ("sonnet", 0.5)
-        );
-        let wiki = parse("[wiki]\nask_model = \"haiku\"\nask_budget_usd = 0.1\n");
-        let wiki = wiki.unwrap().wiki;
-        assert_eq!(
-            (wiki.ask_model.as_str(), wiki.ask_budget_usd),
-            ("haiku", 0.1)
-        );
-        assert!(parse("[wiki]\nask_budget = 1\n").is_err());
     }
 
     #[test]
@@ -2374,10 +2354,6 @@ back_to = "build"
                 restore_screens: true,
             },
             update: UpdateSettings { check: false },
-            wiki: WikiSettings {
-                ask_model: "opus".into(),
-                ask_budget_usd: 2.0,
-            },
             profiles: vec![Profile {
                 name: "review".into(),
                 description: Some("A second pair of eyes".into()),

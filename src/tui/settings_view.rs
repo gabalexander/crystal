@@ -107,8 +107,6 @@ pub enum Setting {
     TaskPermissions,
     TaskBudget,
     DailyBudget,
-    AskModel,
-    AskBudget,
     Distill,
     DistillModel,
     DistillBudget,
@@ -174,8 +172,6 @@ impl Setting {
             Setting::TaskBudget => &["tasks", "max_budget_usd"],
             Setting::DailyBudget => &["tasks", "daily_budget_usd"],
             Setting::Distill => &["memory", "distill"],
-            Setting::AskModel => &["wiki", "ask_model"],
-            Setting::AskBudget => &["wiki", "ask_budget_usd"],
             Setting::DistillModel => &["memory", "distill_model"],
             Setting::DistillBudget => &["memory", "distill_budget_usd"],
             Setting::Embeddings => &["memory", "embeddings"],
@@ -239,8 +235,6 @@ impl Setting {
             Setting::TaskPermissions => "permission mode",
             Setting::TaskBudget => "a run's budget",
             Setting::DailyBudget => "a day's budget",
-            Setting::AskModel => "model",
-            Setting::AskBudget => "a question's budget",
             Setting::Distill => "distill finished work",
             Setting::DistillModel => "  model",
             Setting::DistillBudget => "  budget",
@@ -264,7 +258,6 @@ impl Setting {
                 | Setting::WorktreeBase
                 | Setting::WorktreeDirectory
                 | Setting::DistillModel
-                | Setting::AskModel
         )
     }
 
@@ -283,7 +276,6 @@ impl Setting {
                 | Setting::WorktreeBase
                 | Setting::WorktreeDirectory
                 | Setting::DistillModel
-                | Setting::AskModel
         )
     }
 }
@@ -394,9 +386,6 @@ const DAILY_BUDGETS: [i64; 6] = [0, 500, 1_000, 2_000, 5_000, 10_000];
 
 /// What the distiller may spend on a task, in cents.
 const DISTILL_BUDGETS: [i64; 4] = [10, 25, 50, 100];
-
-/// What the wiki's chat may spend on a question, in cents.
-const ASK_BUDGETS: [i64; 5] = [10, 25, 50, 100, 200];
 
 /// The shell modes and the places a new terminal starts, as the file
 /// writes them.
@@ -576,13 +565,10 @@ const TABS: [Tab; 8] = [
     },
     Tab {
         name: "Tasks",
-        sections: &[
-            (
-                "Background tasks",
-                &[S::TaskPermissions, S::TaskBudget, S::DailyBudget],
-            ),
-            ("Wiki's chat", &[S::AskModel, S::AskBudget]),
-        ],
+        sections: &[(
+            "Background tasks",
+            &[S::TaskPermissions, S::TaskBudget, S::DailyBudget],
+        )],
     },
     Tab {
         name: "Memory",
@@ -1237,7 +1223,6 @@ impl SettingsView {
             }
             S::TaskBudget => money(config.tasks.max_budget_usd, &TASK_BUDGETS),
             S::DailyBudget => money(config.tasks.daily_budget_usd, &DAILY_BUDGETS),
-            S::AskBudget => money(config.wiki.ask_budget_usd, &ASK_BUDGETS),
             S::Distill => on(!config.memory.distill),
             S::DistillBudget => money(config.memory.distill_budget_usd, &DISTILL_BUDGETS),
             S::Embeddings => on(!config.memory.embeddings),
@@ -1258,8 +1243,7 @@ impl SettingsView {
             | S::Shell
             | S::WorktreeBase
             | S::WorktreeDirectory
-            | S::DistillModel
-            | S::AskModel => return Outcome::Stay,
+            | S::DistillModel => return Outcome::Stay,
         };
         Outcome::Change(change)
     }
@@ -1323,7 +1307,6 @@ fn typed_text(setting: Setting, config: &Config) -> String {
             .map(|directory| directory.display().to_string())
             .unwrap_or_default(),
         S::DistillModel => config.memory.distill_model.clone(),
-        S::AskModel => config.wiki.ask_model.clone(),
         _ => String::new(),
     }
 }
@@ -1795,7 +1778,6 @@ fn shown(setting: Setting, config: &Config) -> Shown {
         false => text.to_string(),
     };
     let memory_on = crate::memory::enabled(config);
-    let wiki_on = crate::plugins::enabled(config, "wiki");
     let shown = match setting {
         S::Notify => switch(config.notify, "tell you when a session needs you"),
         S::NotifyAfter => choice(
@@ -2102,20 +2084,6 @@ fn shown(setting: Setting, config: &Config) -> Shown {
             };
             choice(value, about)
         }
-        S::AskModel => Shown {
-            dim: !wiki_on,
-            ..choice(
-                config.wiki.ask_model.clone(),
-                "what answers a question asked on a wiki, as claude --model takes it: enter",
-            )
-        },
-        S::AskBudget => Shown {
-            dim: !wiki_on,
-            ..choice(
-                dollars(cents(config.wiki.ask_budget_usd)),
-                "the most a question spends: ←/→",
-            )
-        },
         S::Distill => Shown {
             dim: !memory_on,
             ..switch(
@@ -2718,12 +2686,6 @@ mod tests {
         );
         both(
             &mut view,
-            S::AskBudget,
-            cents(S::AskBudget, 100),
-            cents(S::AskBudget, 25),
-        );
-        both(
-            &mut view,
             S::Embedder,
             change(S::Embedder, "gemini"),
             change(S::Embedder, "gemini"),
@@ -2791,7 +2753,7 @@ mod tests {
             }
         }
         let settings: usize = (0..KEYS_TAB).map(|tab| rows(tab, &[]).len()).sum();
-        assert_eq!(settings, 60);
+        assert_eq!(settings, 58);
     }
 
     /// Writes `change` to a config file made of `text`, and reads it back.
