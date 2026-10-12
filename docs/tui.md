@@ -200,7 +200,7 @@ crystal works on a phone without an app: ssh into the machine your agents run on
 `crystal` there, or `crystal ssh box` from another machine. A terminal 64 columns wide or narrower, as a
 phone's is, shows one column instead of the sidebar beside the panes. While the sidebar has the keyboard, it
 takes all of the screen, over the pane; `Enter` on a session gives its pane all of it instead, as though it
-were zoomed, and `Ctrl+\` brings the sidebar back. The pane keeps its size either way, so its program isn't
+were zoomed, and `Ctrl+Q` brings the sidebar back. The pane keeps its size either way, so its program isn't
 drawn again as you go between them. `phone_width` under `[sidebar]` moves the line, and `0` keeps the sidebar
 beside the panes at any width.
 
@@ -249,7 +249,7 @@ its output out for a real screen; once seen, it keeps the size of the last pane 
 While the selection is on a session with a pane of its own, the selection's pane goes on showing the last
 session it showed, so no session is drawn twice and going from pane to pane changes none of them. Shift and an
 arrow select the session in the pane that way, as `j` and `k` would, and `Enter` types into it. `Tab` from the
-sidebar goes on to the pane after the one you typed into last, so `Tab`, then `Ctrl+\`, then `Tab` again walks
+sidebar goes on to the pane after the one you typed into last, so `Tab`, then `Ctrl+Q`, then `Tab` again walks
 through them all.
 
 `H`, `J`, `K` and `L` swap the selected session's pane with the one to its left, below, above or right; or take
@@ -271,7 +271,7 @@ or more stacked.
 
 `F` floats the selected session over the panes, in a frame of its own in the middle of them, and hands it the
 keyboard: a shell to run something in, or an agent to answer, without changing the panes under it. The session
-is sized to the frame. `Ctrl+\` takes you back to the sidebar and leaves it floating, over whatever the
+is sized to the frame. `Ctrl+Q` takes you back to the sidebar and leaves it floating, over whatever the
 selection shows; `Tab` or a click gets back into it, as with any pane. `F` again puts it back among the others,
 whichever session is selected. A tab has one float at most, kept with the tab like its panes. A session split
 off floats up out of its split, and `s` on the one floating puts it down into a split, where the selection's
@@ -343,8 +343,8 @@ or not on its own, and stays that way when you open the TUI again.
 
 `v` puts the selected session's pane in copy mode: a cursor of its own that moves over the screen and back
 through the history with vi's keys, while the program goes on running and its output goes on showing. It
-works on a session that has ended too, on the last it showed. `Ctrl+\` leaves copy mode for the sidebar.
-`crystal attach` has copy mode too: `Ctrl+B` then `v`, and there `Ctrl+\` detaches.
+works on a session that has ended too, on the last it showed. `Ctrl+Q` leaves copy mode for the sidebar.
+`crystal attach` has copy mode too: `Ctrl+B` then `v`, and there `Ctrl+Q` detaches.
 
 | Key | In copy mode |
 |---|---|

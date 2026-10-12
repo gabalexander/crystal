@@ -1,5 +1,5 @@
 //! `crystal attach`: a session fills your terminal until you detach with
-//! Ctrl+\ or its program ends.
+//! the TUI's hand-back key (`Ctrl+Q`) or its program ends.
 //!
 //! What the session writes is drawn through a screen of our own rather than
 //! passed straight through, so whatever the program does to its terminal,
@@ -304,7 +304,7 @@ enum Took {
     Copy(String),
     /// Copy mode opens this link, and is over.
     Open(Target),
-    /// Ctrl+\: the attach is over.
+    /// The hand-back key: the attach is over.
     Detach,
 }
 
@@ -328,7 +328,7 @@ impl Controls {
 
     /// Hands on what came from your terminal, as [`Controls::key`] and
     /// [`Controls::mouse`] say, sending the session its part and drawing
-    /// what changed. Returns whether a Ctrl+\ detaches.
+    /// what changed. Returns whether the hand-back key detaches.
     fn take(
         &mut self,
         inputs: Vec<Input>,
@@ -393,10 +393,10 @@ impl Controls {
         Ok(detached)
     }
 
-    /// What a key, or a paste, does: Ctrl+\ detaches; in copy mode it's
-    /// copy mode's; after the prefix, it's the attach's if it's a key of
-    /// copy mode or paging, and the program's if it's the prefix again;
-    /// the prefix waits for the key after it, `Shift+PageUp` and
+    /// What a key, or a paste, does: the hand-back key detaches; in copy
+    /// mode it's copy mode's; after the prefix, it's the attach's if it's a
+    /// key of copy mode or paging, and the program's if it's the prefix
+    /// again; the prefix waits for the key after it, `Shift+PageUp` and
     /// `Shift+PageDown` page, and the rest are the program's.
     fn key(&mut self, typed: Typed, shown: &mut Shown) -> Took {
         let key = match typed {
@@ -416,7 +416,7 @@ impl Controls {
             let theirs = !self.took_last && self.prefixed.is_none() && shown.copy.is_none();
             return if theirs { Took::Passed } else { Took::Dropped };
         }
-        if detaches(&key) {
+        if self.keymap.is_hand_back(&key) {
             return Took::Detach;
         }
         self.took_last = true;
@@ -607,12 +607,6 @@ impl Controls {
 /// How many lines a notch of the wheel scrolls, while the attach has it.
 fn lines(options: Options) -> u16 {
     options.wheel.unwrap_or(0)
-}
-
-/// Whether `key` is Ctrl+\, which detaches, written the old way (as
-/// Ctrl+4) or in the Kitty protocol.
-fn detaches(key: &KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('\\' | '4')) && key.modifiers == KeyModifiers::CONTROL
 }
 
 /// Runs `command`, one of the TUI's that the attach has: copy mode, and
@@ -1476,10 +1470,20 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_backslash_detaches_from_copy_mode_too() {
+    fn ctrl_q_detaches_from_copy_mode_too() {
         let (mut controls, mut shown) = (controls(true), shown());
-        let took = press(&mut controls, &mut shown, b"\x02v\x1b[92;5u");
+        let took = press(&mut controls, &mut shown, b"\x02v\x1b[113;5u");
         assert_eq!(took, [Took::Taken, Took::Taken, Took::Detach]);
+        assert_eq!(press(&mut controls, &mut shown, b"\x11"), [Took::Detach]);
+    }
+
+    #[test]
+    fn the_hand_back_key_the_config_gives_detaches() {
+        let config = crate::config::from_text("[keys]\nhand-back = \"ctrl+\\\\\"").unwrap();
+        let keymap = Keymap::new(&config.keys).unwrap();
+        let mut controls = Controls::new(keymap, controls(true).options);
+        let mut shown = shown();
+        assert_eq!(press(&mut controls, &mut shown, b"\x11"), [Took::Typed]);
         assert_eq!(press(&mut controls, &mut shown, b"\x1c"), [Took::Detach]);
     }
 
@@ -1646,6 +1650,11 @@ mod tests {
         assert_eq!(said.as_deref(), Some("copied 1 line"));
     }
 
+    /// Whether `key` detaches, with the keys crystal has by default.
+    fn detaches(key: &KeyEvent) -> bool {
+        Keymap::default().is_hand_back(key)
+    }
+
     /// Where the first key in `keys` that detaches starts.
     fn detach_key(keys: &[u8]) -> Option<usize> {
         keys::decode(keys)
@@ -1655,31 +1664,33 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_backslash_detaches_the_old_way() {
-        assert_eq!(detach_key(b"ls\x1c"), Some(2));
+    fn ctrl_q_detaches_the_old_way() {
+        assert_eq!(detach_key(b"ls\x11"), Some(2));
         assert_eq!(detach_key(b"ls\r"), None);
+        assert_eq!(detach_key(b"ls\x1c"), None);
     }
 
     #[test]
-    fn ctrl_backslash_detaches_in_the_kitty_protocol() {
-        assert_eq!(detach_key(b"a\x1b[92;5u"), Some(1));
+    fn ctrl_q_detaches_in_the_kitty_protocol() {
+        assert_eq!(detach_key(b"a\x1b[113;5u"), Some(1));
         // A press said so, alternate keys, and Caps Lock on.
-        assert_eq!(detach_key(b"\x1b[92;5:1u"), Some(0));
-        assert_eq!(detach_key(b"\x1b[92:124;5u"), Some(0));
-        assert_eq!(detach_key(b"\x1b[92;69u"), Some(0));
+        assert_eq!(detach_key(b"\x1b[113;5:1u"), Some(0));
+        assert_eq!(detach_key(b"\x1b[113:81;5u"), Some(0));
+        assert_eq!(detach_key(b"\x1b[113;69u"), Some(0));
     }
 
     #[test]
     fn other_keys_in_the_kitty_protocol_dont_detach() {
-        // Its release, Ctrl+Shift+\, a plain backslash, Ctrl+], Shift+Enter.
+        // Its release, a plain q, Alt+q, Ctrl+W, Ctrl+\, Shift+Enter.
         for keys in [
-            &b"\x1b[92;5:3u"[..],
-            b"\x1b[92;6u",
-            b"\x1b[92u",
-            b"\x1b[93;5u",
+            &b"\x1b[113;5:3u"[..],
+            b"\x1b[113u",
+            b"\x1b[113;3u",
+            b"\x1b[119;5u",
+            b"\x1b[92;5u",
             b"\x1b[13;2u",
-            b"\x1b[92;5",
-            b"\x1b[92;0u",
+            b"\x1b[113;5",
+            b"\x1b[113;0u",
         ] {
             let detaches = keys::decode(keys).iter().any(
                 |(typed, _)| matches!(typed, Typed::Key(key) if detaches(key) && key.kind != KeyEventKind::Release),

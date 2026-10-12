@@ -6867,10 +6867,10 @@ impl App {
     }
 
     /// Every key goes to the pane's session, Tab too, since shells and
-    /// agents need it. Kept back are Ctrl+\, which returns to the sidebar,
-    /// and Shift+PageUp and Shift+PageDown, how terminals have always
-    /// scrolled back: they page through the pane's history. Unshifted, the
-    /// page keys go to the session like any other.
+    /// agents need it. Kept back are the hand-back key, Ctrl+Q, which
+    /// returns to the sidebar, and Shift+PageUp and Shift+PageDown, how
+    /// terminals have always scrolled back: they page through the pane's
+    /// history. Unshifted, the page keys go to the session like any other.
     fn on_pane_key(&mut self, slot: Slot, key: KeyEvent) -> Option<Action> {
         // A key the user wrote `direct+` is theirs, not the program's.
         if let Some(bound) = self.keymap.direct(&key) {
@@ -6943,8 +6943,8 @@ impl App {
         }
     }
 
-    /// Every key goes to copy mode, but Ctrl+\, which leaves it for the
-    /// sidebar.
+    /// Every key goes to copy mode, but the hand-back key, which leaves it
+    /// for the sidebar.
     fn on_copy_key(&mut self, slot: Slot, key: KeyEvent) -> Option<Action> {
         if self.keymap.is_hand_back(&key) {
             self.focus = Focus::Sidebar;
@@ -8072,7 +8072,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_hands_the_keyboard_to_the_pane_and_ctrl_backslash_takes_it_back() {
+    fn enter_hands_the_keyboard_to_the_pane_and_ctrl_q_takes_it_back() {
         let mut app = app_with(&["a"]);
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
@@ -8084,8 +8084,15 @@ mod tests {
         };
         assert_eq!(app.on_key(q), Some(typed));
 
+        // Ctrl+\, the hand-back key before, is the program's.
         let ctrl_backslash = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL);
-        assert_eq!(app.on_key(ctrl_backslash), None);
+        assert!(matches!(
+            app.on_key(ctrl_backslash),
+            Some(Action::Type { .. })
+        ));
+
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        assert_eq!(app.on_key(ctrl_q), None);
         assert_eq!(app.focus(), Focus::Sidebar);
     }
 
@@ -9607,7 +9614,7 @@ mod tests {
     }
 
     fn hand_back(app: &mut App) {
-        app.on_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
     }
 
     /// An app with `names`, the first `split` of them split off, and the
@@ -10339,8 +10346,8 @@ mod tests {
         ctrl(&mut app, 'a');
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(selected_name(&app), Some("b"));
-        ctrl(&mut app, '\\');
-        assert_ne!(app.focus(), Focus::Sidebar, "ctrl+\\ is the program's now");
+        ctrl(&mut app, 'q');
+        assert_ne!(app.focus(), Focus::Sidebar, "ctrl+q is the program's now");
         ctrl(&mut app, 'g');
         assert_eq!(app.focus(), Focus::Sidebar);
     }
@@ -10460,7 +10467,7 @@ mod tests {
         let typed = ctrl_alt(&mut app, 'k');
         assert!(matches!(typed, Some(Action::Type { .. })), "{typed:?}");
         // In the sidebar it's a key like any other.
-        ctrl(&mut app, '\\');
+        ctrl(&mut app, 'q');
         press(&mut app, KeyCode::Char('k'));
         ctrl_alt(&mut app, 'j');
         assert_eq!(selected_name(&app), Some("b"));
@@ -10599,7 +10606,7 @@ mod tests {
         let shifted = app.on_key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT));
         assert_eq!(shifted, answer(Answer::Always));
         // And in the list of what needs the user, `y` there is nothing.
-        ctrl(&mut app, '\\');
+        ctrl(&mut app, 'q');
         press(&mut app, KeyCode::Char('U'));
         assert_eq!(press(&mut app, KeyCode::Char('y')), None);
         assert_eq!(press(&mut app, KeyCode::Char('d')), answer(Answer::Deny));
@@ -11669,7 +11676,7 @@ mod tests {
         assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
         // From the sidebar, the sidebar keeps the keyboard.
         app.note_selection(start + Duration::from_secs(2));
-        ctrl(&mut app, '\\');
+        ctrl(&mut app, 'q');
         assert_eq!(app.focus(), Focus::Sidebar);
         press(&mut app, KeyCode::Char(';'));
         assert_eq!(selected_name(&app), Some("b"));

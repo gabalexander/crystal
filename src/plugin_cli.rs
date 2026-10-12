@@ -843,7 +843,7 @@ on = "*"
 command = ["sh", "hook.sh"]
 
 # A program shown over the TUI's panes, with the keyboard, until it ends
-# or you press Ctrl+\. Or `placement = "popup"`, with a `width` and a
+# or you press Ctrl+Q. Or `placement = "popup"`, with a `width` and a
 # `height` like 40 or "80%"; or as a session of its own: "split" off the
 # selected session's pane (`split = "down"` below it), "zoomed", or "tab".
 # `crystal plugin pane open NAME events` opens it from the command line.
