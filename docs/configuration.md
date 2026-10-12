@@ -37,7 +37,7 @@ that makes no sense is said there too, and the settings stay as they were until 
 | `mermaid_ascii` | `false` | draw [mermaid diagrams](code.md#the-file-finder-and-the-tree-browser) with ASCII rather than box drawing |
 | `scrollback_lines` | `10000` | how many rows that scrolled off a session's screen it keeps, up to 1,000,000, for scrolling back, copy mode, `e` and `crystal read --history`; a change counts for the sessions running too, which let their oldest rows go when it's fewer |
 | `[plugins]` | | which plugins are on and off: [plugins](plugins.md) |
-| `[memory]` | | how memory's [distiller](memory.md#the-distiller) runs, whether it [searches by meaning](memory.md#search-by-meaning), and with what: the model here or [Gemini](memory.md#gemini-instead-of-the-model-here); and whether Claude Code is shown the entries about each file it reads |
+| `[memory]` | | how memory's [distiller](memory.md#the-distiller) runs, whether it [searches by meaning](memory.md#search-by-meaning), and with what: the models here, [Gemini](memory.md#gemini-instead-of-the-model-here) or [Voyage AI](memory.md#voyage-instead-of-the-reranker-here); and whether Claude Code is shown the entries about each file it reads |
 | `[tasks]` | | what [background tasks](tasks.md#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none); and what they may do without asking: `permission_mode` (`"default"`), `allowed_tools` (none) and `allow_bypass` (`false`) |
 | `[events]` | | `keep_days`, how long the [event log](events.md) keeps what happened: 30 days, or `0` for ever |
 | `[handoff]` | | `in_git`, the projects, by their main worktree, whose [handoff notes](tasks.md#the-handoff-file) go in git |

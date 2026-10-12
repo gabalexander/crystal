@@ -28,8 +28,8 @@ use super::search::letters_in;
 use super::text_input::TextInput;
 use super::theme::{self, Theme};
 use crate::config::{
-    self, BarPosition, Config, Embedder, EmptiedWorktree, Fold, NewCwd, SessionSettings, ShellMode,
-    SidebarOrder, TaskSettings, ThemeName,
+    self, BarPosition, Config, Embedder, EmptiedWorktree, Fold, NewCwd, Reranker, SessionSettings,
+    ShellMode, SidebarOrder, TaskSettings, ThemeName,
 };
 use crate::embed::Status;
 use crate::integration::{self, Standing};
@@ -114,6 +114,8 @@ pub enum Setting {
     Embedder,
     GeminiDimensions,
     Rerank,
+    Reranker,
+    VoyageModel,
     RecallOnRead,
 }
 
@@ -178,6 +180,8 @@ impl Setting {
             Setting::Embedder => &["memory", "embedder"],
             Setting::GeminiDimensions => &["memory", "gemini_dimensions"],
             Setting::Rerank => &["memory", "rerank"],
+            Setting::Reranker => &["memory", "reranker"],
+            Setting::VoyageModel => &["memory", "voyage_model"],
             Setting::RecallOnRead => &["memory", "recall_on_read"],
         }
     }
@@ -242,6 +246,8 @@ impl Setting {
             Setting::Embedder => "  vectors by",
             Setting::GeminiDimensions => "  dimensions",
             Setting::Rerank => "  rerank",
+            Setting::Reranker => "  reranked by",
+            Setting::VoyageModel => "  voyage model",
             Setting::RecallOnRead => "shown as files are read",
         }
     }
@@ -398,6 +404,16 @@ fn embedder_name(embedder: Embedder) -> &'static str {
     match embedder {
         Embedder::Local => EMBEDDERS[0],
         Embedder::Gemini => EMBEDDERS[1],
+    }
+}
+
+/// What `[memory] reranker` takes, as the file writes it.
+const RERANKERS: [&str; 2] = ["local", "voyage"];
+
+fn reranker_name(reranker: Reranker) -> &'static str {
+    match reranker {
+        Reranker::Local => RERANKERS[0],
+        Reranker::Voyage => RERANKERS[1],
     }
 }
 const NEW_CWDS: [&str; 3] = ["follow", "home", "current"];
@@ -582,6 +598,8 @@ const TABS: [Tab; 8] = [
                 S::Embedder,
                 S::GeminiDimensions,
                 S::Rerank,
+                S::Reranker,
+                S::VoyageModel,
                 S::RecallOnRead,
             ],
         )],
@@ -1235,6 +1253,14 @@ impl SettingsView {
                 number(next_of(&crate::gemini::DIMENSIONS, now, forward).into())
             }
             S::Rerank => on(!config.memory.rerank),
+            S::Reranker => {
+                let now = reranker_name(config.memory.reranker);
+                Change::set(setting, next_named(&RERANKERS, now, forward))
+            }
+            S::VoyageModel => {
+                let now = config.memory.voyage_model.as_str();
+                Change::set(setting, next_named(&crate::voyage::MODELS, now, forward))
+            }
             S::RecallOnRead => on(!config.memory.recall_on_read),
             S::NotifyCommand
             | S::Separator
@@ -1446,6 +1472,34 @@ fn gemini_says(status: Option<&Status>) -> (String, Option<bool>) {
         0 => (format!("key in {key}; asked nothing yet"), Some(true)),
         tokens => (
             format!("key in {key}; {tokens} tokens sent since the daemon started"),
+            Some(true),
+        ),
+    }
+}
+
+/// What the Voyage line says of how Voyage stands: where its key is, or
+/// why it failed last, searches going unreranked meanwhile.
+fn voyage_says(status: Option<&Status>) -> (String, Option<bool>) {
+    let Some(voyage) = status.and_then(|status| status.voyage.as_ref()) else {
+        return ("the daemon didn't say".to_string(), None);
+    };
+    if let Some(failed) = &voyage.failed {
+        return (
+            format!("{failed}; searches go unreranked meanwhile"),
+            Some(false),
+        );
+    }
+    let key = voyage.key.as_deref().unwrap_or("nowhere");
+    if voyage.key_shared {
+        return (
+            format!("key in {key}, which others can read: chmod 600 it"),
+            Some(false),
+        );
+    }
+    match voyage.tokens {
+        0 => (format!("key in {key}; asked nothing yet"), Some(true)),
+        tokens => (
+            format!("key in {key}; {tokens} tokens read since the daemon started"),
             Some(true),
         ),
     }
@@ -2135,8 +2189,27 @@ fn shown(setting: Setting, config: &Config) -> Shown {
             dim: !memory_on || !config.memory.embeddings,
             ..switch(
                 config.memory.rerank,
-                "jina's reranker reads the best of a search again",
+                "a reranker reads the best of a search again",
             )
+        },
+        S::Reranker => Shown {
+            dim: !memory_on || !config.memory.embeddings || !config.memory.rerank,
+            ..choice(
+                reranker_name(config.memory.reranker).to_string(),
+                match config.memory.reranker {
+                    Reranker::Local => "jina's reranker, on this machine: ←/→",
+                    Reranker::Voyage => {
+                        "Voyage AI's API: searches and entries' text go to Voyage: ←/→"
+                    }
+                },
+            )
+        },
+        S::VoyageModel => Shown {
+            dim: !memory_on
+                || !config.memory.embeddings
+                || !config.memory.rerank
+                || config.memory.reranker != Reranker::Voyage,
+            ..choice(config.memory.voyage_model.clone(), "Voyage's reranker: ←/→")
         },
         S::RecallOnRead => Shown {
             dim: !memory_on,
@@ -2292,6 +2365,10 @@ fn after_section(
         if memory.embeddings && memory.embedder == Embedder::Gemini {
             let (said, good) = gemini_says(view.model());
             lines.push(detail("gemini", said, good));
+        }
+        if memory.embeddings && memory.rerank && memory.reranker == Reranker::Voyage {
+            let (said, good) = voyage_says(view.model());
+            lines.push(detail("voyage", said, good));
         }
         if let Some(status) = view.model()
             && (memory.embeddings || status.is_downloaded())
@@ -2696,6 +2773,18 @@ mod tests {
             number(S::GeminiDimensions, 1536),
             number(S::GeminiDimensions, 3072),
         );
+        both(
+            &mut view,
+            S::Reranker,
+            change(S::Reranker, "voyage"),
+            change(S::Reranker, "voyage"),
+        );
+        both(
+            &mut view,
+            S::VoyageModel,
+            change(S::VoyageModel, "rerank-3-lite"),
+            change(S::VoyageModel, "rerank-2.5"),
+        );
     }
 
     #[test]
@@ -2753,7 +2842,7 @@ mod tests {
             }
         }
         let settings: usize = (0..KEYS_TAB).map(|tab| rows(tab, &[]).len()).sum();
-        assert_eq!(settings, 58);
+        assert_eq!(settings, 60);
     }
 
     /// Writes `change` to a config file made of `text`, and reads it back.
@@ -3493,6 +3582,59 @@ mod tests {
         };
         assert!(memory(&config, Some(gemini(shared))).contains("others can read: chmod 600"));
         assert!(memory(&config, Some(status())).contains("the daemon didn't say"));
+    }
+
+    #[test]
+    fn with_voyage_the_view_says_searches_go_to_voyage_and_how_its_key_stands() {
+        let row = |name: &str, value: &str| format!("{name:<22}{value}");
+        let mut config = Config::default();
+        let memory = |config: &Config, model| {
+            let mut view = view_of(config.clone(), model);
+            press(&mut view, KeyCode::Char('6'));
+            text(&view)
+        };
+        let shown = memory(&config, Some(status()));
+        assert!(shown.contains(&row("  reranked by", "local")), "{shown}");
+        let says_voyage = |shown: &str| shown.lines().any(|line| line.starts_with("    voyage  "));
+        assert!(!says_voyage(&shown), "{shown}");
+        config.memory.reranker = Reranker::Voyage;
+        let voyage = |voyage: crate::voyage::Status| Status {
+            voyage: Some(voyage),
+            ..status()
+        };
+        let working = crate::voyage::Status {
+            model: "rerank-3".into(),
+            key: Some("~/.config/crystal/voyage.key".into()),
+            tokens: 4_000,
+            ..crate::voyage::Status::default()
+        };
+        let shown = memory(&config, Some(voyage(working.clone())));
+        assert!(shown.contains(&row("  reranked by", "voyage")), "{shown}");
+        assert!(
+            shown.contains("searches and entries' text go to Voyage"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(&row("  voyage model", "rerank-3")),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("key in ~/.config/crystal/voyage.key; 4000 tokens read"),
+            "{shown}"
+        );
+        let failed = crate::voyage::Status {
+            failed: Some("rerank-3: Provided API key is invalid. (HTTP 401)".into()),
+            ..working.clone()
+        };
+        let shown = memory(&config, Some(voyage(failed)));
+        assert!(
+            shown.contains("is invalid. (HTTP 401); searches go unreranked meanwhile"),
+            "{shown}"
+        );
+        assert!(memory(&config, Some(status())).contains("the daemon didn't say"));
+        config.memory.rerank = false;
+        let off = memory(&config, Some(voyage(working)));
+        assert!(!says_voyage(&off), "{off}");
     }
 
     #[test]

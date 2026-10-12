@@ -4,13 +4,14 @@
 
 What a project's sessions learn, kept for the next ones: how you and agents add to it, search it and replace
 what no longer holds, what an agent is shown as it starts and as it reads a file, search by meaning, with the
-model here or Gemini, and the distiller that reads what a session did.
+models here or Gemini and Voyage AI, and the distiller that reads what a session did.
 
 - [Remembering](#remembering)
 - [What an agent is shown](#what-an-agent-is-shown)
 - [Through MCP](#through-mcp)
 - [Search by meaning](#search-by-meaning)
 - [Gemini instead of the model here](#gemini-instead-of-the-model-here)
+- [Voyage instead of the reranker here](#voyage-instead-of-the-reranker-here)
 - [The distiller](#the-distiller)
 
 ## Remembering
@@ -39,7 +40,7 @@ crystal memory kind --notes          # the notes a model reads as lessons, and t
 crystal memory promote 2             # copy one into the project's CLAUDE.md, under "Notes"
 crystal memory distill fixer         # have a model read what a session did, now
 crystal memory embed                 # give every entry its vector, downloading the models first if needed
-crystal memory status                # how search by meaning stands: what makes the vectors, Gemini's key
+crystal memory status                # how search by meaning stands: what makes the vectors, what reranks, the keys
 crystal memory dedupe                # entries that say what another does, by meaning; --apply merges them
 crystal remember --replaces 3 --why "it flipped" "Idle stop is on by default"   # in place of 3, which no longer holds
 crystal memory retire 3 --by 12      # 3 no longer holds: 12, there already, holds in its place
@@ -271,7 +272,8 @@ crystal memory embed   # downloads both models now (2.4 GB), and gives every ent
   but not commercially. `embeddings = false` under `[memory]` turns search by meaning off, and `rerank =
   false` leaves the reranker out: faster on a CPU, but a search then always brings back what's nearest.
 - `crystal memory status` says how it stands: what makes the vectors, how many entries have theirs, whether
-  the models are downloaded and loaded, and with Gemini, where its key is and how its last request went.
+  the models are downloaded and loaded, what reranks, and with Gemini or Voyage, where its key is and how its
+  last request went.
 
 ## Gemini instead of the model here
 
@@ -320,6 +322,63 @@ still reads the best of each search: the Gemini API has none.
   By meaning alone, Gemini ranks well ahead (0.83 against 0.74), but with the reranker, which the
   default keeps, it doesn't beat the model here. And a search waits on Google: about 0.55 seconds for its
   vector at 768, 0.77 at 3072, unless it was asked in the last hour.
+
+## Voyage instead of the reranker here
+
+`reranker = "voyage"` under `[memory]` has [Voyage AI's API](https://docs.voyageai.com/docs/reranker) read
+the best of each search again, with `rerank-3` unless `voyage_model` names `rerank-3-lite` or `rerank-2.5`,
+in place of jina-reranker-v3. The reranker here isn't loaded then, which leaves about 1.2 GB to the rest of
+your machine; with `embedder = "gemini"` too, nothing is loaded here at all, unless Gemini fails and a search
+falls back on the model that makes vectors.
+
+```toml
+[memory]
+embedder = "gemini"   # vectors from Google: see above
+reranker = "voyage"   # reranked by Voyage AI
+```
+
+- **What goes to Voyage AI:** each search, the first prompt of each agent that starts among them, with the
+  text of the 20 entries found best for it; and an entry being remembered or deduped, with those most alike
+  to it. Credentials are taken out first. Turn it on only where you're fine sending your memory to Voyage
+  AI; the settings view's row says so too.
+- **The key:** put it in `~/.config/crystal/voyage.key`, one line, readable by you alone (`chmod 600`), or
+  name another file with `voyage_key_file`; with no file, `VOYAGE_API_KEY` in the daemon's environment. It's
+  kept, read and handed to `curl` as Gemini's is: never in `config.toml`, on a command line, in a log or in
+  sessions.
+- **Rate limits:** until a payment method is on your Voyage account, it takes 3 requests and 10,000 tokens a
+  minute, fewer than agents searching at once ask; past them, searches go unreranked. With one, it takes
+  2,000 requests a minute, and `rerank-3`'s first 200 million tokens are free.
+- What a search was scored is kept an hour, since agents ask the same again. A search of 20 entries reads
+  about 1,200 tokens, about $0.00006 at `rerank-3`'s $0.05 a million past the free ones, and takes about a
+  third of a second.
+- **When Voyage fails** (offline, a rate limit, a key it refuses), it's said once in the daemon's log, and
+  searches go on without a reranker, as with `rerank = false`, until it's asked again: 30 seconds after the
+  network failed, a minute after a 429, five minutes after a refusal, or at once with a new key. `crystal
+  memory status` and the settings view say why.
+- **Thresholds are its own.** Voyage scores from 0 to 1, an entry that has nothing to do with a search at
+  about 0.2 to 0.4, where jina's sit about 0: so the score a search's best entry has to reach for it to find
+  anything, the score below which an entry is left out, and the score at which an entry being remembered
+  says the same as one before, were measured again for each model on crystal's own memory.
+- **Measured** on crystal's own 658 entries, 2026-10-12: 49 questions with an answer in the memory and 12
+  without, each reranker given the same 20 entries for each; a right entry first, in the first five, and the
+  mean reciprocal rank of the first right one:
+
+  | | first | first five | MRR@10 | the best entry of a question with no answer |
+  | --- | --- | --- | --- | --- |
+  | jina, here | 46 of 49 | 49 | 0.963 | up to 0.150: 2 of 12 found something |
+  | `rerank-3` | 45 | 49 | 0.959 | up to 0.309, under its 0.42: none |
+  | `rerank-3-lite` | 45 | 49 | 0.956 | up to 0.365, under its 0.47: none |
+  | `rerank-2.5` | 48 | 49 | 0.990 | up to 0.387, under its 0.49: none |
+
+  Every entry put first that wasn't the one asked about said the same as it, kept twice, so all four rank
+  alike here. Where they differ is a question the memory can't answer: each of Voyage's scores the best
+  entry for it well below the best for one it can (0.54 at least, with `rerank-3`), where jina found
+  something for 2 of the 12. Once something answers, entries are kept from 0.40 (0.42 for `rerank-3-lite`):
+  about 8 of the 20, as many as jina keeps, every right one among them.
+- **The same said again:** Voyage scores two different lessons on one subject closer to the same lesson said
+  twice than jina does, up to 0.867, so an entry says what one before does from 0.87 (0.88 for
+  `rerank-3-lite`), where every pair was the same lesson. Of the 261 pairs `dedupe` asked about, that merges
+  167 with `rerank-3`, 131 of the 161 jina merges, and 36 more that were all the same lesson in other words.
 
 ## The distiller
 
@@ -371,6 +430,9 @@ distill_model = "claude-haiku-4-5"  # the model, as `claude --model` takes it
 distill_budget_usd = 0.25           # the most one task's pass may spend
 embeddings = true                   # false to search by words alone: see above
 rerank = true                       # false to leave the reranker out
+reranker = "local"                  # "voyage" for Voyage AI's API, which searches and entries' text go to
+voyage_model = "rerank-3"           # Voyage's model: rerank-3, rerank-3-lite or rerank-2.5
+# voyage_key_file = "~/.config/crystal/voyage.key"  # where its key is; never the key itself
 recall_on_read = true               # false to stop showing Claude Code what's known about each file it reads
 embedder = "local"                  # "gemini" for Google's Gemini API, which entries' text goes to: see above
 gemini_model = "gemini-embedding-2" # Gemini's model

@@ -660,6 +660,9 @@ pub struct MemorySettings {
     /// Have the reranker read the best of a search again, putting what
     /// answers it first and leaving out what doesn't.
     pub rerank: bool,
+    /// What reranks: the model run on this machine, or Voyage AI's API,
+    /// which searches and entries' text go to.
+    pub reranker: Reranker,
     /// Show Claude Code the entries about a file as it reads or edits it,
     /// a few once per file: see [`crate::recall`].
     pub recall_on_read: bool,
@@ -676,6 +679,12 @@ pub struct MemorySettings {
     /// export`, mustn't hold.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gemini_key_file: Option<PathBuf>,
+    /// Voyage AI's model, as it names it: one of [`crate::voyage::MODELS`].
+    pub voyage_model: String,
+    /// The file its key is read from: see [`MemorySettings::voyage_key_file`].
+    /// Never the key itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voyage_key_file: Option<PathBuf>,
 }
 
 /// What turns memory's entries and searches into vectors.
@@ -690,6 +699,17 @@ pub enum Embedder {
     Gemini,
 }
 
+/// What reads the best of a memory search again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Reranker {
+    /// jina-reranker-v3, run on this machine: see [`crate::rerank`].
+    #[default]
+    Local,
+    /// Voyage AI's API: see [`crate::voyage`].
+    Voyage,
+}
+
 impl Default for MemorySettings {
     fn default() -> MemorySettings {
         MemorySettings {
@@ -698,11 +718,14 @@ impl Default for MemorySettings {
             distill_budget_usd: 0.25,
             embeddings: true,
             rerank: true,
+            reranker: Reranker::Local,
             recall_on_read: true,
             embedder: Embedder::Local,
             gemini_model: crate::gemini::MODEL.to_string(),
             gemini_dimensions: crate::gemini::DEFAULT_DIMENSIONS,
             gemini_key_file: None,
+            voyage_model: crate::voyage::MODEL.to_string(),
+            voyage_key_file: None,
         }
     }
 }
@@ -717,8 +740,22 @@ impl MemorySettings {
         }
     }
 
-    /// Refuses a size of vector its thresholds weren't measured at, and a
-    /// key where the name of its file goes.
+    /// The file Voyage AI's key is read from: the one given, `~` its home,
+    /// or `voyage.key` beside the config file.
+    pub fn voyage_key_file(&self) -> PathBuf {
+        match &self.voyage_key_file {
+            Some(file) => crate::shell::expand_home(file),
+            None => path().with_file_name("voyage.key"),
+        }
+    }
+
+    /// Whether the reranker that's to read searches is the one here.
+    pub fn reranks_here(&self) -> bool {
+        self.rerank && self.reranker == Reranker::Local
+    }
+
+    /// Refuses a size of vector or a reranker's model whose thresholds
+    /// weren't measured, and a key where the name of its file goes.
     fn check(&self) -> Result<()> {
         let sizes = crate::gemini::DIMENSIONS;
         if !sizes.contains(&self.gemini_dimensions) {
@@ -733,13 +770,25 @@ impl MemorySettings {
                 crate::gemini::MODEL
             );
         }
-        if let Some(file) = &self.gemini_key_file {
-            let file = file.to_string_lossy();
-            if crate::secrets::redact(&file) != file {
-                bail!(
-                    "[memory] gemini_key_file names a file, not the key: put the key in that \
-                     file, never here"
-                );
+        let models = crate::voyage::MODELS;
+        if !models.contains(&self.voyage_model.trim()) {
+            bail!(
+                "[memory] voyage_model is {:?}: it's one of {models:?}",
+                self.voyage_model
+            );
+        }
+        for (name, file) in [
+            ("gemini_key_file", &self.gemini_key_file),
+            ("voyage_key_file", &self.voyage_key_file),
+        ] {
+            if let Some(file) = file {
+                let file = file.to_string_lossy();
+                if crate::secrets::redact(&file) != file {
+                    bail!(
+                        "[memory] {name} names a file, not the key: put the key in that file, \
+                         never here"
+                    );
+                }
             }
         }
         Ok(())
@@ -1963,6 +2012,38 @@ back_to = "build"
     }
 
     #[test]
+    fn memory_reranks_here_unless_told_voyage_with_a_model_it_was_measured_for() {
+        let memory = parse("").unwrap().memory;
+        assert_eq!(memory.reranker, Reranker::Local);
+        assert_eq!(memory.voyage_model, "rerank-3");
+        assert!(memory.reranks_here());
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let config = "[memory]\nreranker = \"voyage\"\nvoyage_model = \"rerank-2.5\"\n\
+                      voyage_key_file = \"~/keys/voyage\"\n";
+        let memory = parse(config).unwrap().memory;
+        assert_eq!(memory.reranker, Reranker::Voyage);
+        assert_eq!(memory.voyage_model, "rerank-2.5");
+        assert_eq!(memory.voyage_key_file(), home.join("keys/voyage"));
+        assert!(!memory.reranks_here());
+        assert!(
+            !parse("[memory]\nrerank = false\n")
+                .unwrap()
+                .memory
+                .reranks_here()
+        );
+        let err = parse("[memory]\nvoyage_model = \"rerank-1\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("rerank-3-lite"), "{err:#}");
+        assert!(parse("[memory]\nreranker = \"cohere\"\n").is_err());
+        let fake = "pa-FakeTestKey0123456789abcdefghijklmnopqrstu";
+        let err = parse(&format!("[memory]\nvoyage_key_file = \"{fake}\"\n")).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("voyage_key_file names a file") && !err.contains(fake),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn background_tasks_have_a_budget_each_and_none_a_day_unless_given() {
         let config = parse("").unwrap();
         assert_eq!(config.tasks.max_budget_usd, 5.0);
@@ -2321,11 +2402,14 @@ back_to = "build"
                 distill_budget_usd: 0.5,
                 embeddings: true,
                 rerank: false,
+                reranker: Reranker::Voyage,
                 recall_on_read: false,
                 embedder: Embedder::Gemini,
                 gemini_model: "gemini-embedding-2".into(),
                 gemini_dimensions: 3072,
                 gemini_key_file: Some(PathBuf::from("~/keys/gemini.key")),
+                voyage_model: "rerank-3".into(),
+                voyage_key_file: Some(PathBuf::from("~/keys/voyage.key")),
             },
             tasks: TaskSettings {
                 max_budget_usd: 2.5,

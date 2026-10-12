@@ -200,7 +200,7 @@ impl Crystal {
         command.arg(&self.socket);
         command.args(args);
         command.cwd(self.dir.path());
-        for variable in crystal_variables().into_iter().chain(gemini_keys()) {
+        for variable in crystal_variables().into_iter().chain(api_keys()) {
             command.env_remove(variable);
         }
         // A notification's click brings the TUI's terminal to the front by
@@ -497,18 +497,22 @@ fn crystal_variables() -> Vec<std::ffi::OsString> {
         .collect()
 }
 
-/// The variables crystal reads Gemini's key from: a test that searches
-/// memory through Gemini gives its fake one in a file, so the developer's
-/// own never reaches a test's daemon, nor a server.
-fn gemini_keys() -> Vec<std::ffi::OsString> {
-    vec!["GEMINI_API_KEY".into(), "GOOGLE_API_KEY".into()]
+/// The variables crystal reads Gemini's and Voyage's keys from: a test that
+/// searches memory through them gives its fake ones in files, so the
+/// developer's own never reach a test's daemon, nor a server.
+fn api_keys() -> Vec<std::ffi::OsString> {
+    vec![
+        "GEMINI_API_KEY".into(),
+        "GOOGLE_API_KEY".into(),
+        "VOYAGE_API_KEY".into(),
+    ]
 }
 
 /// A command for `program`, without [`crystal_variables`] or
-/// [`gemini_keys`]: how every test runs anything.
+/// [`api_keys`]: how every test runs anything.
 fn outside_crystal(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
-    for variable in crystal_variables().into_iter().chain(gemini_keys()) {
+    for variable in crystal_variables().into_iter().chain(api_keys()) {
         command.env_remove(variable);
     }
     command
@@ -9221,6 +9225,80 @@ impl FakeGemini {
     }
 }
 
+/// A fake Voyage AI on 127.0.0.1: it scores an entry about Postgres 0.95
+/// for a search about a database and everything else 0.05, or refuses the
+/// key once told to; and keeps each request's head and body.
+struct FakeVoyage {
+    url: String,
+    asked: Arc<Mutex<Vec<(String, String)>>>,
+    refusing: Arc<Mutex<bool>>,
+}
+
+impl FakeVoyage {
+    fn new() -> FakeVoyage {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let refusing = Arc::new(Mutex::new(false));
+        let (kept, refuse) = (asked.clone(), refusing.clone());
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let (head, body) = read_request(&stream);
+                kept.lock().unwrap().push((head, body.clone()));
+                let (code, reply) = match *refuse.lock().unwrap() {
+                    true => (
+                        401,
+                        r#"{"detail": "Provided API key is invalid."}"#.to_string(),
+                    ),
+                    false => (200, fake_scores(&body)),
+                };
+                let mut stream = stream;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        FakeVoyage {
+            url,
+            asked,
+            refusing,
+        }
+    }
+
+    fn asked(&self) -> Vec<(String, String)> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+/// What the fake Voyage answers a `rerank` with: the scores, the best first.
+fn fake_scores(body: &str) -> String {
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    let query = body["query"].as_str().unwrap().to_lowercase();
+    let documents = body["documents"].as_array().unwrap();
+    let mut data: Vec<serde_json::Value> = documents
+        .iter()
+        .enumerate()
+        .map(|(index, document)| {
+            let answers =
+                query.contains("database") && document.as_str().unwrap().contains("Postgres");
+            let score = if answers { 0.95 } else { 0.05 };
+            serde_json::json!({"relevance_score": score, "index": index})
+        })
+        .collect();
+    let score = |scored: &serde_json::Value| scored["relevance_score"].as_f64().unwrap();
+    data.sort_by(|a, b| score(b).total_cmp(&score(a)));
+    serde_json::json!({
+        "object": "list",
+        "data": data,
+        "model": body["model"],
+        "usage": {"total_tokens": documents.len() * 10},
+    })
+    .to_string()
+}
+
 /// An HTTP request's head and body.
 fn read_request(stream: &std::net::TcpStream) -> (String, String) {
     use std::io::BufRead;
@@ -9359,6 +9437,93 @@ fn memory_searches_by_meaning_through_gemini_with_the_key_from_its_file_alone() 
     let tried = gemini.asked().len();
     run(&["memory", "-C", repo_dir, "search", "another outage"]);
     assert_eq!(gemini.asked().len(), tried, "it rests after a 429");
+}
+
+#[test]
+fn memory_reranks_through_voyage_with_nothing_loaded_here_and_goes_on_without_it_when_it_fails() {
+    let gemini = FakeGemini::new();
+    let voyage = FakeVoyage::new();
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    let gemini_key = crystal.dir.path().join("gemini.key");
+    std::fs::write(&gemini_key, "AQ.fake-key-for-the-e2e-test\n").unwrap();
+    let voyage_key = crystal.dir.path().join("voyage.key");
+    std::fs::write(&voyage_key, "pa-fake-key-for-the-e2e-test\n").unwrap();
+    crystal.configure(&format!(
+        "notify = false\nname_by_agent = false\n\n[memory]\ndistill = false\n\
+         embedder = \"gemini\"\ngemini_key_file = \"{}\"\n\
+         reranker = \"voyage\"\nvoyage_key_file = \"{}\"\n",
+        gemini_key.display(),
+        voyage_key.display()
+    ));
+    let run = |args: &[&str]| {
+        let out = crystal
+            .command(args)
+            .env("CRYSTAL_GEMINI_URL", &gemini.url)
+            .env("CRYSTAL_VOYAGE_URL", &voyage.url)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "crystal {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    // A daemon to ask, which keeps how Voyage last answered.
+    run(&["new", "-d", "-n", "here", "sleep", "30"]);
+    run(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "Postgres has to be up for the ledger tests",
+    ]);
+    run(&["remember", "-C", repo_dir, "Deploys go out on Tuesdays"]);
+    let found = run(&["memory", "-C", repo_dir, "search", "start the database"]);
+    assert!(found.contains("Postgres has to be up"), "{found}");
+    // Its words match, but Voyage finds nothing in it answers the search.
+    let found = run(&["memory", "-C", repo_dir, "search", "deploys to kubernetes"]);
+    assert_eq!(found, "", "the reranker finds nothing answers it");
+    let asked = voyage.asked();
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    for (head, body) in &asked {
+        assert!(head.starts_with("POST /v1/rerank HTTP/1.1\r\n"), "{head}");
+        assert!(
+            head.contains("Authorization: Bearer pa-fake-key-for-the-e2e-test\r\n"),
+            "{head}"
+        );
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["model"], "rerank-3");
+    }
+    assert!(asked[0].1.contains("\"query\":\"start the database\""));
+    let status = run(&["memory", "status"]);
+    assert!(
+        status.contains("rerank            by rerank-3 through Voyage AI's API"),
+        "{status}"
+    );
+    assert!(
+        status.contains(&format!("voyage key        {}", voyage_key.display())),
+        "{status}"
+    );
+    assert!(status.contains("working: 20 tokens read"), "{status}");
+    let config = std::fs::read_to_string(crystal.config_file()).unwrap();
+    assert!(!config.contains("pa-fake"), "the key stays in its file");
+
+    // A key Voyage refuses: the search goes on unreranked, and the status
+    // says why.
+    *voyage.refusing.lock().unwrap() = true;
+    let found = run(&["memory", "-C", repo_dir, "search", "deploys to kubernetes"]);
+    assert_eq!(found, "", "what a search was scored is kept");
+    let found = run(&["memory", "-C", repo_dir, "search", "deploys to a cluster"]);
+    assert!(found.contains("Deploys go out on Tuesdays"), "{found}");
+    let status = run(&["memory", "status"]);
+    assert!(
+        status.contains("Provided API key is invalid. (HTTP 401); searches go unreranked"),
+        "{status}"
+    );
+    let tried = voyage.asked().len();
+    run(&["memory", "-C", repo_dir, "search", "deploys on fridays"]);
+    assert_eq!(voyage.asked().len(), tried, "it rests after a refusal");
 }
 
 #[test]
