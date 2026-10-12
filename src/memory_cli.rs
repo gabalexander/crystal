@@ -8,7 +8,6 @@ use crate::distill::{self, Change, Proposal};
 use crate::embed::{self, Embed, Models};
 use crate::env;
 use crate::events::{self, Event};
-use crate::gemini;
 use crate::git::Checkout;
 use crate::memory::{
     self, Added, Entry, Forgotten, Kind, Listed, Memory, Merge, Near, New, Replacing, Source,
@@ -18,6 +17,7 @@ use crate::output::{err, errln, out, outln};
 use crate::printable;
 use crate::protocol::{Request, Response};
 use crate::tui::sidebar::ago;
+use crate::{gemini, voyage};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -914,23 +914,14 @@ fn status_lines(settings: &MemorySettings, status: &embed::Status) -> Vec<(&'sta
                 gemini_model = gemini.model
             ),
         ));
-        let key = match (&gemini.key, gemini.key_shared) {
-            (Some(key), false) => key.clone(),
-            (Some(key), true) => format!("{key} (others can read it: chmod 600 it)"),
-            (None, _) => "none found".to_string(),
-        };
-        lines.push(("key", key));
+        lines.push(("key", key_said(&gemini.key, gemini.key_shared)));
         let meanwhile = match downloaded {
             true => format!("searches go by {} meanwhile", embed::MODEL),
             false => "searches go by words meanwhile".to_string(),
         };
         let said = match (&gemini.failed, gemini.failed_secs_ago) {
             (Some(failed), Some(secs)) => {
-                let when = match ago(0, secs) {
-                    now if now == "now" => "just now".to_string(),
-                    ago => format!("{ago} ago"),
-                };
-                format!("failed {when}: {failed}; {meanwhile}")
+                format!("failed {}: {failed}; {meanwhile}", failed_when(secs))
             }
             (Some(failed), None) => format!("{failed}; {meanwhile}"),
             (None, _) if gemini.tokens == 0 => "nothing asked yet".to_string(),
@@ -960,12 +951,58 @@ fn status_lines(settings: &MemorySettings, status: &embed::Status) -> Vec<(&'sta
     if let Some(failed) = &status.failed {
         lines.push(("", format!("couldn't get them ready: {failed}")));
     }
-    let rerank = match settings.rerank {
-        true => "the reranker reads the best of each search again",
-        false => "off (`rerank = false` under [memory])",
-    };
-    lines.push(("rerank", rerank.to_string()));
+    match (&status.voyage, settings.rerank) {
+        (_, false) => lines.push((
+            "rerank",
+            "off (`rerank = false` under [memory])".to_string(),
+        )),
+        (None, true) => lines.push((
+            "rerank",
+            format!("by {}, on this machine", embed::RERANKER.repo),
+        )),
+        (Some(voyage), true) => {
+            lines.push((
+                "rerank",
+                format!(
+                    "by {} through Voyage AI's API: searches and entries' text go to Voyage",
+                    voyage.model
+                ),
+            ));
+            lines.push(("voyage key", key_said(&voyage.key, voyage.key_shared)));
+            let said = match (&voyage.failed, voyage.failed_secs_ago) {
+                (Some(failed), Some(secs)) => format!(
+                    "failed {}: {failed}; searches go unreranked meanwhile",
+                    failed_when(secs)
+                ),
+                (Some(failed), None) => format!("{failed}; searches go unreranked meanwhile"),
+                (None, _) if voyage.tokens == 0 => "nothing asked yet".to_string(),
+                (None, _) => format!(
+                    "working: {} tokens read since the daemon started, {}",
+                    voyage.tokens,
+                    voyage::cost(voyage.tokens)
+                ),
+            };
+            lines.push(("voyage", said));
+        }
+    }
     lines
+}
+
+/// Where an API's key is, as the status says it.
+fn key_said(key: &Option<String>, shared: bool) -> String {
+    match (key, shared) {
+        (Some(key), false) => key.clone(),
+        (Some(key), true) => format!("{key} (others can read it: chmod 600 it)"),
+        (None, _) => "none found".to_string(),
+    }
+}
+
+/// When a request failed `secs` ago, as the status says it.
+fn failed_when(secs: u64) -> String {
+    match ago(0, secs) {
+        now if now == "now" => "just now".to_string(),
+        ago => format!("{ago} ago"),
+    }
 }
 
 /// Has the daemon run the distiller over what the session `name` did, and
@@ -1344,6 +1381,76 @@ mod tests {
         let off = said(&settings, &failed);
         assert!(off.contains("off: by words alone"), "{off}");
         assert!(!off.contains("have their vector"), "{off}");
+    }
+
+    #[test]
+    fn the_status_says_what_reranks_where_voyage_s_key_is_and_how_it_went() {
+        let mut settings = MemorySettings::default();
+        let status = embed::Status {
+            entries: 2,
+            embedded: 2,
+            embedder: embed::MODEL.into(),
+            ..embed::Status::default()
+        };
+        let said = |settings: &MemorySettings, status: &embed::Status| {
+            status_lines(settings, status)
+                .iter()
+                .map(|(label, said)| format!("{label:<18}{said}\n"))
+                .collect::<String>()
+        };
+        let here = said(&settings, &status);
+        assert!(
+            here.contains("rerank            by jinaai/jina-reranker-v3, on this machine\n"),
+            "{here}"
+        );
+        settings.reranker = crate::config::Reranker::Voyage;
+        let working = voyage::Status {
+            model: "rerank-3".into(),
+            key: Some("~/.config/crystal/voyage.key".into()),
+            tokens: 4_000,
+            ..voyage::Status::default()
+        };
+        let through = embed::Status {
+            voyage: Some(working.clone()),
+            ..status.clone()
+        };
+        let voyage = said(&settings, &through);
+        assert!(
+            voyage.contains(
+                "rerank            by rerank-3 through Voyage AI's API: searches and entries' \
+                 text go to Voyage\n"
+            ),
+            "{voyage}"
+        );
+        assert!(voyage.contains("voyage key        ~/.config/crystal/voyage.key\n"));
+        assert!(
+            voyage.contains("voyage            working: 4000 tokens read since the daemon"),
+            "{voyage}"
+        );
+        let failed = embed::Status {
+            voyage: Some(voyage::Status {
+                failed: Some("no key for Voyage: put it in ~/.config/crystal/voyage.key".into()),
+                key: None,
+                ..working
+            }),
+            ..status
+        };
+        let failing = said(&settings, &failed);
+        assert!(
+            failing.contains("voyage key        none found\n"),
+            "{failing}"
+        );
+        assert!(
+            failing.contains(
+                "no key for Voyage: put it in ~/.config/crystal/voyage.key; \
+                              searches go unreranked meanwhile"
+            ),
+            "{failing}"
+        );
+        settings.rerank = false;
+        let off = said(&settings, &failed);
+        assert!(off.contains("rerank            off"), "{off}");
+        assert!(!off.contains("voyage"), "{off}");
     }
 
     #[test]

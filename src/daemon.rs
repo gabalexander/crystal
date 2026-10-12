@@ -1780,7 +1780,8 @@ impl Daemon {
     }
 
     /// How the models that search memory by meaning stand. Asked while
-    /// the config says not to search with them, the daemon lets them go;
+    /// the config says not to search with them, the daemon lets them go,
+    /// and the reranker here while it says none reranks or Voyage does;
     /// while entries have no vector yet from what searches use, and it
     /// could give them one (the models here loaded, or Gemini with a key
     /// and not resting after a failure), it does, in the background, rather
@@ -1791,7 +1792,7 @@ impl Daemon {
         let mut status = embed::status(&self.socket, &settings)?;
         let could = match status.gemini {
             Some(_) => embed::gemini_ready(&settings),
-            None => embed::is_loaded(),
+            None => embed::is_ready(),
         };
         if could && status.embedded < status.entries {
             self.prepare_embeddings(false);

@@ -24,6 +24,11 @@
 //! each, so going from one to the other, or back, embeds again only what
 //! the other hasn't.
 //!
+//! With `reranker = "voyage"`, Voyage AI's API reranks in place of the
+//! second ([`crate::voyage`], [`Voyaged`]), which isn't loaded then; when
+//! Voyage fails, a search goes on without a reranker. With both, nothing is
+//! loaded here unless Gemini fails.
+//!
 //! Both models are licensed CC BY-NC 4.0: for use that isn't commercial.
 
 use crate::config::{self, Config, MemorySettings};
@@ -31,6 +36,7 @@ use crate::gemini::{self, Gemini};
 use crate::output::errln;
 use crate::qwen3::{self, Qwen3};
 use crate::rerank::Reranker;
+use crate::voyage::{self, Voyage};
 use anyhow::{Context, Result, anyhow, bail};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -41,7 +47,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use tokenizers::{Tokenizer, TruncationParams};
 
 /// The model that turns texts into vectors, as Hugging Face names it, which
@@ -443,6 +449,17 @@ impl Models {
         self.reranker.is_some()
     }
 
+    /// Whether either model is loaded, and takes memory: the one that
+    /// makes vectors is, while it's running.
+    fn holds_any(&self) -> bool {
+        self.reranker.is_some()
+            || match self.lane.try_lock() {
+                Ok(lane) => lane.is_some(),
+                Err(TryLockError::WouldBlock) => true,
+                Err(TryLockError::Poisoned(lane)) => lane.into_inner().is_some(),
+            }
+    }
+
     /// The vectors of `texts`, the model that makes them loaded first if it
     /// isn't yet.
     fn vectors(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
@@ -559,6 +576,77 @@ impl Embed for Remote {
     }
 }
 
+/// What searches by meaning, `inner`, with Voyage AI's API reranking in
+/// place of whatever reranks there; and what a search falls back on while
+/// it fails, the model here for Gemini, reranked by Voyage too. When Voyage
+/// fails, it's said once, and a search goes on without a reranker.
+pub struct Voyaged {
+    inner: Shared,
+    voyage: Arc<Voyage>,
+    fallback: Option<Box<Voyaged>>,
+}
+
+impl Embed for Voyaged {
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+
+    fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.inner.embed_passages(texts)
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.inner.embed_query(text)
+    }
+
+    fn min_similarity(&self) -> f32 {
+        self.inner.min_similarity()
+    }
+
+    fn near_best(&self) -> f32 {
+        self.inner.near_best()
+    }
+
+    fn rerank(&self, query: &str, passages: &[&str]) -> Result<Option<Vec<f32>>> {
+        // A failure was said as it happened, and only once.
+        Ok(self.voyage.rerank(query, passages).ok())
+    }
+
+    fn answers_from(&self) -> f32 {
+        self.voyage.thresholds().answers_from
+    }
+
+    fn kept_from(&self) -> f32 {
+        self.voyage.thresholds().kept_from
+    }
+
+    fn same_from(&self) -> f32 {
+        self.inner.same_from()
+    }
+
+    fn alike_from(&self) -> f32 {
+        self.inner.alike_from()
+    }
+
+    fn same_reranked_from(&self) -> f32 {
+        self.voyage.thresholds().same_reranked_from
+    }
+
+    fn near_from(&self) -> f32 {
+        self.inner.near_from()
+    }
+
+    fn batch(&self) -> usize {
+        self.inner.batch()
+    }
+
+    fn fallback(&self) -> Option<&dyn Embed> {
+        self.fallback
+            .as_deref()
+            .map(|voyaged| voyaged as &dyn Embed)
+    }
+}
+
 /// Whether every number of `vector` is one: the model has given NaN, every
 /// number of one vector, though the same text never did again, on the GPU
 /// or the CPU, alone or in any batch.
@@ -591,20 +679,40 @@ static LOADED: Mutex<Option<Arc<Models>>> = Mutex::new(None);
 
 /// What searches by meaning, as the config says: the models here, loaded
 /// once in each process and kept, once they're downloaded; or Gemini, with
-/// them beside it when they are. With the config saying not to search by
-/// meaning, a process that had the models loaded lets them go; with it
-/// leaving the reranker out, or putting it back, they're loaded again to
-/// match.
+/// them beside it when they are; and either reranked by Voyage in place of
+/// the reranker here, when the config says so. With the config saying not
+/// to search by meaning, a process that had the models loaded lets them go;
+/// with it leaving the reranker here out, or putting it back, they're
+/// loaded again to match.
 pub fn shared(settings: &MemorySettings) -> Option<Shared> {
     let local = local(settings);
-    match settings.embedder {
-        _ if !settings.embeddings => None,
-        config::Embedder::Local => local.map(|models| models as Shared),
-        config::Embedder::Gemini => Some(Arc::new(Remote {
+    let embedding: Shared = match settings.embedder {
+        _ if !settings.embeddings => return None,
+        config::Embedder::Local => local.clone()?,
+        config::Embedder::Gemini => Arc::new(Remote {
             gemini: gemini::shared(settings),
-            local,
-        })),
+            local: local.clone(),
+        }),
+    };
+    if !settings.rerank || settings.reranker != config::Reranker::Voyage {
+        return Some(embedding);
     }
+    let voyage = voyage::shared(settings);
+    let fallback = (settings.embedder == config::Embedder::Gemini)
+        .then_some(local)
+        .flatten()
+        .map(|models| {
+            Box::new(Voyaged {
+                inner: models,
+                voyage: voyage.clone(),
+                fallback: None,
+            })
+        });
+    Some(Arc::new(Voyaged {
+        inner: embedding,
+        voyage,
+        fallback,
+    }))
 }
 
 /// Gemini alone, without the models here: what `crystal memory embed`
@@ -629,8 +737,9 @@ fn local(settings: &MemorySettings) -> Option<Arc<Models>> {
         *loaded = None;
         return None;
     }
+    let rerank = settings.reranks_here();
     if let Some(models) = &*loaded {
-        if models.has_reranker() == settings.rerank {
+        if models.has_reranker() == rerank {
             return Some(models.clone());
         }
         *loaded = None;
@@ -639,7 +748,7 @@ fn local(settings: &MemorySettings) -> Option<Arc<Models>> {
     if !is_downloaded(&root) {
         return None;
     }
-    match Models::load(&root, settings.rerank) {
+    match Models::load(&root, rerank) {
         Ok(models) => {
             let models = Arc::new(models);
             *loaded = Some(models.clone());
@@ -672,13 +781,17 @@ pub fn gemini_model(settings: &MemorySettings) -> String {
 
 /// How search by meaning stands in this process, as `settings` say: the
 /// models' files here, whether it has them loaded, how many entries have
-/// their vector from what searches use, and how Gemini stands, when that's
-/// it. What the daemon is doing to get them ready is for it to say.
+/// their vector from what searches use, how Gemini stands, when that's it,
+/// and Voyage, when it reranks. What the daemon is doing to get them ready
+/// is for it to say.
 pub fn status(socket: &Path, settings: &MemorySettings) -> Result<Status> {
     let embedder = model_now(settings);
     let (entries, embedded) = crate::memory::Store::open(socket)?.counts(&embedder)?;
     let gemini = (settings.embeddings && settings.embedder == config::Embedder::Gemini)
         .then(|| gemini::shared(settings).status());
+    let voyage =
+        (settings.embeddings && settings.rerank && settings.reranker == config::Reranker::Voyage)
+            .then(|| voyage::shared(settings).status());
     Ok(Status {
         on_disk: models_dir().map_or(0, |dir| on_disk(&dir)),
         size: size(),
@@ -689,6 +802,7 @@ pub fn status(socket: &Path, settings: &MemorySettings) -> Result<Status> {
         embedded,
         embedder,
         gemini,
+        voyage,
     })
 }
 
@@ -700,16 +814,28 @@ pub fn gemini_ready(settings: &MemorySettings) -> bool {
         && gemini::shared(settings).ready()
 }
 
-/// Whether this process has the models loaded.
-pub fn is_loaded() -> bool {
+/// Whether this process has the models ready to run: either loaded, or
+/// the one that makes vectors to be loaded once it's asked for one.
+pub fn is_ready() -> bool {
     LOADED.lock().unwrap().is_some()
 }
 
+/// Whether this process has either model loaded, taking memory.
+pub fn is_loaded() -> bool {
+    let models = LOADED.lock().unwrap().clone();
+    models.is_some_and(|models| models.holds_any())
+}
+
 /// Lets the models go, when this process has them and the config now says
-/// not to search with them.
+/// not to search with them, or has the reranker here and the config says
+/// none reranks or Voyage does: the model that makes vectors is loaded
+/// again once it's asked for one.
 pub fn let_go_unless(settings: &MemorySettings) {
-    if !settings.embeddings {
-        LOADED.lock().unwrap().take();
+    let mut loaded = LOADED.lock().unwrap();
+    let reranker_unwanted =
+        (loaded.as_ref()).is_some_and(|models| models.has_reranker() && !settings.reranks_here());
+    if !settings.embeddings || reranker_unwanted {
+        loaded.take();
     }
 }
 
@@ -722,7 +848,7 @@ pub struct Status {
     /// way, and how much they are in all.
     pub on_disk: u64,
     pub size: u64,
-    /// Whether the daemon has them loaded.
+    /// Whether the daemon has either loaded, taking memory.
     pub loaded: bool,
     /// What the daemon is doing to get them ready, while it does.
     pub preparing: Option<String>,
@@ -739,6 +865,9 @@ pub struct Status {
     /// How Gemini stands, while searches use it.
     #[serde(default)]
     pub gemini: Option<gemini::Status>,
+    /// How Voyage stands, while it reranks.
+    #[serde(default)]
+    pub voyage: Option<voyage::Status>,
 }
 
 impl Status {
@@ -1022,6 +1151,111 @@ mod tests {
         let still = |_: &str| -> Result<Vec<Vec<f32>>> { Ok(vec![vec![f32::INFINITY, 0.0]]) };
         let made = again_unless_numbers(vectors, &texts, still).unwrap();
         assert!(is_numbers(&made[0]) && !is_numbers(&made[1]));
+    }
+
+    /// What makes vectors, with thresholds of its own and a reranker that
+    /// mustn't be asked.
+    struct Vectors;
+
+    impl Embed for Vectors {
+        fn model(&self) -> &str {
+            "vectors@2"
+        }
+
+        fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.0, 1.0]).collect())
+        }
+
+        fn embed_query(&self, _text: &str) -> Result<Vec<f32>> {
+            Ok(vec![1.0, 0.0])
+        }
+
+        fn min_similarity(&self) -> f32 {
+            0.11
+        }
+
+        fn near_best(&self) -> f32 {
+            0.12
+        }
+
+        fn same_from(&self) -> f32 {
+            0.93
+        }
+
+        fn alike_from(&self) -> f32 {
+            0.91
+        }
+
+        fn near_from(&self) -> f32 {
+            0.81
+        }
+
+        fn batch(&self) -> usize {
+            7
+        }
+
+        fn rerank(&self, _query: &str, _passages: &[&str]) -> Result<Option<Vec<f32>>> {
+            panic!("Voyage reranks in its place")
+        }
+    }
+
+    #[test]
+    fn voyage_reranks_with_its_thresholds_what_another_makes_vectors_for() {
+        use crate::web_api::fake::{self, Fake};
+        let fake = Fake::new("/v1", |_| {
+            let reply = r#"{"data": [{"relevance_score": 0.9, "index": 1},
+                {"relevance_score": 0.2, "index": 0}], "usage": {"total_tokens": 20}}"#;
+            (200, reply.to_string())
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("voyage.key");
+        fs::write(&key_file, "pa-fake-for-tests\n").unwrap();
+        let voyage = Arc::new(Voyage::for_tests(key_file.clone(), &fake.url));
+        let voyaged = Voyaged {
+            inner: Arc::new(Vectors),
+            voyage: voyage.clone(),
+            fallback: Some(Box::new(Voyaged {
+                inner: Arc::new(Vectors),
+                voyage,
+                fallback: None,
+            })),
+        };
+        assert_eq!(voyaged.model(), "vectors@2");
+        assert_eq!(voyaged.embed_query("q").unwrap(), [1.0, 0.0]);
+        assert_eq!(
+            (
+                voyaged.min_similarity(),
+                voyaged.near_best(),
+                voyaged.batch()
+            ),
+            (0.11, 0.12, 7)
+        );
+        assert_eq!(
+            (
+                voyaged.same_from(),
+                voyaged.alike_from(),
+                voyaged.near_from()
+            ),
+            (0.93, 0.91, 0.81)
+        );
+        let measured = voyage::thresholds(voyage::MODEL);
+        assert_eq!(voyaged.answers_from(), measured.answers_from);
+        assert_eq!(voyaged.kept_from(), measured.kept_from);
+        assert_eq!(voyaged.same_reranked_from(), measured.same_reranked_from);
+        assert_eq!(
+            voyaged.rerank("q", &["a", "b"]).unwrap(),
+            Some(vec![0.2, 0.9])
+        );
+        let fallback = voyaged.fallback().unwrap();
+        assert_eq!(fallback.answers_from(), measured.answers_from);
+        assert!(fallback.fallback().is_none());
+        // Voyage failing leaves the search unreranked, not failed.
+        let offline = Voyaged {
+            inner: Arc::new(Vectors),
+            voyage: Arc::new(Voyage::for_tests(key_file, &fake::nowhere())),
+            fallback: None,
+        };
+        assert_eq!(offline.rerank("q", &["a"]).unwrap(), None);
     }
 
     /// Runs the real models, once `crystal memory embed` has downloaded

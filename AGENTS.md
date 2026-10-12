@@ -426,8 +426,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     from the sessions the TUI sees waiting their turn, and those that failed, said once; pure
   - `settings_view.rs`: the settings view (`,`): the settings in tabs (general, look, sessions, mouse, tasks,
     memory), each under its heading, changed with a key, gone through with the arrows or typed in, or taken out
-    of the file for its default, and how the models stand, and with Gemini, where its key is or why it last
-    failed; crystal's hooks in each agent installed here, put
+    of the file for its default, and how the models stand, and with Gemini or Voyage, where its key is or why
+    it last failed; crystal's hooks in each agent installed here, put
     in, brought up to date or taken out with a key; and the keys' tab, every key `[keys]` gives or those `/`'s
     filter finds, the key pressed next given one, one another has taken from it, or an installed plugin's
     action takes, once the user says so; a click on a tab or a row, and the wheel, where `hit` says the mouse
@@ -774,15 +774,27 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   it starts unless `CRYSTAL_NO_MODEL_DOWNLOAD` is set; the one copy each process loads when `[memory]
   embeddings` is on, the reranker as it loads and the model that makes vectors once it's first asked for one;
   with `embedder = "gemini"`, `Remote`: Gemini's vectors, the reranker here, and the model here to fall back
-  on while Gemini fails; and how search by meaning stands (`Status`); memory.rs keeps the vectors, one from
-  each model, and merges the rankings
+  on while Gemini fails; with `reranker = "voyage"`, `Voyaged`: Voyage's API reranking whatever makes the
+  vectors, and what Gemini falls back on, with its own thresholds, the reranker here not loaded and a search
+  unreranked while Voyage fails; and how search by meaning stands (`Status`), the models loaded only while
+  they take memory; memory.rs keeps the vectors, one from each model, and merges the rankings
 - `src/gemini.rs`: search by meaning through Google's Gemini API (`gemini-embedding-2`): its key read from
-  `gemini_key_file` or `GEMINI_API_KEY`/`GOOGLE_API_KEY` for each request and handed to `curl` on its
-  standard input with the request (never argv, the config file or a log), entries a hundred to a
+  `gemini_key_file` or `GEMINI_API_KEY`/`GOOGLE_API_KEY` for each request and asked through `web_api.rs`,
+  entries a hundred to a
   `batchEmbedContents`, four at once, each text after Google's task prefix with credentials taken out, a
   query's vector kept an hour, a failure said once and kept for the status with no request tried for a while
   after it (as long as a 429 asks, or until the key changes), the thresholds measured for it at each size,
   and what its tokens cost; `CRYSTAL_GEMINI_URL` points it elsewhere, as tests do, at a fake server
+- `src/voyage.rs`: reranking through Voyage AI's API (`rerank-3` unless `voyage_model` names another it was
+  measured for): its key read from `voyage_key_file` or `VOYAGE_API_KEY` for each request and asked through
+  `web_api.rs`, a search and its passages, credentials taken out, as one `rerank`, the scores read back into
+  the passages' order, what a search was scored kept an hour, a failure said once and kept for the status
+  with no request tried for a while after it, the thresholds measured for each model, and what its tokens
+  cost; `CRYSTAL_VOYAGE_URL` points it elsewhere, as tests do, at a fake server
+- `src/web_api.rs`: what Gemini and Voyage share: a key read from its file or the environment and checked,
+  handed to `curl` on its standard input with the request (never argv, the config file or a log), what's said
+  of a failure scrubbed of it, how long to rest after one, and how an API stands for its status; and a fake
+  server on 127.0.0.1 for their tests
 - `src/qwen3.rs`: Qwen3, the transformer both models are, adapted from candle-transformers' to read texts whole:
   no cache, a batch padded at its end, causal attention through Candle's fused kernel on Metal (past 8 tokens,
   below which Candle's kernel isn't causal)

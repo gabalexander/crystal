@@ -149,6 +149,7 @@ fn looks_like_a_key(word: &str) -> bool {
         || (word.starts_with("ya29.") && len >= 20)
         || (word.starts_with("npm_") && len >= 36)
         || (word.starts_with("hf_") && len >= 30)
+        || (word.starts_with("pa-") && len >= 40 && is_base64url(&word[3..]))
         || (word.starts_with("eyJ") && len >= 30 && word.matches('.').count() == 2)
         || (!word.contains('/') && word.split('.').any(looks_generated))
 }
@@ -271,6 +272,10 @@ mod tests {
             (
                 "gemini AQ.FakeTestKey0123456789-abcdefghijklmnop_QRSTUVWXYZab works.",
                 "gemini [redacted] works.",
+            ),
+            (
+                "voyage pa-fakevoyagekeyabcdefghijklmnopqrstuvwxyz_- works",
+                "voyage [redacted] works",
             ),
             (
                 "sendgrid SG.FakeSendGrid0123456789.FakeSecretPart0123456789abcdefghijKLMNOPQ",
