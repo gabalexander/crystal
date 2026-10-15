@@ -87,12 +87,12 @@ keys` lists them.
 
 ## In a pane
 
-While you're typing into a session, every key goes to it, `Tab` included, except `Ctrl+\`, which takes you
+While you're typing into a session, every key goes to it, `Tab` included, except `Ctrl+Q`, which takes you
 back to the sidebar, `Shift+PageUp` / `Shift+PageDown`, which page through the pane's history, and the prefix,
 `Ctrl+B`: press it, then any key in the table above, and that key's command runs without the keyboard leaving
 the pane, as in tmux. `Ctrl+B` twice sends `Ctrl+B` to the program, and `Esc` after it does nothing. Some
 terminals keep `Shift+PageUp` for their own scrolling; `Ctrl+B` and then `PageUp` does the same. Every key in
-the table, the prefix and `Ctrl+\` included, can be changed, a command can have a key that works in a pane with
+the table, the prefix and `Ctrl+Q` included, can be changed, a command can have a key that works in a pane with
 no prefix at all, and keys of your own can open a popup or run a command: see
 [keys and commands](#commands-and-keys).
 
@@ -124,7 +124,17 @@ Two commands given the same key, a command or a key crystal doesn't know, are er
 name that's nearly one crystal knows says which, so a typo never goes unnoticed. Keys are written as `n`, `N`
 (or `shift+n`), `ctrl+b`, `alt+enter`, `ctrl+alt+h`, `shift+left`, `pageup`, `space`, `f5`, or the character
 itself, like `|`, `(` or `:`. The `?` overlay, the footer and the command list all say the keys you chose. The
-[settings view](configuration.md#the-settings-view)'s keys tab gives a command the key you press, with the same checks.
+[settings view](configuration.md#the-settings-view)'s keys tab gives a command the key you press, with the same checks,
+and `R` there puts every key back as crystal has it.
+
+Some keys never reach crystal from some terminals, and crystal says so, as you give one in the settings view and
+at the end of `crystal keys`, giving it all the same. Without the [Kitty keyboard
+protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/), which crystal asks for and Ghostty, kitty,
+WezTerm, foot and Alacritty speak but Terminal.app doesn't, a terminal sends `ctrl+i` as `Tab`, `ctrl+m` as
+`Enter`, `ctrl+h` as `Backspace` and `ctrl+[` as `Esc`, and nothing at all for `ctrl` with most punctuation or
+digits, or for `shift+enter`. On a Mac, Mission Control takes `ctrl` and the arrows, and `alt` with a letter
+types a character unless the terminal sends `Option` as `Meta`, which is why `alt+j` and `alt+k` may do nothing
+there.
 
 Every prefix in the list starts the same thing: the first is the one the footer shows. Inside a pane every key
 goes to the program but the prefixes and the hand-back key, so a command's key works there only after a prefix,
@@ -201,7 +211,7 @@ A command is a line for `/bin/sh -c`, run in the selected session's directory, o
 selected. It finds `CRYSTAL_BIN` and `CRYSTAL_SOCKET` in its environment, and the selected session's
 `CRYSTAL_SESSION`, `CRYSTAL_SESSION_ID`, `CRYSTAL_PROJECT` and `CRYSTAL_WORKTREE`, as a [plugin](plugins.md)'s
 action does; a popup, a pane and a tab are sessions of their own, so their `CRYSTAL_SESSION` is their own. A
-popup is in `crystal ls` while it's open, ends when its program does or when you press `Ctrl+\`, and takes
+popup is in `crystal ls` while it's open, ends when its program does or when you press `Ctrl+Q`, and takes
 every other key, `Esc` included. A pane's or a tab's session stays when its command ends, to read what it said
 or run it again with `Enter`, like any other. Your commands are in the command list and the `?` overlay, under
 what they're called.

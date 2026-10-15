@@ -50,7 +50,7 @@ one with work of its own still running, a command in the background or a Monitor
 |---|---|
 | `j` `k` | Move down and up the sidebar |
 | `Enter` | Type into the selected session |
-| `Ctrl+\` | Leave a pane: the keyboard goes back to the sidebar |
+| `Ctrl+Q` | Leave a pane: the keyboard goes back to the sidebar |
 | `Ctrl+B` | The prefix: in a pane, the next key is the sidebar's |
 | `n` `w` | A new session, or one in a new worktree |
 | `Space` | Reply to the selected session |

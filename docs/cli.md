@@ -28,7 +28,7 @@ crystal worktree move fix/login             # move this session into a worktree,
 crystal worktree rm fix/login               # remove that worktree, once nothing runs in it
 crystal ls                                  # list sessions and how they're doing
 crystal ls --json                           # the same, as JSON, for scripts and agents
-crystal attach review                       # show a session; Ctrl+\ hands your terminal back
+crystal attach review                       # show a session; Ctrl+Q hands your terminal back
 crystal send review "check the diff"        # type into a session and press Enter
 crystal send-keys review 1                  # press keys: an answer, Enter, Escape, C-c, Up…
 crystal wait review                         # block until its agent stops working; print how it ended
@@ -122,9 +122,9 @@ The first `crystal new` starts the daemon. Sessions keep running after you detac
 `crystal attach` picks up exactly where the screen was. With no name it attaches to the newest session; on a
 session that has ended, it prints the last screen and how the program exited.
 
-In `crystal attach` a few keys are crystal's, as they are in a pane: `Ctrl+\` detaches, and the prefix, `Ctrl+B`,
+In `crystal attach` a few keys are crystal's, as they are in a pane: `Ctrl+Q` detaches, and the prefix, `Ctrl+B`,
 then `v` puts the screen in [copy mode](tui.md#zoom-copy-mode-and-search), with the search typed on its bottom row and
 what it says at its top right. `PageUp` or `PageDown` after the prefix, or `Shift+PageUp` and `Shift+PageDown`,
 page through the session's history, from before you attached as well, until you type. The prefix twice sends
 the program the prefix, and while it waits, the top right says what can follow it. They're the keys `[keys]`
-gives `prefix`, `copy`, `page-up` and `page-down`, and one written `direct+` works without the prefix.
+gives `hand-back`, `prefix`, `copy`, `page-up` and `page-down`, and one written `direct+` works without the prefix.

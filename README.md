@@ -79,7 +79,7 @@ you quit.
 | Key | What it does |
 |---|---|
 | `j` / `k` | select a session |
-| `Enter` | type into it; `Ctrl+\` hands the keyboard back to the sidebar |
+| `Enter` | type into it; `Ctrl+Q` hands the keyboard back to the sidebar |
 | `Space` | reply to it without going into its pane |
 | `u` | go to the next session that needs you |
 | `d` | what changed in its worktree |
@@ -93,7 +93,7 @@ Everything is also a command, for scripts and for agents:
 ```sh
 crystal new -d -n fixer -w fix/login claude "fix the login redirect"   # Claude Code in a new worktree
 crystal ls                                      # the sessions and how they're doing
-crystal attach fixer                            # show one; Ctrl+\ hands your terminal back
+crystal attach fixer                            # show one; Ctrl+Q hands your terminal back
 crystal send fixer "add a test for it" --wait   # type into a session, and wait for its turn to end
 crystal read fixer --lines 40                   # the end of its screen
 crystal integration install                     # crystal's hooks in the agents you start yourself

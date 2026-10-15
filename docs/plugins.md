@@ -149,7 +149,7 @@ A pane is a session of its own, started in the plugin's directory. Its `placemen
 | `tab` | in a tab of its own, named after its title |
 
 Over the panes or in a popup, it's in `crystal ls` while it's open, and ends when its program does or when you
-press `Ctrl+\`. Split off, zoomed or in a tab, it's a session like the others: it stays once its program has
+press `Ctrl+Q`. Split off, zoomed or in a tab, it's a session like the others: it stays once its program has
 ended, until you kill it. Its `CRYSTAL_SESSION` is its own; `CRYSTAL_PROJECT` and `CRYSTAL_WORKTREE` are the
 selected session's.
 

@@ -760,7 +760,7 @@ fn a_stale_socket_does_not_stop_the_daemon_from_starting() {
 }
 
 #[test]
-fn attach_shows_the_session_until_ctrl_backslash() {
+fn attach_shows_the_session_until_ctrl_q() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "cat", "cat"]);
 
@@ -768,7 +768,7 @@ fn attach_shows_the_session_until_ctrl_backslash() {
     terminal.type_keys("hello from the keyboard\r");
     terminal.shows("hello from the keyboard");
 
-    terminal.type_keys("\x1c");
+    terminal.type_keys("\x11");
     terminal.shows("[detached from cat]");
     assert!(terminal.exit());
     assert_eq!(crystal.row("cat").unwrap()[1], "running");
@@ -790,7 +790,7 @@ fn attach_passes_the_session_s_bell_on_to_your_terminal() {
     thread::sleep(Duration::from_millis(600));
     assert_eq!(terminal.bells(), 1);
 
-    terminal.type_keys("\x1c");
+    terminal.type_keys("\x11");
     terminal.shows("[detached from ringer]");
 }
 
@@ -920,7 +920,7 @@ fn attach_asks_your_terminal_for_what_the_program_asked_and_gives_it_back() {
     eventually("pastes are marked", || terminal.marks_pastes());
     assert!(terminal.sends_the_mouse());
 
-    terminal.type_keys("\x1c");
+    terminal.type_keys("\x11");
     terminal.shows("[detached from asker]");
     assert!(!terminal.marks_pastes());
     assert!(!terminal.sends_the_mouse());
@@ -945,7 +945,7 @@ fn attach_has_the_wheel_send_arrows_only_while_the_program_is_on_the_alternate_s
     eventually("the wheel sends arrows", || terminal.wheel_sends_arrows());
 
     // Detached, your terminal has it as it was before.
-    terminal.type_keys("\x1c");
+    terminal.type_keys("\x11");
     terminal.shows("[detached from scroller]");
     terminal.wrote("\x1b[?1007s", 1);
     terminal.wrote("\x1b[?1007r", 1);
@@ -990,7 +990,7 @@ fn attach_taking_the_mouse_scrolls_the_history_with_the_wheel_until_you_type() {
     terminal.shows("got hi");
     terminal.hides("↑");
 
-    terminal.type_keys("\x1c");
+    terminal.type_keys("\x11");
     terminal.shows("[detached from counter]");
     assert!(!terminal.sends_the_mouse());
 }
@@ -1057,7 +1057,7 @@ fn attach_has_copy_mode_after_the_prefix_and_its_search_goes_as_you_type() {
     terminal.shows("got hi");
     terminal.hides("copied");
 
-    terminal.type_keys("\x1c");
+    terminal.type_keys("\x11");
     terminal.shows("[detached from printer]");
 }
 
@@ -1077,7 +1077,7 @@ fn attach_taking_the_mouse_selects_with_a_drag_and_copies_it() {
     terminal.type_keys("\x1b[<0;7;1M\x1b[<32;10;1M\x1b[<0;10;1m");
     terminal.copies("beta");
     terminal.shows("copied 1 line");
-    terminal.type_keys("\x1c");
+    terminal.type_keys("\x11");
     terminal.shows("[detached from words]");
     drop(terminal);
 
@@ -1093,15 +1093,15 @@ fn attach_taking_the_mouse_selects_with_a_drag_and_copies_it() {
 }
 
 #[test]
-fn attach_detaches_on_ctrl_backslash_in_the_kitty_keyboard_protocol() {
+fn attach_detaches_on_ctrl_q_in_the_kitty_keyboard_protocol() {
     let crystal = Crystal::new();
     let script = r"printf '\033[>1ukitty'; sleep 30";
     crystal.ok(&["new", "-n", "kitty", "sh", "-c", script]);
 
     let mut terminal = crystal.attach(&["attach", "kitty"]);
     terminal.shows("kitty");
-    // How a terminal that speaks the protocol writes Ctrl+\.
-    terminal.type_keys("\x1b[92;5u");
+    // How a terminal that speaks the protocol writes Ctrl+Q.
+    terminal.type_keys("\x1b[113;5u");
     terminal.shows("[detached from kitty]");
     assert!(terminal.exit());
 }
@@ -1130,7 +1130,7 @@ fn new_attaches_when_run_in_a_terminal() {
     terminal.type_keys("echo I am $CRYSTAL_SESSION\r");
     terminal.shows("I am shell");
 
-    terminal.type_keys("\x1c");
+    terminal.type_keys("\x11");
     terminal.shows("[detached from shell]");
     assert!(terminal.exit());
 }
@@ -1283,7 +1283,7 @@ fn the_tui_lists_the_sessions_and_shows_the_selected_one() {
 }
 
 #[test]
-fn keys_go_to_the_pane_after_enter_and_back_to_the_list_after_ctrl_backslash() {
+fn keys_go_to_the_pane_after_enter_and_back_to_the_list_after_ctrl_q() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "cat", "cat"]);
 
@@ -1294,7 +1294,7 @@ fn keys_go_to_the_pane_after_enter_and_back_to_the_list_after_ctrl_backslash() {
     tui.type_keys("hello pane\r");
     tui.shows("hello pane");
 
-    tui.type_keys("\x1c");
+    tui.type_keys("\x11");
     tui.shows("q quit");
     // Back on the list, q quits rather than going to cat.
     tui.type_keys("q");
@@ -1410,8 +1410,8 @@ fn the_task_is_edited_by_words_and_kept_as_a_draft_until_a_session_starts() {
     assert!(args.ends_with("\n--\nfix the bug\n"), "{args:?}");
 
     // A session started from it, it's gone. The session has the keyboard:
-    // Ctrl+\\ hands it back to the sidebar.
-    tui.type_keys("\x1c");
+    // Ctrl+Q hands it back to the sidebar.
+    tui.type_keys("\x11");
     tui.hides("typing into");
     tui.type_keys("n");
     tui.shows("What should it do?");
@@ -2086,7 +2086,7 @@ fn f_floats_a_session_over_the_panes_and_puts_it_back() {
     eventually("the session is the float's size", || size_is("14 49\n"));
 
     // Back in the sidebar, it goes on floating, until F puts it back.
-    tui.type_keys("\x1c");
+    tui.type_keys("\x11");
     tui.shows("F puts it back");
     tui.type_keys("F");
     tui.hides("floating");
@@ -2463,7 +2463,7 @@ fn claude_reports_what_it_is_doing_through_its_hooks() {
 
     // Looking at a finished turn marks it seen.
     let mut terminal = crystal.attach(&["attach", "agent"]);
-    terminal.type_keys("\x1c");
+    terminal.type_keys("\x11");
     assert!(terminal.exit());
     assert_eq!(crystal.row("agent").unwrap()[1], "idle");
 }
@@ -5094,11 +5094,11 @@ fn tab_takes_the_keyboard_on_to_a_split_and_its_session_gets_the_keys() {
     // again.
     tui.type_keys("\t");
     tui.shows("typing into reader");
-    tui.type_keys("\x1c");
+    tui.type_keys("\x11");
     tui.shows("q quit");
     tui.type_keys("\t");
     tui.shows("typing into other");
-    tui.type_keys("\x1c");
+    tui.type_keys("\x11");
     tui.shows("q quit");
     tui.type_keys("\t");
     tui.shows("typing into reader");
@@ -5382,7 +5382,7 @@ fn new_tab_with_a_shell(tui: &mut Terminal) {
     tui.type_keys("echo in the new tab\r");
     tui.shows("in the new tab");
     sidebar_shows(tui, "❯ sh");
-    tui.type_keys("\x1c");
+    tui.type_keys("\x11");
 }
 
 #[test]
@@ -7189,7 +7189,7 @@ fn nobody_is_told_about_a_session_someone_is_watching() {
     assert!(lines_in(&notices).is_empty());
 
     // Seen while it waited, it isn't news once the user looks away.
-    terminal.type_keys("\x1c");
+    terminal.type_keys("\x11");
     assert!(terminal.exit());
     thread::sleep(Duration::from_millis(800));
     assert!(lines_in(&notices).is_empty());
@@ -11841,7 +11841,7 @@ fn enter_on_a_pull_request_starts_a_session_in_its_worktree_forks_too() {
     assert_eq!(upstream.trim(), "origin/fix-login");
 
     // The fork's `main` is never the project's: it goes under its owner.
-    tui.type_keys("\x1c");
+    tui.type_keys("\x11");
     tui.type_keys("O");
     tui.shows("Dark mode");
     tui.type_keys("\x1b[B\r");
@@ -12355,10 +12355,10 @@ fn a_terminal_as_narrow_as_a_phone_shows_the_sidebar_or_the_pane() {
     // The sidebar across all of it, over the pane.
     tui.hides("ready-in-planner");
     tui.shows("planner");
-    // Typing into the session, its pane takes it all; Ctrl+\ goes back.
+    // Typing into the session, its pane takes it all; Ctrl+Q goes back.
     tui.type_keys("\r");
     tui.shows("ready-in-planner");
-    tui.type_keys("\x1c");
+    tui.type_keys("\x11");
     tui.hides("ready-in-planner");
     tui.resize(24, 80);
     tui.shows("ready-in-planner");
@@ -15530,9 +15530,9 @@ command = ["sh", "show.sh"]
         crystal.row("board-show").is_none()
     });
 
-    // Ctrl+\ closes it too, and ends its session.
+    // Ctrl+Q closes it too, and ends its session.
     open(&mut tui);
-    tui.type_keys("\x1c");
+    tui.type_keys("\x11");
     tui.hides("the board says hi");
     eventually("its session ends with it", || {
         crystal.row("board-show").is_none()
@@ -16393,7 +16393,7 @@ command = ["sh", "show.sh"]
         refused.contains("The board is open over the panes already"),
         "{refused}"
     );
-    tui.type_keys("\x1c");
+    tui.type_keys("\x11");
     tui.hides("board · The board");
     eventually("its session ends with it", || {
         crystal.row("board-show").is_none()
@@ -18607,7 +18607,7 @@ fn an_agent_left_idle_is_stopped_and_starts_again_where_it_was() {
     thread::sleep(Duration::from_millis(1500));
     assert_eq!(crystal.row("agent").unwrap()[1], "done");
     let mut seen = crystal.attach(&["attach", "agent"]);
-    seen.type_keys("\x1c");
+    seen.type_keys("\x11");
     assert!(seen.exit());
     eventually("the idle agent is stopped", || {
         crystal.row("agent").unwrap()[1] == "stopped idle"
@@ -18634,7 +18634,7 @@ fn an_agent_left_idle_is_stopped_and_starts_again_where_it_was() {
     let mut back = crystal.attach_with_env(&["attach", "agent"], &[("PATH", &path)]);
     eventually("it's started again", || args.exists());
     assert_eq!(written(&args), "--resume\ns 1\n");
-    back.type_keys("\x1c");
+    back.type_keys("\x11");
     assert!(back.exit());
     assert_ne!(crystal.row("agent").unwrap()[1], "stopped idle");
     crash(daemon);
@@ -18686,7 +18686,7 @@ fn an_agent_with_a_job_running_on_its_own_is_left_until_the_job_ends() {
         crystal.listed("agent")["activity"] == "done"
     });
     let mut seen = crystal.attach(&["attach", "agent"]);
-    seen.type_keys("\x1c");
+    seen.type_keys("\x11");
     assert!(seen.exit());
     thread::sleep(Duration::from_millis(2000));
     assert_eq!(crystal.row("agent").unwrap()[1], "idle", "its job holds it");

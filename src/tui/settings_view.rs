@@ -678,6 +678,9 @@ enum Editing {
         rebinding: Rebinding,
         action: Option<String>,
     },
+    /// `R` pressed on the keys' tab: waiting for Enter to put every key the
+    /// file gives back as crystal has it, or any other key to leave them.
+    ResettingAll(Rebinding),
     /// The keys' tab's filter being typed.
     Filter,
 }
@@ -833,7 +836,18 @@ impl SettingsView {
         match self.editing.take() {
             Some(Editing::Text(input)) => return self.on_text_key(input, key),
             Some(Editing::Capture { add }) => return self.on_captured(key, add),
-            Some(Editing::Taking { rebinding, .. }) => {
+            Some(Editing::Taking {
+                chord, rebinding, ..
+            }) => {
+                return match key.code {
+                    KeyCode::Enter => {
+                        self.note = kept_said(chord);
+                        Outcome::Keys(rebinding)
+                    }
+                    _ => Outcome::Stay,
+                };
+            }
+            Some(Editing::ResettingAll(rebinding)) => {
                 return match key.code {
                     KeyCode::Enter => Outcome::Keys(rebinding),
                     _ => Outcome::Stay,
@@ -1006,6 +1020,13 @@ impl SettingsView {
             }
             KeyCode::Char('x') => keymap::unbind(&keys, id),
             KeyCode::Backspace | KeyCode::Delete => keymap::reset(&keys, id),
+            KeyCode::Char('R') => match keymap::reset_all(&keys) {
+                Ok(rebinding) => {
+                    self.editing = Some(Editing::ResettingAll(rebinding));
+                    return Outcome::Stay;
+                }
+                Err(why) => Err(why),
+            },
             _ => return Outcome::Stay,
         };
         self.keys_or_why(rebinding)
@@ -1042,7 +1063,12 @@ impl SettingsView {
                 });
                 Outcome::Stay
             }
-            rebinding => self.keys_or_why(rebinding),
+            rebinding => {
+                if rebinding.is_ok() {
+                    self.note = kept_said(chord);
+                }
+                self.keys_or_why(rebinding)
+            }
         }
     }
 
@@ -1356,6 +1382,7 @@ pub fn hints(view: &SettingsView) -> &'static [(&'static str, &'static str)] {
         Some(Editing::Text(_)) => &[("enter", "save"), ("esc", "leave it")],
         Some(Editing::Capture { .. }) => &[("a key", "give it"), ("esc", "leave it")],
         Some(Editing::Taking { .. }) => &[("enter", "take it"), ("esc", "leave it")],
+        Some(Editing::ResettingAll(_)) => &[("enter", "put them back"), ("esc", "leave them")],
         Some(Editing::Filter) => &[("enter", "keep it"), ("↑/↓", "move"), ("esc", "show all")],
         None => match view.row() {
             None if view.filter.is_some() => &[("/", "filter"), ("esc", "show all")],
@@ -1765,6 +1792,22 @@ fn foot(view: &SettingsView, theme: &Theme, width: usize) -> Vec<Line<'static>> 
                 ),
                 (None, None) => String::new(),
             };
+            let said = match chord.kept() {
+                Some(why) => format!("{said}; and it may never reach crystal: {why}"),
+                None => said,
+            };
+            (said, theme.waiting)
+        }
+        (Some(Editing::ResettingAll(rebinding)), _) => {
+            let count = rebinding.lines.len();
+            let keys = match count {
+                1 => "the key the file gives".to_string(),
+                _ => format!("the {count} keys the file gives"),
+            };
+            let said = format!(
+                "enter puts {keys} back as crystal has them, your [[keys.command]] keys \
+                 staying; esc leaves them"
+            );
             (said, theme.waiting)
         }
         (_, Some(problem)) => (problem.clone(), theme.failed),
@@ -1776,6 +1819,15 @@ fn foot(view: &SettingsView, theme: &Theme, width: usize) -> Vec<Line<'static>> 
     let lines = wrapped(&said, width).into_iter();
     let lines = lines.map(|line| Line::styled(line, Style::new().fg(color)));
     std::iter::once(Line::from("")).chain(lines).collect()
+}
+
+/// What's said of `chord` given a command, when a terminal may keep it
+/// from crystal: given all the same.
+fn kept_said(chord: Chord) -> Option<String> {
+    Some(format!(
+        "{chord} may never reach crystal: {}",
+        chord.kept()?
+    ))
 }
 
 /// `text` in lines at most `width` characters long, broken between words,
@@ -2465,8 +2517,9 @@ fn key_lines(view: &SettingsView, config: &Config, theme: &Theme, body: &mut Bod
         }
     };
     body.say(Line::from(""));
+    // A key pressed that can't be given says why as it's pressed.
     body.say(Line::styled(
-        "a key you press for a command is checked as the file's are; • the file gives it",
+        "• the file gives it; R puts every one back as crystal has it",
         muted,
     ));
     if view.keys.is_empty() {
@@ -3080,6 +3133,79 @@ mod tests {
                 taken_from: None,
             })
         );
+    }
+
+    #[test]
+    fn a_key_a_terminal_may_keep_is_given_and_said_so() {
+        let new_session = KeyId::Command(Command::NewSession);
+        let mut view = on_key_row(Config::default(), new_session);
+        press(&mut view, KeyCode::Enter);
+        let ctrl_i = KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL);
+        let Outcome::Keys(rebinding) = view.on_key(ctrl_i) else {
+            panic!("not given")
+        };
+        assert_eq!(
+            rebinding.lines,
+            [(new_session, Some(Binding::One("ctrl+i".into())))]
+        );
+        assert!(
+            text(&view).contains("ctrl+i may never reach crystal: a terminal without the Kitty"),
+            "{}",
+            text(&view)
+        );
+        // Taken from another, it says so as it asks, and once it's given.
+        let mut view = on_key_row(Config::default(), new_session);
+        press(&mut view, KeyCode::Enter);
+        let alt_k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT);
+        assert_eq!(view.on_key(alt_k), Outcome::Stay);
+        assert!(
+            text(&view).contains("alt+k is move-up's: enter takes it from it, esc leaves it;"),
+            "{}",
+            text(&view)
+        );
+        assert!(matches!(press(&mut view, KeyCode::Enter), Outcome::Keys(_)));
+        assert!(text(&view).contains("alt+k may never reach crystal"));
+        // A key every terminal sends says nothing.
+        press(&mut view, KeyCode::Enter);
+        assert!(matches!(press(&mut view, KeyCode::F(2)), Outcome::Keys(_)));
+        assert!(!text(&view).contains("may never reach"), "{}", text(&view));
+    }
+
+    #[test]
+    fn capital_r_puts_every_key_back_once_the_user_says() {
+        let config = Config {
+            keys: toml::from_str(
+                "kill = \"K\"\nprefix = \"ctrl+a\"\n[[command]]\nkey = \"g\"\ntype = \"popup\"\n\
+                 command = \"lazygit\"\n",
+            )
+            .unwrap(),
+            ..Config::default()
+        };
+        let kill = KeyId::Command(Command::Kill);
+        let mut view = on_key_row(config, kill);
+        assert!(text(&view).contains("R puts every one back as crystal has it"));
+        assert_eq!(press(&mut view, KeyCode::Char('R')), Outcome::Stay);
+        assert!(
+            text(&view).contains("enter puts the 2 keys the file gives back as crystal has them"),
+            "{}",
+            text(&view)
+        );
+        assert_eq!(hints(&view)[0], ("enter", "put them back"));
+        assert_eq!(
+            press(&mut view, KeyCode::Enter),
+            Outcome::Keys(Rebinding {
+                lines: vec![(KeyId::Prefix, None), (kill, None)],
+                taken_from: None,
+            })
+        );
+        // Any other key leaves them.
+        press(&mut view, KeyCode::Char('R'));
+        assert_eq!(press(&mut view, KeyCode::Char('j')), Outcome::Stay);
+        assert!(!text(&view).contains("enter puts the 2 keys"));
+        // With none the file gives, there's nothing to put back.
+        let mut view = on_key_row(Config::default(), kill);
+        assert_eq!(press(&mut view, KeyCode::Char('R')), Outcome::Stay);
+        assert_eq!(view.problem(), Some("every key is crystal's own already"));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! ```toml
 //! [keys]
 //! prefix = ["ctrl+b", "ctrl+a"]  # then a command's key, from inside a pane
-//! hand-back = "ctrl+\\"          # from a pane back to the sidebar
+//! hand-back = "ctrl+q"          # from a pane back to the sidebar
 //! new-session = ["n", "ctrl+n"]
 //! pane-left = ["shift+left", "direct+ctrl+alt+h"]
 //! kill = "X"
@@ -873,7 +873,7 @@ const DEFAULT_PREFIX: &str = "ctrl+b";
 
 /// What hands the keyboard back from a pane unless the config says: the
 /// key that detaches `crystal attach` too.
-const DEFAULT_HAND_BACK: &str = "ctrl+\\";
+const DEFAULT_HAND_BACK: &str = "ctrl+q";
 
 /// A key with its modifiers, folded into one form whichever way the
 /// terminal sent it: see the module's comment.
@@ -965,6 +965,59 @@ impl Chord {
             && !self
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    }
+
+    /// Why a terminal, or the Mac it runs on, may keep it from crystal,
+    /// when one may: a key a terminal sends the same bytes for as another
+    /// unless it speaks the Kitty keyboard protocol, which crystal asks for
+    /// but not every terminal speaks (Terminal.app doesn't), and keys a Mac
+    /// takes for itself. Nothing is refused for it: the settings view and
+    /// `crystal keys` say so, as docket's keys do.
+    pub fn kept(&self) -> Option<&'static str> {
+        let ctrl = self.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = self.modifiers.contains(KeyModifiers::ALT);
+        let shift = self.modifiers.contains(KeyModifiers::SHIFT);
+        match self.code {
+            KeyCode::Char('i') if ctrl => {
+                Some("a terminal without the Kitty keyboard protocol sends it as Tab")
+            }
+            KeyCode::Char('m') if ctrl => {
+                Some("a terminal without the Kitty keyboard protocol sends it as Enter")
+            }
+            KeyCode::Char('h') if ctrl => {
+                Some("a terminal without the Kitty keyboard protocol sends it as Backspace")
+            }
+            KeyCode::Char('[') if ctrl => {
+                Some("a terminal without the Kitty keyboard protocol sends it as Esc")
+            }
+            // Of the rest, only these have a byte of their own with Ctrl.
+            KeyCode::Char(c)
+                if ctrl
+                    && !c.is_ascii_alphabetic()
+                    && !matches!(c, ' ' | '\\' | ']' | '^' | '/') =>
+            {
+                Some("only a terminal with the Kitty keyboard protocol sends Ctrl with this key")
+            }
+            KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace | KeyCode::Esc if ctrl => {
+                Some("only a terminal with the Kitty keyboard protocol tells it from the key alone")
+            }
+            KeyCode::Enter | KeyCode::Backspace | KeyCode::Esc if shift => {
+                Some("only a terminal with the Kitty keyboard protocol tells it from the key alone")
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+                if ctrl && !alt && !shift =>
+            {
+                Some(
+                    "on a Mac, Mission Control takes Ctrl and the arrows unless its shortcuts are off",
+                )
+            }
+            KeyCode::Char(_) if alt => Some(
+                "on a Mac, Alt (Option) types a character unless the terminal sends Option as \
+                 Meta, which most don't until told",
+            ),
+            KeyCode::F(13..) => Some("few terminals send F13 and above"),
+            _ => None,
+        }
     }
 
     /// Whether a program in a pane can spare it: it has Ctrl or Alt, or
@@ -2081,6 +2134,20 @@ pub fn reset(settings: &KeySettings, key: KeyId) -> Result<Rebinding, String> {
     checked(settings, vec![(key, None)], None)
 }
 
+/// `[keys]` with the line of every key crystal has taken out, for each to
+/// have its default keys again; the user's own `[[keys.command]]` keys
+/// stay, being theirs alone. Nothing to take out is said so.
+pub fn reset_all(settings: &KeySettings) -> Result<Rebinding, String> {
+    let lines: Vec<(KeyId, Option<Binding>)> = KeyId::all()
+        .filter(|key| settings.bindings.contains_key(key.id()))
+        .map(|key| (key, None))
+        .collect();
+    if lines.is_empty() {
+        return Err("every key is crystal's own already".to_string());
+    }
+    checked(settings, lines, None)
+}
+
 /// `[keys]` with no key for `key`.
 pub fn unbind(settings: &KeySettings, key: KeyId) -> Result<Rebinding, String> {
     if key == KeyId::HandBack {
@@ -2335,7 +2402,8 @@ pub const RESIZE_HELP: &[HelpRow] = &[
 
 /// `crystal keys`: every command, its id and its keys, as the config has
 /// them, for the user to find an id to put in `[keys]`; then the modes'
-/// keys, and the user's own.
+/// keys, the user's own, and the keys a terminal may keep from crystal, by
+/// why ([`Chord::kept`]).
 pub fn listing(keymap: &Keymap) -> String {
     let width = ids().map(str::len).max().unwrap_or(0);
     let line = |id: &str, keys: String, does: &str| {
@@ -2369,6 +2437,37 @@ pub fn listing(keymap: &Keymap) -> String {
                 keys => keys,
             };
             out += &line(&keys, command.kind.name().into(), command.label());
+        }
+    }
+    let mut kept: Vec<(&str, Vec<String>)> = Vec::new();
+    let mut keep = |chord: Chord, whose: &str| {
+        let Some(why) = chord.kept() else {
+            return;
+        };
+        let key = format!("{} ({whose})", chord.hint());
+        match kept.iter_mut().find(|(said, _)| *said == why) {
+            Some((_, keys)) => keys.push(key),
+            None => kept.push((why, vec![key])),
+        }
+    };
+    for key in KeyId::all() {
+        for chord in keymap.keys_of(key) {
+            keep(chord, key.id());
+        }
+    }
+    for (command, chords) in keymap.custom() {
+        for &chord in chords {
+            keep(chord, command.label());
+        }
+    }
+    if !kept.is_empty() {
+        out.push_str(
+            "
+keys a terminal may keep from crystal:
+",
+        );
+        for (why, keys) in kept {
+            out += &format!("  {}: {why}\n", keys.join(", "));
         }
     }
     out
@@ -2430,12 +2529,20 @@ mod tests {
     }
 
     #[test]
-    fn the_legacy_encoding_of_ctrl_backslash_is_the_hand_back_key() {
+    fn ctrl_q_is_the_hand_back_key() {
         let keymap = Keymap::default();
+        assert!(keymap.is_hand_back(&key(KeyCode::Char('q'), KeyModifiers::CONTROL)));
+        assert!(!keymap.is_hand_back(&key(KeyCode::Char('q'), KeyModifiers::NONE)));
+        assert!(!keymap.is_hand_back(&key(KeyCode::Char('\\'), KeyModifiers::CONTROL)));
+        assert!(keymap.is_prefix(&key(KeyCode::Char('b'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn the_legacy_encoding_of_ctrl_backslash_is_ctrl_backslash() {
+        let keymap = keymap("hand-back = \"ctrl+\\\\\"").unwrap();
         assert!(keymap.is_hand_back(&key(KeyCode::Char('\\'), KeyModifiers::CONTROL)));
         assert!(keymap.is_hand_back(&key(KeyCode::Char('4'), KeyModifiers::CONTROL)));
         assert!(!keymap.is_hand_back(&key(KeyCode::Char('\\'), KeyModifiers::NONE)));
-        assert!(keymap.is_prefix(&key(KeyCode::Char('b'), KeyModifiers::CONTROL)));
     }
 
     #[test]
@@ -2550,6 +2657,38 @@ mod tests {
             assert!(listing.contains(spec.id), "{}", spec.id);
         }
         assert!(listing.starts_with("prefix"));
+    }
+
+    #[test]
+    fn the_listing_ends_with_the_keys_a_terminal_may_keep_by_why() {
+        let listed = listing(&Keymap::default());
+        let (_, kept) = listed
+            .split_once("\nkeys a terminal may keep from crystal:\n")
+            .unwrap();
+        assert_eq!(
+            kept,
+            "  alt+k (move-up), alt+j (move-down), alt+K (move-project-up), alt+J \
+             (move-project-down): on a Mac, Alt (Option) types a character unless the terminal \
+             sends Option as Meta, which most don't until told\n"
+        );
+        let keymap = keymap(
+            "kill = \"ctrl+i\"\nmove-up = \"K\"\nmove-down = \"none\"\n\
+                             move-project-up = \"none\"\nmove-project-down = \"none\"",
+        )
+        .unwrap();
+        let listed = listing(&keymap);
+        assert!(
+            listed.ends_with(
+                "keys a terminal may keep from crystal:\n  ctrl+i (kill): a terminal without the \
+                 Kitty keyboard protocol sends it as Tab\n"
+            ),
+            "{listed}"
+        );
+        let none = self::keymap(
+            "move-up = \"none\"\nmove-down = \"none\"\n\
+                           move-project-up = \"none\"\nmove-project-down = \"none\"",
+        );
+        assert!(!listing(&none.unwrap()).contains("may keep"));
     }
 
     fn alt_ctrl(c: char) -> KeyEvent {
@@ -2915,7 +3054,7 @@ height = 30
     fn a_key_the_settings_cant_take_says_why() {
         let none = KeySettings::default();
         let kill = KeyId::Command(Command::Kill);
-        let hand_back = rebind(&none, kill, chord("ctrl+\\"), false).unwrap_err();
+        let hand_back = rebind(&none, kill, chord("ctrl+q"), false).unwrap_err();
         assert!(
             hand_back.contains("give hand-back another first"),
             "{hand_back}"
@@ -2982,5 +3121,76 @@ height = 30
         assert_eq!(KeyId::all().count(), COMMANDS.len() + MODE_KEYS.len() + 2);
         assert_eq!(KeyId::Command(Command::Kill).id(), "kill");
         assert_eq!(KeyId::Prefix.does(), PREFIX_DOES);
+    }
+
+    #[test]
+    fn the_settings_put_every_key_back_but_the_users_own() {
+        // Together, the prefix back is no key a command has.
+        let given = settings(
+            "prefix = \"ctrl+a\"\nkill = \"ctrl+b\"\nview-close = \"none\"\n\
+             [[command]]\nkey = \"g\"\ntype = \"popup\"\ncommand = \"lazygit\"\n",
+        );
+        let all = reset_all(&given).unwrap();
+        assert_eq!(
+            all.lines,
+            [
+                (KeyId::Prefix, None),
+                (KeyId::Command(Command::Kill), None),
+                (KeyId::Mode(ModeKey::ViewClose), None),
+            ]
+        );
+        assert_eq!(all.taken_from, None);
+        let own = settings("[[command]]\nkey = \"g\"\ntype = \"popup\"\ncommand = \"lazygit\"\n");
+        assert_eq!(
+            reset_all(&own).unwrap_err(),
+            "every key is crystal's own already"
+        );
+        assert!(reset_all(&KeySettings::default()).is_err());
+    }
+
+    #[test]
+    fn a_key_a_terminal_may_keep_says_why() {
+        for (key, why) in [
+            ("ctrl+i", "sends it as Tab"),
+            ("ctrl+m", "sends it as Enter"),
+            ("ctrl+h", "sends it as Backspace"),
+            ("ctrl+alt+h", "sends it as Backspace"),
+            ("ctrl+[", "sends it as Esc"),
+            ("ctrl+1", "sends Ctrl with this key"),
+            ("ctrl+.", "sends Ctrl with this key"),
+            ("ctrl+enter", "tells it from the key alone"),
+            ("ctrl+tab", "tells it from the key alone"),
+            ("shift+enter", "tells it from the key alone"),
+            ("ctrl+left", "Mission Control"),
+            ("ctrl+up", "Mission Control"),
+            ("alt+n", "sends Option as Meta"),
+            ("alt+N", "sends Option as Meta"),
+            ("f13", "F13 and above"),
+        ] {
+            let kept = chord(key).kept();
+            assert!(
+                kept.is_some_and(|kept| kept.contains(why)),
+                "{key}: {kept:?}"
+            );
+        }
+        for key in [
+            "n",
+            "N",
+            "ctrl+b",
+            "ctrl+q",
+            "ctrl+\\",
+            "ctrl+]",
+            "ctrl+space",
+            "ctrl+shift+left",
+            "ctrl+alt+left",
+            "shift+left",
+            "alt+enter",
+            "shift+tab",
+            "enter",
+            "pageup",
+            "f2",
+        ] {
+            assert_eq!(chord(key).kept(), None, "{key}");
+        }
     }
 }

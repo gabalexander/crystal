@@ -284,7 +284,10 @@ settings that are lists or tables, like `[colors]` and `[tab_bar] right`, are th
 The keys' tab lists the prefixes, the key back from a pane, every command and each mode's keys, with the keys
 each has and a `•` beside those the file gives. `enter` on one waits for the key you press next and gives it that
 key in place of its own, and `a` gives it the key beside them; `x` leaves it with none, and `del` puts its own
-back. A key is checked as the file's keys are: one another command has asks first, saying whose it is, and
+back. `R` puts every key the file gives back as crystal has it once `enter` says so, your own
+`[[keys.command]]` keys staying. A key a terminal may never send crystal, like `ctrl+i`, which most send as
+`Tab`, is given all the same and the view says why ([keys](keys.md#commands-and-keys)). A key is checked as the
+file's keys are: one another command has asks first, saying whose it is, and
 `enter` takes it from that one, which keeps its other keys, while `esc` leaves it; a key a view always has, or
 the key back from a pane, isn't given, and the view says why. A key an installed [plugin](plugins.md)'s action
 takes asks first too, since the command would have it before the action, which would run from the command list

@@ -1062,9 +1062,10 @@ fn draw_float_frame(frame: &mut Frame, app: &App, look: &Look, around: Rect) {
     );
     let color = if focused { theme.accent } else { theme.rule };
     let hint = if app.focus() == Focus::Sidebar {
-        " F puts it back "
+        " F puts it back ".to_string()
     } else {
-        " ctrl+\\ sidebar · then F puts it back "
+        let hand_back = app.keymap().hand_back().hint();
+        format!(" {hand_back} sidebar · then F puts it back ")
     };
     let block = Block::bordered()
         .border_style(Style::new().fg(color))
@@ -2446,7 +2447,7 @@ mod tests {
         }
         let pages = [
             "In a pane",
-            "Ctrl+\\",
+            "Ctrl+Q",
             "In resize mode",
             "In a view",
             "With the mouse",

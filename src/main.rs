@@ -556,7 +556,7 @@ enum Command {
         #[command(subcommand)]
         command: Option<LayoutCommand>,
     },
-    /// Show a session in this terminal; Ctrl+\ detaches, Ctrl+B v is copy
+    /// Show a session in this terminal; Ctrl+Q detaches, Ctrl+B v is copy
     /// mode.
     #[command(visible_alias = "a")]
     Attach {

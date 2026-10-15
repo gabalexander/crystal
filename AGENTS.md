@@ -273,8 +273,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     for the key every view takes for it); the user's own keys, `[[keys.command]]`, and what each runs (a
     popup, a pane, a tab, a command in the background or a plugin's action); a plugin's key, one or two
     pressed one after the other, and the keys kept from plugins; the `?` overlay's rows of sidebar keys and
-    resize mode's; `crystal keys`'s list; and what a key the settings view gives a command, takes from
-    another, leaves none or puts back does to `[keys]` (`rebind`, `unbind`, `reset`), checked as the config's
+    resize mode's; `crystal keys`'s list; the keys a terminal may never send crystal, and why (`Chord::kept`:
+    those that need the Kitty keyboard protocol, and those a Mac takes), adapted from docket's; and what a key
+    the settings view gives a command, takes from another, leaves none or puts back, or every key put back,
+    does to `[keys]` (`rebind`, `unbind`, `reset`, `reset_all`), checked as the config's
   - `command_list.rs`: the command list (`:`): every command, the user's own keys' commands and plugin action
     by name, with its keys, filtered as you type, the latest run first; its state and keys, kept apart from
     I/O, and its drawing
@@ -430,7 +432,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     it last failed; crystal's hooks in each agent installed here, put
     in, brought up to date or taken out with a key; and the keys' tab, every key `[keys]` gives or those `/`'s
     filter finds, the key pressed next given one, one another has taken from it, or an installed plugin's
-    action takes, once the user says so; a click on a tab or a row, and the wheel, where `hit` says the mouse
+    action takes, once the user says so, and said so when a terminal may keep it from crystal, and every key
+    put back with `R` once the user says so; a click on a tab or a row, and the wheel, where `hit` says the mouse
     is as `draw` lays the view out; kept apart from I/O, so it's unit-tested; the event loop writes the file
     (`config::apply`) or the agent's hooks (`integration`) and, while it's open, reads the settings, the hooks
     and the daemon's `EmbeddingStatus` again every half a second
